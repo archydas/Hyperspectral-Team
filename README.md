@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Hyperspectral Tools
 
 A collection of tools for hyperspectral data processing, data aggregation, analysis, and visualization.
@@ -83,3 +84,6 @@ Please refer to the respective project directories for:
 ## License
 
 Refer to the licensing information and LICENSE files provided with the respective projects.
+=======
+# Hyperspectral-Team
+>>>>>>> 7d7bd31717d710d6fb234bf966469883202d086d
