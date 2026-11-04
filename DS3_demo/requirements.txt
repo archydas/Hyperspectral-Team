@@ -1,0 +1,17 @@
+# DS3 Library — install with:  pip install -r requirements.txt     (Python 3.11 or 3.12 recommended)
+-e .                      # the DS3 core (readers for all image and spectra formats, aggregation) from src/
+fastapi>=0.110
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+psycopg[binary]>=3.2      # PostgreSQL driver (not needed for SQLite)
+python-dotenv>=1.0
+python-multipart>=0.0.9
+matplotlib>=3.8           # image previews and ROI polygons
+scipy>=1.11               # MATLAB .mat images
+openpyxl>=3.1             # Excel spectra (.xlsx)
+pyarrow>=15               # Parquet spectra (optional)
+pywebview>=5              # separate application window (optional; the default browser is used without it)
+# --- tests / packaging ---
+pytest>=8
+httpx>=0.27
+pyinstaller>=6.0          # only to build the .exe

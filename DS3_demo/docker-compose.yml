@@ -1,0 +1,39 @@
+# PostgreSQL for DS3 (and, optionally, the whole application).
+#
+#   docker compose up -d db            -> only the database (use it from  python run_gui.py  with DATABASE_URL in .env)
+#   docker compose --profile app up -d --build   -> database + the web application at http://localhost:8000/app/
+#
+# The five main library files are read from  material_library/data/libraries/  (mounted read-only into the app container).
+services:
+  db:
+    image: postgres:16
+    container_name: ds3-db
+    environment:
+      POSTGRES_USER: ds3
+      POSTGRES_PASSWORD: ds3
+      POSTGRES_DB: ds3
+    ports: ["5432:5432"]
+    volumes: ["ds3-pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ds3 -d ds3"]
+      interval: 5s
+      retries: 12
+
+  app:
+    build: .
+    container_name: ds3-app
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql+psycopg://ds3:ds3@db:5432/ds3
+      AUTO_IMPORT_DIR: /libraries
+      DS3_HOME: /data
+    ports: ["8000:8000"]
+    volumes:
+      - ./material_library/data/libraries:/libraries:ro
+      - ds3-data:/data
+    profiles: ["app"]          # started only with:  docker compose --profile app up -d --build
+
+volumes:
+  ds3-pgdata:
+  ds3-data:

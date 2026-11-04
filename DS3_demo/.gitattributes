@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+*.hdr text
+*.img binary
+*.tif binary
+*.h5 binary
+*.nc binary

@@ -1,0 +1,9 @@
+.venv
+.git
+**/__pycache__
+**/*.db
+dist
+build
+material_library/data/uploads
+tests/e2e
+*.egg-info
