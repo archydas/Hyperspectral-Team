@@ -42,3 +42,4 @@ Desktop.ini
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+*.txt

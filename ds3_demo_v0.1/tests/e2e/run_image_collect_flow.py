@@ -107,7 +107,7 @@ with sync_playwright() as p:
     res=requests.get(API+"/api/spectra/search",params={"library_id":libs["Obj lib"]["id"],"limit":20}).json()
     assert res["total"]==3, res["total"]
     r0=res["results"][0]; pg.evaluate("([l,m])=>goToMaterial(l,m)",[libs["Obj lib"]["id"],r0["material_id"]]); pg.wait_for_timeout(1500)
-    sv=pg.inner_text("#main"); assert "Source" in sv and "Image patch" in sv and "Left half" in sv and ".tif" in sv and "Load image" in sv and "Locate" in sv and str(OUT) not in sv, sv[:600]
+    sv=pg.inner_text("#main"); assert "Source" in sv and "Image patch" in sv and "Left half" in sv and ".tif" in sv and "View image" in sv and "Locate" in sv and str(OUT) not in sv, sv[:600]
     pg.screenshot(path=str(OUT/"6_source_image.png"))
     pg.click('[data-nav="image"]'); pg.wait_for_timeout(800)
     assert "Collected spectra (0)" in pg.inner_text("#imgSide")      # switching image clears the pixel spectra (object samples stay)

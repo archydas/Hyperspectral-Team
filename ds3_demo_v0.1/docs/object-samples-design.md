@@ -10,7 +10,7 @@ Decided 10 Nov 2026, updated 11 Nov 2026 (version 0.2) — Arju Verma, DS3 Task 
 - `images` table holds only the description and the file **address** (`path`); the cube stays in the file on disk.
 - **Object (ROI) sample** = mean spectrum (a normal spectrum row) + `sample_metadata.object` = {class_name, polygon (row, col), n_pixels, lat, lon, image_id, image_name, image_path, **patch_file**, **patch_path**}.
 - **Image patch (v0.2):** each ROI is written as a georeferenced GeoTIFF `<class name>.tif` (duplicates `_2`, `_3`), float32, all bands, pixels outside the polygon = NaN, wavelengths in ENVI tags (so the patch re-opens in DS3). The folder is asked once, at the first ROI (system folder dialog in the desktop window, typed path in a browser) and kept in the browser (`ds3_patch_folder`). The database stores the file name + address, never the pixels.
-- The page never receives `patch_path`: Library -> **Load image** (`POST /api/samples/{id}/patch/load`, opens the file in place) and **Locate** (`.../patch/reveal`) go through the sample id. A moved file is reported as "not found".
+- The page never receives `patch_path`: Library -> **View image** (`GET /api/samples/{id}/patch/view` and `/patch/pixel`: read in place, for viewing only, nothing is added to the Image module) and **Locate** (`.../patch/reveal`) go through the sample id. A moved file is reported as "not found".
 - `.roi` file (JSON, `format: ds3-roi`, version 2): polygons + image name/address + lat/lon + patch file. Export / Import in the Image page.
 
 ## Georeferencing

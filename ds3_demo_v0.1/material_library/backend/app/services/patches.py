@@ -2,7 +2,7 @@
 
 * file name = the class name  ->  <folder>/<class name>.tif   (a second ROI of the same class gets _2, _3, ...)
 * bands = the image's bands, float32 reflectance (or the image's own unit); pixels outside the polygon = NaN (no-data)
-* wavelengths are written as ENVI-domain tags, so the patch opens again in DS3 (Library > Load image) with the same wavelength axis
+* wavelengths are written as ENVI-domain tags, so the patch opens again in DS3 (Library > View image) with the same wavelength axis
 * when the image is georeferenced (its own map information, or ground control points set in the Image module) the patch is
   georeferenced too (cropped transform).
 """

@@ -1,7 +1,7 @@
 """Object samples (ROI), zoom, georeferencing and the Library module:
  toolbar line (Show checkboxes next to Download image) · mouse-wheel zoom and drag · ROI -> folder question -> <class>.tif patch ·
  per-ROI spectrum · georeference with control points (image beside the map) · lat/lon in the table ·
- Library page: pixel-based vs object-based libraries, patch file name only, Load image.
+ Library page: pixel-based vs object-based libraries, patch file name only, View image (view only).
 The map needs Leaflet: set LEAFLET_DIST to the folder with leaflet.js / leaflet.css (npm i leaflet) when there is no internet."""
 import os, re, shutil, requests
 from pathlib import Path
@@ -98,13 +98,17 @@ with sync_playwright() as p:
     assert "Add library" in lt and "Build library" in lt
     assert lt.index("Pond pixels")<lt.index("Object-based libraries (ROI)")<lt.index("Pond objects"), "libraries must sit in their own sections"
     pg.click(".lib-card:has-text('Pond objects')"); pg.wait_for_selector("#matRows .obj-table"); pg.wait_for_timeout(500)
-    ot=pg.inner_text("#matRows"); assert "Water.tif" in ot and "Load image" in ot and "Locate" in ot and str(PATCH) not in ot and "/" not in ot.split("Image (patch file)")[1].split("The image patches")[0].replace("The image patches",""), ot[:500]
+    ot=pg.inner_text("#matRows"); assert "Water.tif" in ot and "View image" in ot and "Locate" in ot and str(PATCH) not in ot and "/" not in ot.split("Image (patch file)")[1].split("The image patches")[0].replace("The image patches",""), ot[:500]
     pg.screenshot(path=str(OUT/"3_object_library.png"))
     n_img=len(requests.get(API+"/api/images/").json())
-    pg.click("#matRows >> text=Load image >> nth=0"); pg.wait_for_selector("#imgBox", timeout=15000); pg.wait_for_timeout(1200)
-    assert len(requests.get(API+"/api/images/").json())==n_img+1
-    assert "Water" in pg.locator("#imgInfo").inner_text() and "zoom" in pg.locator("#imgInfo").inner_text(), pg.locator("#imgInfo").inner_text()
-    pg.screenshot(path=str(OUT/"4_patch_loaded.png"))
+    pg.click("#matRows >> text=View image >> nth=0"); pg.wait_for_selector("#pvImg", timeout=15000); pg.wait_for_timeout(1200)
+    assert len(requests.get(API+"/api/images/").json())==n_img, "viewing a patch must not add it to the Image module"
+    wt=pg.inner_text(".win"); assert "Water.tif" in wt and "for viewing only" in wt and "bands" in wt, wt[:300]
+    assert pg.locator("#pvBand0 option").count()>=3, "every band is listed"
+    pg.click("#pvImg"); pg.wait_for_timeout(800); assert "Pixel (" in pg.inner_text("#pvChart") or "nodata" in pg.inner_text("#pvChart")
+    pg.select_option("#pvBand0", index=3); pg.click(".win >> text=Apply bands"); pg.wait_for_timeout(1000); assert pg.input_value("#pvBand0")=="4"
+    pg.screenshot(path=str(OUT/"4_patch_viewer.png"))
+    pg.evaluate("winClose()")
     print("JS errors:", errs); b.close()
 assert not errs, errs
 print("OK object samples flow" + ("" if LEAF else " (map steps skipped: set LEAFLET_DIST)"))

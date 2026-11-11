@@ -50,7 +50,7 @@ async function bldSave(){
 }
 
 /* ---------- where an object / pixel sample came from (spectrum page of a library material) ---------- */
-/* ROI sample: the name of its patch file + Load image / Locate. Pixel sample: the image name and the pixel. No folder paths are shown. */
+/* ROI sample: the name of its patch file + View image / Locate. Pixel sample: the image name and the pixel. No folder paths are shown. */
 function srcImageHtml(sps){
   const rows=sps.map(s=>{ const m=s.sample_meta||{}; return m.object?{o:m.object,kind:"ROI",sid:s.sample_id}:(m.pixel?{o:m.pixel,kind:"pixel",sid:s.sample_id}:null); }).filter(Boolean);
   if(!rows.length) return "";
@@ -58,6 +58,6 @@ function srcImageHtml(sps){
   return `<div class="card" style="padding:12px;margin-top:12px"><b>Source</b> <span class="small">· the image is not stored in the database, only the name and address of its file</span>`
     +rows.slice(0,6).map(({o,kind,sid})=>kind==="ROI"
       ?`<div class="small" style="margin-top:8px">ROI of ${o.n_pixels||"?"} pixels${o.class_name?` · class <b>${escapeHtml(o.class_name)}</b>`:""}${o.lat!=null?` · ${f5(o.lat)}, ${f5(o.lon)}`:""} · scene ${escapeHtml(o.image_name||"")}<br>
-         ${o.patch_file?`Image patch: <b>&#128247; ${escapeHtml(o.patch_file)}</b> <button class="btn emerald btn-sm" onclick="libObjLoad('${sid}')">Load image</button> <button class="btn ghost btn-sm" onclick="libObjLocate('${sid}')">Locate</button>`:`<span class="note" style="margin:0">no image patch was saved for this ROI</span>`}</div>`
+         ${o.patch_file?`Image patch: <b>&#128247; ${escapeHtml(o.patch_file)}</b> <button class="btn emerald btn-sm" onclick="libObjView('${sid}')" title="Look at the saved patch (it is not opened in the Image module)">View image</button> <button class="btn ghost btn-sm" onclick="libObjLocate('${sid}')">Locate</button>`:`<span class="note" style="margin:0">no image patch was saved for this ROI</span>`}</div>`
       :`<div class="small" style="margin-top:8px">pixel (${o.row}, ${o.col}) · image <b>${escapeHtml(o.image_name||"")}</b> ${o.image_id?`<button class="btn ghost btn-sm" onclick="imgLocate('${o.image_id}')">Locate image file</button>`:""}</div>`).join("")+`</div>`;
 }

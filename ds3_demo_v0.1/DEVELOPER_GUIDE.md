@@ -33,7 +33,7 @@ A spectrum stores `values[]`, `wavelength_start/end/step`, `wavelengths[]` only 
 `acquisition_type` (lab|field|airborne|satellite|NULL) and `metadata` (JSON: source file, `purity`, and for aggregated signatures `std`, `n_pixels`, `source_scenes`).
 `materials.category` is a `/`-separated path; the tree is computed from it (`services/taxonomy.py`), so no extra table exists.
 Images: one row per registered file (shape, unit, wavelengths, bad-band mask, reader options); the pixels stay in the file. Control-point georeferencing is stored in the image's `metadata.georef`.
-Object (ROI) samples: `samples.sample_metadata.object` = class, polygon, lat/lon, source image, `patch_file` and `patch_path` (the GeoTIFF written by `services/patches.py`); the library's metadata has `type: "object"`. The page never receives `patch_path`: *Load image* / *Locate* go through the sample id.
+Object (ROI) samples: `samples.sample_metadata.object` = class, polygon, lat/lon, source image, `patch_file` and `patch_path` (the GeoTIFF written by `services/patches.py`); the library's metadata has `type: "object"`. The page never receives `patch_path`: *View image* / *Locate* go through the sample id.
 Schema changes: add an idempotent file to `database/migrations/`, mirror it in `schema.sql` and in the model; `init_db()` adds missing columns on start-up.
 
 ## Aggregation algorithm

@@ -212,7 +212,7 @@ function buildMaterialRows(lib){
 }
 
 /* ---------------- object (ROI) libraries: the saved image patch of each sample ---------------- */
-/* Only the patch FILE NAME is shown. "Load image" opens the file from the folder where it was saved (it is not copied);
+/* Only the patch FILE NAME is shown. "View image" opens the file from the folder where it was saved (it is not copied);
    "Locate" shows it in the file browser. Both go through the sample id: the page never handles the folder path. */
 function objectRowsHtml(lib){
   const q=(state.matQuery||"").trim().toLowerCase(), list=(lib.objects||[]).filter(o=>!q||(o.name||"").toLowerCase().includes(q)||(o.class_name||"").toLowerCase().includes(q));
@@ -221,19 +221,46 @@ function objectRowsHtml(lib){
     const ok=o.has_patch&&o.patch_exists!==false;
     return `<tr><td>${escapeHtml(o.name)}</td><td>${escapeHtml(o.class_name||"")}</td><td class="num">${f5(o.lat)}</td><td class="num">${f5(o.lon)}</td><td class="num">${o.n_pixels??"—"}</td>
       <td>${o.has_patch?`&#128247; ${escapeHtml(o.patch_file||"")}${o.patch_exists===false?` <span style="color:#c62828" title="The file is not at its saved location any more">· not found</span>`:""}`:`<span class="note" style="margin:0">no patch</span>`}</td>
-      <td style="white-space:nowrap"><button class="btn emerald btn-sm" onclick="libObjLoad('${o.sample_id}')" ${ok?"":"disabled"} title="Open this image patch in the Image module">Load image</button>
+      <td style="white-space:nowrap"><button class="btn emerald btn-sm" onclick="libObjView('${o.sample_id}')" ${ok?"":"disabled"} title="Look at this image patch (view only, it is not opened in the Image module)">View image</button>
         <button class="btn ghost btn-sm" onclick="libObjLocate('${o.sample_id}')" ${ok?"":"disabled"} title="Show the file in the file browser">Locate</button>
         <button class="btn ghost btn-sm" onclick="goToMaterial('${lib.id}','${o.material_id}')">Spectrum</button></td></tr>`; }).join("");
   return `<div style="overflow:auto;padding:4px 8px"><table class="gcp-table obj-table"><tr><th>Label</th><th>Class</th><th>Latitude</th><th>Longitude</th><th>Pixels</th><th>Image (patch file)</th><th></th></tr>${rows||`<tr><td colspan=7 class="note">No object samples match.</td></tr>`}</table></div>
     <p class="note" style="padding:0 12px 10px">The image patches stay in the folder where they were saved; the database keeps only the file name and its address.</p>`;
 }
-async function libObjLoad(sampleId){
+/* ---- Library > View image: the saved patch opens in a viewer window, for looking only (it is NOT added to the Image module) ---- */
+const PV={ id:"", d:null, sel:[1,1,1], msg:"" };
+async function libObjView(sampleId,bands){
   try{
-    showToast("Loading the image…");
-    const r=await apiSend("POST",`/api/samples/${sampleId}/patch/load`,{});
-    I.list=await apiGet("/api/images/"); state.view="image"; render(); await openImage(r.image_id);
-    showToast(`${r.name} loaded in the Image module`);
+    PV.id=sampleId; PV.msg="";
+    const q=bands?`?r=${bands[0]}&g=${bands[1]}&b=${bands[2]}`:"";
+    PV.d=await apiGet(`/api/samples/${sampleId}/patch/view${q}`); PV.sel=PV.d.preview.bands.slice();
+    pvShow(); pvChartClear();
   }catch(e){ showToast(e.message); }
+}
+function pvShow(){
+  const d=PV.d, wl=d.wavelengths, opt=sel=>wl.map((w,i)=>`<option value="${i+1}" ${sel===i+1?"selected":""}>Band ${i+1} · ${Math.round(w)} nm</option>`).join("");
+  win(`Image patch — ${d.name}`,`<div class="note" style="margin:0 0 8px">${escapeHtml(d.name)} · ${d.rows}×${d.cols} pixels · ${d.bands} bands · ${escapeHtml(d.unit)} · ${Math.round(wl[0])}–${Math.round(wl[wl.length-1])} nm · for viewing only</div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      ${["R","G","B"].map((c,k)=>`<span class="small">${c}</span><select id="pvBand${k}" style="max-width:150px">${opt(PV.sel[k])}</select>`).join("")}
+      <button class="btn ghost btn-sm" onclick="pvApply()">Apply bands</button>
+      <button class="btn ghost btn-sm" style="margin-left:auto" onclick="libObjLocate('${PV.id}')">Locate file</button></div>
+    <div style="background:#000;border-radius:8px;text-align:center;max-height:52vh;overflow:auto"><img id="pvImg" src="${d.preview.image}" onclick="pvPick(event)" title="Click a pixel to see its spectrum"
+      style="width:${Math.max(240,Math.min(820,d.cols*Math.max(1,Math.floor(500/Math.max(d.rows,d.cols)))))}px;image-rendering:pixelated;cursor:crosshair;display:block;margin:0 auto"></div>
+    <div id="pvChart" style="margin-top:8px"></div>`,{width:880});
+}
+async function pvApply(){
+  const r=[0,1,2].map(k=>parseInt(document.getElementById("pvBand"+k).value,10));
+  await libObjView(PV.id,r);
+}
+function pvChartClear(){ const c=document.getElementById("pvChart"); if(c) c.innerHTML=`<p class="note">Click a pixel to see its spectrum. Black pixels are outside the ROI.</p>`; }
+async function pvPick(ev){
+  const d=PV.d, im=document.getElementById("pvImg"), b=im.getBoundingClientRect();
+  const col=Math.min(d.cols-1,Math.floor((ev.clientX-b.left)/b.width*d.cols)), row=Math.min(d.rows-1,Math.floor((ev.clientY-b.top)/b.height*d.rows));
+  const c=document.getElementById("pvChart");
+  try{
+    const s=await apiGet(`/api/samples/${PV.id}/patch/pixel?row=${row}&col=${col}`);
+    c.innerHTML=`<div class="small"><b>Pixel (${row}, ${col})</b> · ${escapeHtml(s.unit)}</div>`+dsChart([{name:"pixel",color:"#2563eb",data:s.wavelengths.map((w,i)=>({x:w,y:s.values[i]})).filter(p=>p.y!=null)}],{height:210,width:820,unit:s.unit});
+  }catch(e){ c.innerHTML=`<p class="note">${escapeHtml(e.message)}</p>`; }
 }
 async function libObjLocate(sampleId){
   try{ await apiSend("POST",`/api/samples/${sampleId}/patch/reveal`,{}); }catch(e){ showToast(e.message); }

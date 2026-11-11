@@ -50,11 +50,15 @@ def test_patch_is_named_by_class_georeferenced_and_reloadable(client, tmp_path):
     with rasterio.open(out / "Dry grass.tif") as d:
         assert d.count == 30 and d.crs is not None and d.height == 14 and d.width == 16
         assert d.tags(ns="ENVI")["wavelength_units"] == "nm"
-    # the patch opens again as an image with the same wavelengths (Library > Load image)
+    # the patch opens again as an image with the same wavelengths (it is the same reader that Library > View image uses)
     r = client.post("/api/import/path", json={"paths": [str(out / "Dry grass.tif")]}); assert r.status_code == 200, r.text
     imgs = client.get("/api/images/").json()
     patch = [i for i in imgs if i["path"].endswith("Dry grass.tif")][0]
     assert patch["bands"] == 30 and patch["rows"] == 14 and patch["wavelength_min"] == 450
+    # every band is listed again, the preview opens on the bands that were shown when the patch was saved
+    bd = client.get(f"/api/images/{patch['id']}/bands").json()
+    assert len(bd["wavelengths"]) == 30
+    pv = client.get(f"/api/images/{patch['id']}/preview?r=20&g=12&b=4").json(); assert pv["bands"] == [20, 12, 4]
 
 
 def test_patch_rejects_bad_input_and_remote_clients(client, tmp_path):
@@ -136,14 +140,16 @@ def test_object_library_lists_patches_and_loads_them_in_place(client, tmp_path):
     objs = client.get(f"/api/libraries/{lib['id']}/objects").json()["objects"]
     assert len(objs) == 1 and objs[0]["patch_file"] == "Water.tif" and objs[0]["patch_exists"] is True and "path" not in str(objs[0].keys())
     sid = objs[0]["sample_id"]
-    r = client.post(f"/api/samples/{sid}/patch/load"); assert r.status_code == 200, r.text
-    again = client.post(f"/api/samples/{sid}/patch/load").json()
-    assert again["image_id"] == r.json()["image_id"] and again["status"] == "duplicate"        # same file: no second copy in the list
-    img = client.get(f"/api/images/{r.json()['image_id']}").json()
-    assert img["bands"] == 30 and img["name"] == "Water"
+    n_img = len(client.get("/api/images/").json())
+    v = client.get(f"/api/samples/{sid}/patch/view"); assert v.status_code == 200, v.text
+    v = v.json(); assert v["name"] == "Water.tif" and v["bands"] == 30 and len(v["wavelengths"]) == 30 and len(v["preview"]["bands"]) == 3
+    assert "patch_path" not in str(v) and str(out) not in str(v)
+    v2 = client.get(f"/api/samples/{sid}/patch/view?r=20&g=12&b=4").json(); assert v2["preview"]["bands"] == [20, 12, 4]
+    px = client.get(f"/api/samples/{sid}/patch/pixel?row=3&col=3"); assert px.status_code == 200 and len(px.json()["values"]) == 30
+    assert len(client.get("/api/images/").json()) == n_img                                    # viewing never adds the patch to the Image module
     (out / "Water.tif").rename(out / "moved.tif")
     assert client.get(f"/api/libraries/{lib['id']}/objects").json()["objects"][0]["patch_exists"] is False
-    assert client.post(f"/api/samples/{sid}/patch/load").status_code == 404
+    assert client.get(f"/api/samples/{sid}/patch/view").status_code == 404
 
 
 def test_patch_keeps_all_bands_and_default_display_bands(client, tmp_path):

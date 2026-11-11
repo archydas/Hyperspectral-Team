@@ -78,7 +78,7 @@ def check_folder(body: PathBody, request: Request):
 
 @router.post("/system/path_info")
 def path_info(body: PathsBody, request: Request):
-    """Which of these files are still where they were saved? (the Library page shows 'Load image' only for those)"""
+    """Which of these files are still where they were saved? (the Library page shows 'View image' only for those)"""
     _local_only(request, "Checking files")
     out = []
     for s in body.paths[:500]:
@@ -202,7 +202,7 @@ def _object_meta(db, sample_id):
 @router.get("/libraries/{library_id}/objects")
 def library_objects(library_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
     """The object (ROI) samples of a library: label, class, position, pixel count and the NAME of the saved patch file.
-    The folder is not sent to the page; Load image / Locate go through the sample id."""
+    The folder is not sent to the page; View image / Locate go through the sample id."""
     local = (request.client.host if request.client else "") in _LOCAL_HOSTS
     rows = (db.query(Sample, Material).join(Material, Sample.material_id == Material.id)
             .join(Dataset, Sample.dataset_id == Dataset.id).filter(Dataset.library_id == library_id).order_by(Material.name).all())
@@ -218,17 +218,46 @@ def library_objects(library_id: uuid.UUID, request: Request, db: Session = Depen
     return {"objects": out}
 
 
-@router.post("/samples/{sample_id}/patch/load")
-def load_patch(sample_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
-    """Open the sample's patch file (where it was saved) as an image in the Image module — the file is not copied."""
-    _local_only(request, "Loading an image from its saved location")
+def _view_image(db: Session, sample_id: uuid.UUID):
+    """The saved patch as a throw-away Image: it is read from where it was saved and NOT added to the Image module's list."""
+    from ..models import Image
     o = _object_meta(db, sample_id)
     p = Path(o["patch_path"])
     if not p.is_file():
         raise HTTPException(404, f"{o.get('patch_file') or p.name} is not at its saved location any more. Move it back, or save the ROI again.")
-    r = _wrap(lambda: svc.register_image(db, p))
-    db.commit()
-    return {"image_id": r["id"], "status": r["status"], "name": p.name}
+    key = uuid.uuid5(uuid.NAMESPACE_URL, f"{p.resolve()}|{p.stat().st_mtime_ns}")          # a changed file gets a fresh cache entry
+    return Image(id=key, name=p.stem, path=str(p), reader_kw={}, unit=None, bad_band_mask=None), p
+
+
+@router.get("/samples/{sample_id}/patch/view")
+def view_patch(sample_id: uuid.UUID, request: Request, r: Optional[int] = None, g: Optional[int] = None, b: Optional[int] = None,
+               db: Session = Depends(get_db)):
+    """Visualisation only (Library > View image): colour preview, all band wavelengths; the bands shown first are the ones that were on screen when the patch was saved."""
+    _local_only(request, "Viewing an image from its saved location")
+    img, p = _view_image(db, sample_id)
+    def go():
+        cube = svc.open_image(img)
+        bands = [r, g, b] if None not in (r, g, b) else None
+        if bands is None:
+            import rasterio
+            try:
+                with rasterio.open(p) as d:
+                    t = (d.tags().get("display_bands_rgb") or "").split(",")
+                    if len(t) == 3 and all(1 <= int(x) <= d.count for x in t):
+                        bands = [int(x) for x in t]
+            except Exception:
+                pass
+        pv = svc.preview(img, bands, max_px=1_000_000)
+        return dict(name=p.name, rows=cube.rows, cols=cube.cols, bands=cube.bands, unit=str(cube.unit),
+                    wavelengths=[float(x) for x in cube.wavelengths_nm], preview=pv)
+    return _wrap(go)
+
+
+@router.get("/samples/{sample_id}/patch/pixel")
+def patch_pixel(sample_id: uuid.UUID, request: Request, row: int, col: int, db: Session = Depends(get_db)):
+    _local_only(request, "Viewing an image from its saved location")
+    img, _ = _view_image(db, sample_id)
+    return _wrap(lambda: svc.pixel(img, row, col, 1)[0])
 
 
 @router.post("/samples/{sample_id}/patch/reveal")

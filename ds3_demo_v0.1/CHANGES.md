@@ -10,6 +10,7 @@
 * **Save to library (Image page and Library Builder):** one drop-down — *＋ New library…* (then type the name) or an existing library (pixel libraries for spectra, object libraries for ROI samples; the main library is never offered).
 * **Image patches (.tif):** all bands are in the file; the R, G, B bands shown on the page (else the bands nearest 650/550/470 nm) are stored as the default display bands (tags `default_bands` / `display_bands_rgb`). ENVI uses them; ArcMap and QGIS always open a multi-band TIFF on bands 1–3 — choose the bands in the layer's Symbology (RGB composite).
 * Removed the duplicate *Export CSV* under the chart (the collected-spectra list has it).
+* **Library ▸ View image (was “Load image”):** a saved ROI patch opens in a viewer window for **looking only**: all bands in the R/G/B lists (it starts on the bands that were on screen when the patch was saved), click a pixel for its spectrum, *Locate file*. It is **not** added to the Image module's list. (`GET /api/samples/{id}/patch/view|pixel`; the old `patch/load` is gone.)
 * **Fixed:** the menu bar stayed empty when the mouse pointer was already over it at start-up.
 * **Tests:** new/updated browser checks for all of the above, one more patch test (default display bands).
 
