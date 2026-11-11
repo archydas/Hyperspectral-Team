@@ -1,0 +1,3 @@
+After unzipping over your DS3-version0.1 folder, delete this old file (it no longer matches the interface):
+  tests\e2e\run_builder_aggregation_flow.py
+You can then delete this note.

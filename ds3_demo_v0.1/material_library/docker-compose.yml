@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: material_library_db
+
+    environment:
+      POSTGRES_DB: material_library
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+volumes:
+  postgres_data:

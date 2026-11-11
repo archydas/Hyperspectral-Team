@@ -1,0 +1,13 @@
+ENVI
+samples = 60
+lines = 40
+bands = 30
+header offset = 0
+file type = ENVI Standard
+data type = 4
+interleave = bsq
+byte order = 0
+reflectance scale factor = 1
+wavelength units = Nanometers
+map info = {UTM, 1, 1, 500000.0, 2000000.0, 30.0, 30.0, 43, North, WGS-84}
+wavelength = {450, 470, 490, 510, 530, 550, 570, 590, 610, 630, 650, 670, 690, 710, 730, 750, 770, 790, 810, 830, 850, 870, 890, 910, 930, 950, 970, 990, 1010, 1030}
