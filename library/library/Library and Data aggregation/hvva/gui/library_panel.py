@@ -12,6 +12,7 @@ backend), rebuilt in Qt for this window's layout:
     spectrum       sample -> spectrum (+/- std) in the Spectra pane, acquisition tag per spectrum, export CSV
     compare/match  overlay and export spectra; save aggregated signatures / clicked pixels; match a pixel by
                    spectral angle, optionally limited to the acquisition type and category
+    ROIs           spectra saved from the ROI Analysis tab show their ROI class and source ROI(s) / image(s)
 
 Acquisition types: lab, field, airborne, satellite (spectra.acquisition_type, NULL = untagged).
 All database / HTTP work runs on a QThreadPool so the window never freezes; superseded requests are dropped.
@@ -579,7 +580,7 @@ class DataFolderDialog(W.QDialog):
         self.b_scan = W.QPushButton("Scan")
         self.b_scan.clicked.connect(self.scan)
         self.ed_folder.returnPressed.connect(self.scan)
-        self.chk_auto = W.QCheckBox("Import new files from this folder automatically when HyperVista connects")
+        self.chk_auto = W.QCheckBox("Check this folder for new files when HyperVista starts (asks before importing)")
         self.chk_auto.setChecked(auto)
         self.tbl = W.QTableWidget(0, 5)
         self.tbl.setHorizontalHeaderLabels(["Source", "Type", "Import into library", "Status", "Notes"])
@@ -1428,16 +1429,37 @@ class LibraryPanel(W.QWidget):
         self.run(self.client.import_sources, items, done=ok, failed=bad, progress=prog)
 
     def auto_import(self):
-        """Startup: import whatever is new in the data folder, quietly."""
+        """Startup: look for new files in the data folder and ASK before importing anything."""
         folder = self.cfg["data_folder"]
         if not folder or not os.path.isdir(folder):
             return
 
         def scanned(srcs):
             new = [s for s in srcs if s["status"] == "new"]
-            if new:
-                self.host.statusBar().showMessage(f"Auto-import: {len(new)} new source(s) in {folder}", 6000)
-                self._run_imports([{"source": s, "library": s["library"]} for s in new], quiet=True)
+            if not new:
+                return
+            box = W.QMessageBox(self)
+            box.setIcon(W.QMessageBox.Question)
+            box.setWindowTitle("New spectral data found")
+            listing = "\n".join(f"•  {s['name']}  →  library \"{s['library']}\"" for s in new[:12])
+            more = f"\n… and {len(new) - 12} more" if len(new) > 12 else ""
+            box.setText(f"{len(new)} new source(s) in {folder}:\n\n{listing}{more}\n\nImport them now?")
+            box.setInformativeText("Spectra already in a library are skipped, so nothing is duplicated.")
+            b_imp = box.addButton("Import", W.QMessageBox.AcceptRole)
+            b_rev = box.addButton("Review...", W.QMessageBox.ActionRole)
+            box.addButton("Not now", W.QMessageBox.RejectRole)
+            b_off = box.addButton("Don't check at startup", W.QMessageBox.DestructiveRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is b_imp:
+                self._run_imports([{"source": s, "library": s["library"]} for s in new])
+            elif clicked is b_rev:
+                self.on_data_folder()
+            elif clicked is b_off:
+                self.cfg["auto_import"] = False
+                self._save_folder_cfg()
+                self.host.statusBar().showMessage("Startup check of the data folder turned off "
+                                                  "(Import ▸ From data folder... to turn it back on)", 8000)
         self.run(self.client.scan_folder, folder, done=scanned,
                  failed=lambda m: self.host.statusBar().showMessage(f"Auto-import skipped: {m}", 8000))
 
@@ -1943,7 +1965,20 @@ class LibraryPanel(W.QWidget):
                              f"{len(sp['values'])} points · {sp['wavelength_start']:g}–{sp['wavelength_end']:g} {unit}"
                              + (f" · step {step:g}" if step else " · irregular grid"))
                 meta = sp.get("metadata") or {}
-                if meta.get("n_pixels"):
+                if sp.get("roi_class"):
+                    mode = meta.get("roi_mode")
+                    if mode == "class_mean":
+                        src = (f"class mean of {meta.get('n_rois', '?')} ROI(s), {meta.get('n_pixels', '?')} px, "
+                               f"{meta.get('n_scenes', '?')} image(s): {_esc(', '.join(meta.get('scenes') or []))}")
+                    elif mode == "roi_mean":
+                        src = f"mean of {_esc(meta.get('roi_name'))} in {_esc(meta.get('scene'))}, {meta.get('n_pixels', '?')} px"
+                    elif mode == "pixel":
+                        px = meta.get("pixel") or ["?", "?"]
+                        src = f"pixel (r{px[0]}, c{px[1]}) of {_esc(meta.get('roi_name'))} in {_esc(meta.get('scene'))}"
+                    else:
+                        src = "ROI spectrum"
+                    lines.append(f"ROI class <b>{_esc(sp['roi_class'])}</b> · {src}")
+                elif meta.get("n_pixels"):
                     lines.append(f"Aggregated from {meta['n_pixels']} pixels" +
                                  (f" ({_esc(meta.get('source_scenes'))})" if meta.get("source_scenes") else ""))
             self.lbl_mat.setText("<br>".join(lines))

@@ -104,18 +104,29 @@ class Database:
     def migrate(self) -> list:
         """Bring an existing database up to date (idempotent). Returns what was changed.
 
-        Databases created from the original new_hyperspectral schema.sql lack spectra.acquisition_type; this adds
-        it (plus its CHECK constraint and indexes) without touching existing data.
+        001: spectra.acquisition_type (+ CHECK constraint and indexes).
+        002: rois table, spectra.roi_id / spectra.roi_class, spectrum_rois link table (ROI analysis).
+        Existing data is never touched.
         """
         if not self.has_schema():
             return []
-        cols = {c["name"] for c in inspect(self.engine).get_columns("spectra")}
-        changed = [] if "acquisition_type" in cols else ["spectra.acquisition_type"]
+        insp = inspect(self.engine)
+        cols = {c["name"] for c in insp.get_columns("spectra")}
+        changed = [f"spectra.{c}" for c in ("acquisition_type", "roi_id", "roi_class") if c not in cols]
+        changed += [t for t in ("rois", "spectrum_rois") if not insp.has_table(t)]
         if self.is_postgres:
             self._run_script(MIGRATIONS_SQL)
         elif changed:
+            from . import models  # noqa: F401  (registers the tables)
+            Base.metadata.create_all(self.engine, tables=[Base.metadata.tables["rois"],
+                                                          Base.metadata.tables["spectrum_rois"]], checkfirst=True)
             with self.engine.begin() as c:
-                c.exec_driver_sql("ALTER TABLE spectra ADD COLUMN acquisition_type VARCHAR(20)")
+                if "spectra.acquisition_type" in changed:
+                    c.exec_driver_sql("ALTER TABLE spectra ADD COLUMN acquisition_type VARCHAR(20)")
+                if "spectra.roi_id" in changed:
+                    c.exec_driver_sql("ALTER TABLE spectra ADD COLUMN roi_id CHAR(32) REFERENCES rois(id)")
+                if "spectra.roi_class" in changed:
+                    c.exec_driver_sql("ALTER TABLE spectra ADD COLUMN roi_class VARCHAR(255)")
         return changed
 
     @contextmanager

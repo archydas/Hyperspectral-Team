@@ -303,7 +303,11 @@ def _scene_records(sc, path: Path, opts: ReadOptions, reader: str) -> List[Spect
     cube = sc.cube.astype(float)
     h, w, b = cube.shape
     flat = cube.reshape(-1, b)
-    valid = np.isfinite(flat).all(axis=1) & (np.abs(flat).sum(axis=1) > 0)
+    good = np.isfinite(flat).any(axis=0)                  # bands that are no-data everywhere (water bands) -> gaps
+    valid = np.isfinite(flat[:, good]).all(axis=1) & (np.nansum(np.abs(flat), axis=1) > 0)
+    import warnings
+    warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+    warnings.filterwarnings("ignore", "Degrees of freedom", RuntimeWarning)
     mode = opts.image_mode
     masks = sc.class_masks()
     if mode == "auto":
@@ -315,17 +319,18 @@ def _scene_records(sc, path: Path, opts: ReadOptions, reader: str) -> List[Spect
             raise ValueError(f"{path.name}: no label map / classes in this file - choose mean or sample")
         for cname, m in masks.items():
             px = cube[m]
-            px = px[np.isfinite(px).all(axis=1)]
+            px = px[np.isfinite(px[:, good]).all(axis=1)]
             if px.shape[0] == 0:
                 continue
-            out.append(SpectrumRecord(cname, sc.wavelengths, px.mean(0), std=px.std(0, ddof=1) if px.shape[0] > 1 else None,
+            out.append(SpectrumRecord(cname, sc.wavelengths, np.nanmean(px, 0),
+                                      std=np.nanstd(px, 0, ddof=1) if px.shape[0] > 1 else None,
                                       material_metadata={**base, "n_pixels": int(px.shape[0])},
                                       spectrum_metadata={"uid": f"{reader}:{path.name}:class:{cname}",
                                                          "n_pixels": int(px.shape[0]), "source_scenes": sc.name},
                                       group=g))
     elif mode == "mean":
         px = flat[valid]
-        out.append(SpectrumRecord(f"{sc.name} mean", sc.wavelengths, px.mean(0), std=px.std(0, ddof=1),
+        out.append(SpectrumRecord(f"{sc.name} mean", sc.wavelengths, np.nanmean(px, 0), std=np.nanstd(px, 0, ddof=1),
                                   material_metadata={**base, "n_pixels": int(px.shape[0])},
                                   spectrum_metadata={"uid": f"{reader}:{path.name}:mean", "n_pixels": int(px.shape[0]),
                                                      "source_scenes": sc.name}, group=g))

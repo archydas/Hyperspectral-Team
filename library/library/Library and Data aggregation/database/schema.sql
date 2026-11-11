@@ -70,6 +70,61 @@ CREATE TABLE datasets (
 
 
 -- ============================================================
+-- 2b. REGIONS OF INTEREST (HyperVista, migration 002)
+-- ============================================================
+-- A region drawn on an image (rectangle or polygon) labelled with a class.
+-- Many ROIs per class, many classes per image, many images per library.
+--
+-- Example:
+-- Field Campaign Library
+--   ├── vegetation : ROI 1 (scene_A, rect), ROI 3 (scene_B, polygon)
+--   └── soil       : ROI 2 (scene_A, polygon)
+
+CREATE TABLE rois (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    library_id UUID NOT NULL
+        REFERENCES libraries(id)
+        ON DELETE CASCADE,
+
+    dataset_id UUID
+        REFERENCES datasets(id)
+        ON DELETE SET NULL,
+
+    -- id of the ROI inside HyperVista; saving the same ROI again updates this row
+    roi_uid VARCHAR(64) NOT NULL,
+    roi_name VARCHAR(255),
+    class_name VARCHAR(255) NOT NULL,
+
+    scene_name VARCHAR(500),
+    scene_path TEXT,
+    image_rows INTEGER,
+    image_cols INTEGER,
+
+    -- rect {"rect": [r0, c0, r1, c1]} (end-exclusive) | polygon {"vertices": [[col, row], ...]}
+    geometry_type VARCHAR(20) NOT NULL
+        CONSTRAINT rois_geometry_type_check CHECK (geometry_type IN ('rect', 'polygon')),
+    geometry JSONB NOT NULL,
+
+    geometry_map JSONB,
+    crs TEXT,
+
+    bbox_row_min INTEGER,
+    bbox_row_max INTEGER,
+    bbox_col_min INTEGER,
+    bbox_col_max INTEGER,
+    n_pixels INTEGER,
+
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_rois_library_uid UNIQUE (library_id, roi_uid)
+);
+
+
+-- ============================================================
 -- 3. MATERIALS
 -- ============================================================
 -- Represents the actual material.
@@ -179,7 +234,28 @@ CREATE TABLE spectra (
         CONSTRAINT spectra_acquisition_type_check
         CHECK (acquisition_type IN ('lab', 'field', 'airborne', 'satellite')),
 
+    -- ROI provenance (HyperVista): the ROI the spectrum was taken from (NULL for pooled class means)
+    -- and the ROI class it represents
+    roi_id UUID
+        REFERENCES rois(id)
+        ON DELETE SET NULL,
+
+    roi_class VARCHAR(255),
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================
+-- 5b. SPECTRUM <-> ROI LINKS (HyperVista, migration 002)
+-- ============================================================
+-- Every ROI a spectrum was computed from: a pooled class mean links
+-- to all ROIs of its class, in one or several images.
+
+CREATE TABLE spectrum_rois (
+    spectrum_id UUID NOT NULL REFERENCES spectra(id) ON DELETE CASCADE,
+    roi_id UUID NOT NULL REFERENCES rois(id) ON DELETE CASCADE,
+    PRIMARY KEY (spectrum_id, roi_id)
 );
 
 
@@ -258,6 +334,26 @@ CREATE INDEX idx_materials_category_path
     ON materials(category varchar_pattern_ops);
 
 
+-- ROIs (HyperVista)
+CREATE INDEX idx_rois_library
+    ON rois(library_id);
+
+CREATE INDEX idx_rois_class
+    ON rois(library_id, class_name);
+
+CREATE INDEX idx_rois_scene
+    ON rois(scene_name);
+
+CREATE INDEX idx_spectra_roi
+    ON spectra(roi_id);
+
+CREATE INDEX idx_spectra_roi_class
+    ON spectra(roi_class);
+
+CREATE INDEX idx_spectrum_rois_roi
+    ON spectrum_rois(roi_id);
+
+
 -- JSON metadata indexes
 CREATE INDEX idx_materials_metadata
     ON materials USING GIN(metadata);
@@ -312,5 +408,11 @@ EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_samples_updated_at
 BEFORE UPDATE ON samples
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+
+CREATE TRIGGER update_rois_updated_at
+BEFORE UPDATE ON rois
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();

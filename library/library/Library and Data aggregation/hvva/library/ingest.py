@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from . import repository as repo
 from .formats import ReadOptions, SpectrumRecord, detect, read_path
 from .formats.refcollections import _has_ecostress, _walk_files
-from .models import DataFile, Library, Sample, Spectrum
+from .models import DataFile, Library, Material, Sample, Spectrum
 
 
 def default_dataset_name(path, reader_name: str) -> str:
@@ -85,8 +85,11 @@ def write_records(db: Session, records: List[SpectrumRecord], *, library_id=None
                                 file_type=(prov.suffix.lstrip(".") or "file") if prov.is_file() else "folder",
                                 file_size=prov.stat().st_size if prov.is_file() else None, checksum=cs,
                                 storage_path=spath, file_metadata={"source": source_label, "kind": kind}))
+        # duplicate check over the whole library (not just this dataset): re-importing a file under another
+        # dataset name, or a second copy of the same file, must not add the same spectra twice
         have = {(m or {}).get("uid") for (m,) in db.query(Spectrum.spectrum_metadata)
-                .join(Sample, Sample.id == Spectrum.sample_id).filter(Sample.dataset_id == ds.id)}
+                .join(Sample, Sample.id == Spectrum.sample_id).join(Material, Material.id == Sample.material_id)
+                .filter(Material.library_id == lib.id)}
         added = skipped = 0
         cats = set()
         for i, r in enumerate(records, 1):

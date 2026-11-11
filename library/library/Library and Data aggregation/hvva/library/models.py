@@ -13,6 +13,9 @@ generic UUID / JSON on SQLite) so the same models also run on a local SQLite fil
 HyperVista additions (database/migrations/001_category_tree_acquisition.sql, applied automatically on connect):
 ``spectra.acquisition_type`` and the convention that ``materials.category`` holds a '/'-separated hierarchy path
 (Vegetation/Tree/Tsuga/Canadensis).
+Migration 002 (ROIs): table ``rois`` (one row per region of interest drawn on an image, class by class),
+``spectra.roi_id`` / ``spectra.roi_class`` and the link table ``spectrum_rois`` (which ROIs a spectrum was computed
+from - a pooled class mean comes from many ROIs, possibly in several images).
 
 The JSON ``metadata`` column is exposed as ``<table>_metadata`` because ``metadata`` is reserved by SQLAlchemy.
 """
@@ -20,7 +23,8 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import (JSON, BigInteger, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
+                        Uuid)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.sql import func
 
@@ -110,7 +114,46 @@ class Spectrum(Base):
     values = Column(FloatArray, nullable=False)
     spectrum_metadata = _meta()
     acquisition_type = Column(String(20))          # lab | field | airborne | satellite | NULL (migration 001)
+    roi_id = Column(Uuid(as_uuid=True), ForeignKey("rois.id", ondelete="SET NULL"))   # single source ROI (002)
+    roi_class = Column(String(255))                # ROI class the spectrum represents (002)
     created_at = _created()
+
+
+class Roi(Base):
+    """A region of interest on an image (migration 002).  Geometry in pixel coordinates of that image:
+    rect {"rect": [r0, c0, r1, c1]} (end-exclusive) or polygon {"vertices": [[x=col, y=row], ...]};
+    geometry_map holds the same outline in map coordinates when the image is georeferenced."""
+    __tablename__ = "rois"
+    __table_args__ = (UniqueConstraint("library_id", "roi_uid", name="uq_rois_library_uid"),)
+    id = _id()
+    library_id = _fk("libraries.id")
+    dataset_id = Column(Uuid(as_uuid=True), ForeignKey("datasets.id", ondelete="SET NULL"))
+    roi_uid = Column(String(64), nullable=False)           # id of the ROI in HyperVista (scene file / ROI JSON)
+    roi_name = Column(String(255))
+    class_name = Column(String(255), nullable=False)
+    scene_name = Column(String(500))
+    scene_path = Column(Text)
+    image_rows = Column(Integer)
+    image_cols = Column(Integer)
+    geometry_type = Column(String(20), nullable=False)     # rect | polygon
+    geometry = Column(JSONType, nullable=False)
+    geometry_map = Column(JSONType)
+    crs = Column(Text)
+    bbox_row_min = Column(Integer)
+    bbox_row_max = Column(Integer)
+    bbox_col_min = Column(Integer)
+    bbox_col_max = Column(Integer)
+    n_pixels = Column(Integer)
+    roi_metadata = _meta()
+    created_at = _created()
+    updated_at = _updated()
+
+
+class SpectrumRoi(Base):
+    """spectrum <-> ROIs it was computed from (n-n; migration 002)."""
+    __tablename__ = "spectrum_rois"
+    spectrum_id = Column(Uuid(as_uuid=True), ForeignKey("spectra.id", ondelete="CASCADE"), primary_key=True)
+    roi_id = Column(Uuid(as_uuid=True), ForeignKey("rois.id", ondelete="CASCADE"), primary_key=True)
 
 
 class DataFile(Base):

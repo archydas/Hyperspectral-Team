@@ -141,3 +141,36 @@ def test_source_lists_arrays_for_gui(tmp_path):
     g = src.guess()
     assert g["cube_key"] == "cubeA" and g["labels_key"] == "gt" and g["band_axis"] == 2
     assert src.build(cube_key="cubeB", band_axis=2).cube.shape[2] == 5
+
+
+# ---------------------------------------------------------------- sensor GeoTIFF products (EnMAP)
+def _fake_enmap(tmp_path, level="L2A"):
+    tifffile = pytest.importorskip("tifffile")
+    pre = tmp_path / f"ENMAP01-____{level}-DT0000000001_20250101T000000Z_001_V010506_20260101T000000Z-"
+    wl = np.concatenate([np.linspace(418.4, 993.0, 91), np.linspace(902.5, 2445.5, 133)])
+    refl = 0.05 + 0.4 / (1 + np.exp(-(wl - 720) / 15))
+    cube = np.broadcast_to((refl * 10000).astype(np.int16), (30, 36, 224)).copy()
+    cube[:4] = -32768
+    cube[:, :, (wl > 1340) & (wl < 1460)] = -32768
+    xml = "".join(f"<bandID number='{i}'><wavelengthCenterOfBand>{c:.3f}</wavelengthCenterOfBand>"
+                  f"<FWHMOfBand>8</FWHMOfBand><GainOfBand>1</GainOfBand><OffsetOfBand>0</OffsetOfBand></bandID>"
+                  for i, c in enumerate(wl, 1))
+    (tmp_path / (pre.name + "METADATA.XML")).write_text(f"<level_X><specific><bandCharacterisation>{xml}"
+                                                         "</bandCharacterisation></specific></level_X>")
+    tifffile.imwrite(str(pre) + "SPECTRAL_IMAGE.TIF", cube.transpose(2, 0, 1), photometric="minisblack",
+                     planarconfig="separate")
+    tifffile.imwrite(str(pre) + "QL_VNIR.TIF", np.zeros((30, 36, 3), np.uint8), photometric="rgb")
+    return str(pre)
+
+
+def test_enmap_l2a_geotiff(tmp_path):
+    pre = _fake_enmap(tmp_path)
+    src = open_source(pre + "SPECTRAL_IMAGE.TIF")
+    assert "EnMAP L2A" in src.note and "-32768" in src.note
+    sc = load_scene(pre + "SPECTRAL_IMAGE.TIF")
+    assert sc.n_bands == 209 and np.all(np.diff(sc.wavelengths) > 0)          # VNIR/SWIR overlap resolved
+    assert 418 < sc.wavelengths[0] < 419 and sc.wavelengths[-1] == pytest.approx(2445.5)
+    assert np.isnan(sc.cube[0, 0]).all()                                       # no-data rows -> NaN
+    px = sc.cube[10, 10]
+    assert 0 < np.nanmin(px) and np.nanmax(px) < 0.5 and np.isnan(px).sum() == 10   # 0-1 reflectance, water gap
+    assert "QUICKLOOK" in open_source(pre + "QL_VNIR.TIF").note

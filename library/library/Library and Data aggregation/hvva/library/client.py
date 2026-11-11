@@ -118,6 +118,28 @@ class DirectClient(LibraryClient):
     def library_spectra(self, library_id, acquisition=None, category_path=None):
         return self._run(repo.library_spectra, library_id, None, acquisition, category_path)
 
+    # ---- ROIs (migration 002)
+    def save_roi_spectra(self, library_id, dataset_name, rois, items, category=None, acquisition=None):
+        return self._run(repo.save_roi_spectra, library_id, dataset_name, rois, items, category, acquisition)
+
+    def list_rois(self, library_id=None, scene_name=None, class_name=None):
+        return self._run(repo.list_rois, library_id, scene_name, class_name)
+
+    def get_roi(self, roi_id):
+        return self._run(repo.get_roi, roi_id)
+
+    def roi_classes(self, library_id):
+        return self._run(repo.roi_classes, library_id)
+
+    def roi_spectra(self, roi_id=None, library_id=None, class_name=None):
+        return self._run(repo.roi_spectra, roi_id, library_id, class_name)
+
+    def spectrum_roi_info(self, spectrum_id):
+        return self._run(repo.spectrum_roi_info, spectrum_id)
+
+    def delete_roi(self, roi_id, delete_spectra=False):
+        return self._run(repo.delete_roi, roi_id, delete_spectra)
+
     def save_spectra(self, library_id, dataset_name, items, category=None, acquisition=None):
         items = _sig_items(items, category)
 
@@ -293,6 +315,35 @@ class ApiClient(LibraryClient):
     def library_spectra(self, library_id, acquisition=None, category_path=None):
         return self._req("GET", f"/api/libraries/{self._q(library_id)}/spectra",
                          {"acquisition": acquisition, "category_path": category_path})
+
+    # ---- ROIs (migration 002)
+    def save_roi_spectra(self, library_id, dataset_name, rois, items, category=None, acquisition=None):
+        return self._req("POST", f"/api/libraries/{self._q(library_id)}/roi-spectra",
+                         body={"dataset_name": dataset_name, "category": category, "acquisition_type": acquisition,
+                               "rois": rois, "items": items})
+
+    def list_rois(self, library_id=None, scene_name=None, class_name=None):
+        if library_id is None:
+            return self._req("GET", "/api/rois", {"scene_name": scene_name, "class_name": class_name})
+        return self._req("GET", f"/api/libraries/{self._q(library_id)}/rois",
+                         {"scene_name": scene_name, "class_name": class_name})
+
+    def get_roi(self, roi_id):
+        return self._req("GET", f"/api/rois/{self._q(roi_id)}")
+
+    def roi_classes(self, library_id):
+        return self._req("GET", f"/api/libraries/{self._q(library_id)}/roi-classes")
+
+    def roi_spectra(self, roi_id=None, library_id=None, class_name=None):
+        if roi_id is not None:
+            return self._req("GET", f"/api/rois/{self._q(roi_id)}/spectra")
+        return self._req("GET", f"/api/libraries/{self._q(library_id)}/roi-classes/{self._q(class_name)}/spectra")
+
+    def spectrum_roi_info(self, spectrum_id):
+        return self._req("GET", f"/api/spectra/{self._q(spectrum_id)}/rois")
+
+    def delete_roi(self, roi_id, delete_spectra=False):
+        return self._req("DELETE", f"/api/rois/{self._q(roi_id)}", {"delete_spectra": "true" if delete_spectra else None})
 
     def save_spectra(self, library_id, dataset_name, items, category=None, acquisition=None):
         return self._req("POST", f"/api/libraries/{self._q(library_id)}/spectra",

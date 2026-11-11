@@ -7,7 +7,6 @@ import os
 import matplotlib
 import numpy as np
 from matplotlib.patches import Rectangle
-from matplotlib.widgets import RectangleSelector
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .. import APP_NAME, __version__
@@ -23,6 +22,7 @@ from ..core.synthetic import make_demo_scenes
 from . import theme
 from .canvases import ImageCanvas, PlotCanvas
 from .library_panel import LibraryPanel
+from .roi_panel import RoiPanel
 from .theme import THEMES, restyle_figure, set_matplotlib_theme, apply_app_theme
 
 W = QtWidgets
@@ -135,6 +135,8 @@ class LibraryBuilderWindow(W.QMainWindow):
         top.setSizes([600, 700])
         self.tabs = W.QTabWidget()
         self.tabs.addTab(self._tab_scenes(), "Scenes")
+        self.roipanel = RoiPanel(self)                     # ROI Tools + ROI Manager (moved from the DS3 viewer)
+        self.tabs.addTab(self.roipanel, "ROI Analysis")
         self.tabs.addTab(self._tab_grid(), "Wavelength Grid")
         self.tabs.addTab(self._tab_aggregate(), "Aggregation")
         self.tabs.addTab(self._tab_mosaic(), "Mosaic / Stack")
@@ -157,7 +159,7 @@ class LibraryBuilderWindow(W.QMainWindow):
         self.progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress)
         self.image_canvas.mpl_connect("button_press_event", self.on_image_click)
-        self.image_canvas.after_clear = self._attach_roi_selector
+        self.image_canvas.after_clear = self.roipanel.on_canvas_cleared
         self.image_canvas.message("No scene loaded")
         self.plot_canvas.message("Nothing to plot yet")
 
@@ -180,18 +182,19 @@ class LibraryBuilderWindow(W.QMainWindow):
         self.sp_k = W.QSpinBox(); self.sp_k.setRange(2, 20); self.sp_k.setValue(4)
         btn_k = W.QPushButton("Auto-classes (k-means)"); btn_k.clicked.connect(self.on_kmeans)
         btn_lab = W.QPushButton("Import label map (any format)..."); btn_lab.clicked.connect(self.on_import_labels)
-        self.chk_roi = W.QCheckBox("Draw rectangle ROI on the scene view"); self.chk_roi.toggled.connect(self._attach_roi_selector)
-        self.ed_class = W.QLineEdit("class_1")
-        btn_clr = W.QPushButton("Clear ROIs / labels"); btn_clr.clicked.connect(self.on_clear_labels)
+        btn_roi = W.QPushButton("Draw ROIs (ROI Analysis tab)...")
+        btn_roi.clicked.connect(lambda: self.tabs.setCurrentWidget(self.roipanel))
+        btn_clr = W.QPushButton("Clear label map"); btn_clr.clicked.connect(self.on_clear_labels)
         form = W.QFormLayout(); form.setFieldGrowthPolicy(W.QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("Wavelength start (nm)", self.sp_wl0); form.addRow("Wavelength stop (nm)", self.sp_wl1)
         form.addRow(btn_wl)
         form.addRow("Classes (k)", self.sp_k); form.addRow(btn_k)
-        form.addRow(btn_lab); form.addRow(self.chk_roi); form.addRow("ROI class name", self.ed_class); form.addRow(btn_clr)
+        form.addRow(btn_lab); form.addRow(btn_clr); form.addRow(btn_roi)
         right = _group("Prepare selected scene", _help(
             "Scenes without wavelengths (e.g. .npy or plain GeoTIFF) need them assigned before aggregation. "
-            "Classes come from a label map (.npy, 0 = unlabelled), from rectangle ROIs drawn on the view, or "
-            "from a quick k-means. Classes are matched across scenes by name."), form)
+            "Classes come from a label map (.npy, 0 = unlabelled), from a quick k-means, or from rectangle / "
+            "polygon ROIs drawn in the ROI Analysis tab (which also saves them class by class to the library "
+            "database). Classes are matched across scenes by name."), form)
         return _pair(left, right)
 
     # --- Grid tab -------------------------------------------------------
@@ -345,6 +348,8 @@ class LibraryBuilderWindow(W.QMainWindow):
         self.tbl_scenes.blockSignals(False)
         if 0 <= keep < len(self.scenes):
             self.tbl_scenes.selectRow(keep)
+        if hasattr(self, "roipanel"):
+            self.roipanel.refresh()
 
     # ------------------------------------------------------------ scenes
     def on_add_scenes(self):
@@ -402,7 +407,7 @@ class LibraryBuilderWindow(W.QMainWindow):
     def on_demo(self):
         for sc in make_demo_scenes(3):
             self.add_scene(sc)
-        self.say("Loaded 3 synthetic overlapping scenes (different band sampling; A, B labelled by map, C by ROI rectangles).")
+        self.say("Loaded 3 synthetic overlapping scenes (different band sampling; A, B labelled by map, C by ROI rectangles - see the ROI Analysis tab).")
 
     def on_remove(self):
         r = self.tbl_scenes.currentRow()
@@ -427,7 +432,9 @@ class LibraryBuilderWindow(W.QMainWindow):
                 self.say(f"Saved ENVI image + header with map info next to {p}.")
 
     def on_scene_selected(self):
+        self.roipanel.pending = None
         self.show_scene()
+        self.roipanel.refresh()
         sc = self.current_scene()
         if sc and sc.has_wavelengths:
             self.sp_wl0.setValue(float(sc.wavelengths.min())); self.sp_wl1.setValue(float(sc.wavelengths.max()))
@@ -437,9 +444,21 @@ class LibraryBuilderWindow(W.QMainWindow):
         sc = self.current_scene()
         if sc is None:
             self.image_canvas.message("No scene loaded")
+            self.roipanel.refresh()
             return
+        if self.roipanel.show_anomaly:
+            try:
+                img = self.roipanel.anomaly_image(sc)
+                self.image_canvas.show_image(img, title=f"{sc.name} - anomaly map", cmap="inferno", colorbar=True)
+                return
+            except ValueError as e:
+                self._err(e)
         self.image_canvas.show_image(sc.rgb(), title=sc.name)
-        self._draw_rois()
+
+    def select_scene(self, sc):
+        """Make *sc* the current scene (ROI Manager double-click)."""
+        if sc in self.scenes:
+            self.tbl_scenes.selectRow(self.scenes.index(sc))
 
     def on_assign_wl(self):
         sc = self.current_scene()
@@ -491,41 +510,13 @@ class LibraryBuilderWindow(W.QMainWindow):
     def on_clear_labels(self):
         sc = self.current_scene()
         if sc:
-            sc.labels, sc.class_names, sc.rois = None, {}, []
+            sc.labels, sc.class_names = None, {}
             self.refresh_scenes(); self.show_scene()
-
-    # --- ROI drawing -------------------------------------------------------
-    def _attach_roi_selector(self, *_):
-        self._roi_sel = None
-        if getattr(self, "chk_roi", None) is not None and self.chk_roi.isChecked() and self.current_scene() is not None:
-            self._roi_sel = RectangleSelector(self.image_canvas.ax, self._on_roi, useblit=False, button=[1],
-                                              interactive=False, minspanx=2, minspany=2)
-        self._draw_rois()
-
-    def _on_roi(self, press, release):
-        sc = self.current_scene()
-        if not sc:
-            return
-        c0, c1 = sorted((int(press.xdata), int(release.xdata)))
-        r0, r1 = sorted((int(press.ydata), int(release.ydata)))
-        sc.rois.append({"class": self.ed_class.text().strip() or "class_1", "rect": (r0, c0, r1 + 1, c1 + 1)})
-        self.refresh_scenes(); self.say(f"{sc.name}: ROI '{sc.rois[-1]['class']}' rows {r0}-{r1}, cols {c0}-{c1}.")
-        self.show_scene()
-
-    def _draw_rois(self):
-        sc = self.current_scene()
-        if sc is None or not sc.rois:
-            return
-        names = sorted({r["class"] for r in sc.rois})
-        for r in sc.rois:
-            r0, c0, r1, c1 = r["rect"]
-            self.image_canvas.ax.add_patch(Rectangle((c0 - .5, r0 - .5), c1 - c0, r1 - r0, fill=False, lw=1.6,
-                                                     ec=PALETTE[names.index(r["class"]) % 10]))
-        self.image_canvas.draw_idle()
+            self.say(f"{sc.name}: label map cleared (ROIs are managed in the ROI Analysis tab).")
 
     def on_image_click(self, ev):
         sc = self.current_scene()
-        if sc is None or ev.inaxes is not self.image_canvas.ax or ev.xdata is None or self.chk_roi.isChecked():
+        if sc is None or ev.inaxes is not self.image_canvas.ax or ev.xdata is None or self.roipanel.selecting():
             return
         r, c = int(round(ev.ydata)), int(round(ev.xdata))
         if not (0 <= r < sc.shape[0] and 0 <= c < sc.shape[1]):

@@ -50,7 +50,7 @@ class Plugin:
             if out.ndim != 3 or out.shape[:2] != scene.cube.shape[:2]:
                 raise ValueError("a correction plugin must return a cube with the same rows and columns")
             return Scene(f"{scene.name}+{self.name}", out, wl, scene.geo, scene.labels, dict(scene.class_names),
-                         list(scene.rois))
+                         [dict(r, id=None) for r in scene.rois])   # new ids: a new image
         if not isinstance(out, dict):
             out = {"image": np.asarray(out)}
         return out

@@ -15,6 +15,12 @@ class OpenOptionsDialog(W.QDialog):
         info = W.QLabel(f"Arrays found in the file:\n{arr}" + ("\n  ..." if len(src.arrays) > 25 else ""))
         info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         lay.addWidget(info)
+        if src.note:
+            warn = "QUICKLOOK" in src.note or "mask layer" in src.note
+            note = W.QLabel(("⚠ " if warn else "✓ ") + src.note[0].upper() + src.note[1:] + ".")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #d97706; font-weight: bold;" if warn else "color: #16a34a;")
+            lay.addWidget(note)
         form = W.QFormLayout()
         self.cb_cube = W.QComboBox()
         self.cb_cube.addItems(src.cube_candidates())
@@ -25,16 +31,24 @@ class OpenOptionsDialog(W.QDialog):
         self.cb_lab = W.QComboBox()
         self.cb_wl = W.QComboBox()
         self.sp0 = W.QDoubleSpinBox(); self.sp0.setRange(0, 20000); self.sp0.setValue(400)
-        self.sp1 = W.QDoubleSpinBox(); self.sp1.setRange(0, 20000); self.sp1.setValue(1000)
+        self.sp1 = W.QDoubleSpinBox(); self.sp1.setRange(0, 20000); self.sp1.setValue(2500)
+        self.chk_spread = W.QCheckBox("No wavelengths in the file - spread them evenly over the range below")
+        self.chk_spread.setChecked(False)
+        self.chk_spread.toggled.connect(self._sync_spread)
         form.addRow("Hyperspectral cube", self.cb_cube)
         form.addRow("Which axis is the spectral axis?", self.cb_axis)
         form.addRow("Class / ground-truth map", self.cb_lab)
         form.addRow("Wavelength vector", self.cb_wl)
-        form.addRow("...or spread over (nm) from", self.sp0)
-        form.addRow("to", self.sp1)
+        if src.wavelengths is not None:
+            w = src.wavelengths
+            form.addRow("Wavelengths from the file", W.QLabel(f"{len(w)} bands, {w.min():.1f}-{w.max():.1f} nm"))
+        form.addRow(self.chk_spread)
+        form.addRow("from (nm)", self.sp0)
+        form.addRow("to (nm)", self.sp1)
         lay.addLayout(form)
-        self.lbl = W.QLabel("Wavelengths in micrometres are converted to nm. If the file has no wavelengths, the range "
-                            "above is used (you can also change it later in the Scenes tab).")
+        self.lbl = W.QLabel("Wavelengths in micrometres are converted to nm. Spread evenly only if you know the "
+                            "sensor's range (e.g. AVIRIS / EnMAP ~400-2500 nm, VNIR cameras ~400-1000 nm) - "
+                            "otherwise leave it off and assign them later in the Scenes tab.")
         self.lbl.setWordWrap(True)
         lay.addWidget(self.lbl)
         self.chk_all = W.QCheckBox(f"Use these settings for the remaining {n_remaining} file(s)")
@@ -43,8 +57,20 @@ class OpenOptionsDialog(W.QDialog):
         bb = W.QDialogButtonBox(W.QDialogButtonBox.Ok | W.QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+        self.setMinimumWidth(620)
         self.cb_axis.currentIndexChanged.connect(self._axis_changed)
+        self.cb_wl.currentIndexChanged.connect(self._sync_spread)
         self._cube_changed(self.cb_cube.currentText(), first=True)
+        self._sync_spread()
+
+    def _sync_spread(self, *_):
+        has = bool(self.cb_wl.currentData()) or self.src.wavelengths is not None
+        self.chk_spread.setEnabled(not has)
+        if has:
+            self.chk_spread.setChecked(False)
+        on = self.chk_spread.isChecked()
+        self.sp0.setEnabled(on)
+        self.sp1.setEnabled(on)
 
     def _cube_changed(self, key, first=False):
         if not key:
@@ -85,7 +111,7 @@ class OpenOptionsDialog(W.QDialog):
         wl_key = self.cb_wl.currentData()
         return dict(cube_key=self.cb_cube.currentText(), band_axis=self.cb_axis.currentData(),
                     labels_key=self.cb_lab.currentData(), wavelengths_key=wl_key,
-                    wavelength_range=None if wl_key or self.src.wavelengths is not None else (self.sp0.value(), self.sp1.value()))
+                    wavelength_range=(self.sp0.value(), self.sp1.value()) if self.chk_spread.isChecked() else None)
 
 
 class RawDialog(W.QDialog):

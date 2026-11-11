@@ -4,6 +4,8 @@
 
     hvva/core/      algorithms, no GUI, no database      (numpy only)
       scene.py      Scene dataclass; load_scene(); save .npz / ENVI
+      rois.py       ROI geometry (rect / polygon), masks, pooling across images, anomaly map, DS3-ROIs JSON,
+                    map-coordinate transfer, records for the library database
       loaders.py    universal format loaders (.mat, HDF5, NetCDF, Zarr, TIFF, NumPy, raw) + guessing
       geo.py        GeoInfo: CRS + affine transform, ENVI map info <-> transform
       resample.py   common_grid(), resample_spectra() / resample_cube()
@@ -31,6 +33,7 @@
       db.py         legacy single-file SQLite signature store (used by the CLI --db option and tests)
     hvva/gui/       PyQt5 window, theme and canvases (depends on core + library)
       library_panel.py  the Library tab (async via QThreadPool; never blocks the window)
+      roi_panel.py      the ROI Analysis tab (ROI tools + ROI Manager; database work through the Library tab's client)
     database/       docker-compose.yml + schema.sql for the PostgreSQL server
     data/           sample spectra CSVs (material_spectra.csv, soil_spectra.csv)
     hvva/cli.py     headless entry point:  python -m hvva <command>
@@ -53,6 +56,17 @@ wildcards escaped), `rename_category` rewrites a subtree. Acquisition: `spectra.
 (lab, field, airborne, satellite) or NULL; `list_materials(acquisition=...)` keeps materials having such a spectrum;
 `'__none__'` means uncategorised / untagged in both filters. Schema changes go in `database/migrations/` (idempotent)
 and are applied by `Database.migrate()` on connect; `database/schema.sql` already contains them for new installs.
+ROIs (migration 002): `rois` (one row per ROI: `library_id`, `roi_uid` = HyperVista's ROI id, unique per
+library, `class_name`, `roi_name`, `scene_name/path`, `image_rows/cols`, `geometry_type` rect|polygon, `geometry`
+JSONB in pixels — rect `[r0, c0, r1, c1]` end-exclusive, polygon `[[col, row], ...]` pixel centres —,
+`geometry_map` + `crs`, `bbox_*`, `n_pixels`, `metadata`), `spectra.roi_id` (FK, SET NULL; set when the spectrum
+comes from one ROI), `spectra.roi_class`, and `spectrum_rois(spectrum_id, roi_id)` (all source ROIs; a pooled class
+mean links to every ROI of its class). `repository.save_roi_spectra` writes ROIs + spectra in one transaction and
+skips spectra whose `metadata.uid` is already in the library; `list_rois`, `roi_classes`, `roi_spectra`,
+`spectrum_roi_info`, `delete_roi` read and manage them (`/api/libraries/{id}/rois`, `/roi-classes`,
+`/roi-spectra`, `/api/rois/{id}`). `core.rois.library_items(items, mode)` builds the payload from scenes.
+Scene ROI dicts: `{id, name, class, kind: rect|polygon, rect (r0, c0, r1, c1) | vertices [(x, y)]}`; old
+`{class, rect}` dicts are upgraded on load. Mask rules match the viewer (pixel centre inside the polygon).
 Adding a file format: subclass `formats.base.Reader` in one of the formats/ modules and decorate it with
 `@register`. Set `name`, `label` and `extensions`; implement `sniff(path)` (0 = no, 1 = certain) and
 `read(path, opts)`, yielding `SpectrumRecord`s with wavelengths and values as found, plus hints (`wl_unit`,

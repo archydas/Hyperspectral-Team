@@ -50,8 +50,9 @@ def make_demo_scenes(n=3, seed=0, size=(100, 100)):
             sc.labels = lab.copy()
             sc.class_names = {k + 1: v for k, v in enumerate(CLASSES)}
         else:                                                          # labelled by ROI rectangles
-            sc.rois = [{"class": "urban", "rect": (60, 5, 90, 70)},
-                       {"class": "vegetation", "rect": (15, 0, 45, 18)},
-                       {"class": "soil", "rect": (0, 20, 8, 100)}]
+            for roi in ({"class": "urban", "rect": (60, 5, 90, 70)},
+                        {"class": "vegetation", "rect": (15, 0, 45, 18)},
+                        {"class": "soil", "rect": (0, 20, 8, 100)}):
+                sc.add_roi(roi)
         scenes.append(sc)
     return scenes

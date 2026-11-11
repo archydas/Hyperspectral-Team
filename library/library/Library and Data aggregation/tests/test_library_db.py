@@ -36,7 +36,7 @@ def client(request, tmp_path):
         url = os.environ["HVVA_TEST_PG_URL"]
         db = Database(url)
         with db.engine.begin() as con:
-            con.exec_driver_sql("DROP TABLE IF EXISTS data_files, spectra, samples, materials, datasets, libraries CASCADE")
+            con.exec_driver_sql("DROP TABLE IF EXISTS spectrum_rois, rois, data_files, spectra, samples, materials, datasets, libraries CASCADE")
         db.dispose()
         c = DirectClient(url, init_schema=True)
     yield c
@@ -208,7 +208,7 @@ def test_migration_adds_acquisition_column(tmp_path):
                        "\"values\" JSON, metadata JSON, created_at DATETIME)"))
     eng.dispose()
     db = Database(url)
-    assert db.migrate() == ["spectra.acquisition_type"]
+    assert db.migrate() == ["spectra.acquisition_type", "spectra.roi_id", "spectra.roi_class", "rois", "spectrum_rois"]
     assert "acquisition_type" in {c["name"] for c in inspect(db.engine).get_columns("spectra")}
     assert db.migrate() == []                                       # idempotent
 

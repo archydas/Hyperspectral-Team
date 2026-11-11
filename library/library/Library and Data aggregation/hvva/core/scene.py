@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .geo import GeoInfo
+from .rois import normalize_roi, roi_mask
 
 
 @dataclass
@@ -20,8 +21,25 @@ class Scene:
     geo: Optional[GeoInfo] = None
     labels: Optional[np.ndarray] = None                # (rows, cols) int, 0 = unlabelled
     class_names: Dict[int, str] = field(default_factory=dict)
-    rois: List[dict] = field(default_factory=list)     # {"class": str, "rect": (r0, c0, r1, c1)}
+    rois: List[dict] = field(default_factory=list)     # see hvva.core.rois: {id, name, class, kind, rect|vertices}
     path: Optional[str] = None
+
+    def __post_init__(self):
+        self.rois = [normalize_roi(r, k) for k, r in enumerate(self.rois, 1)]
+
+    # ---- ROIs --------------------------------------------------------------
+    def add_roi(self, roi: dict) -> dict:
+        """Normalise (id, name, kind) and append; returns the stored ROI."""
+        names = {r["name"] for r in self.rois}
+        k = len(self.rois) + 1
+        while f"ROI {k}" in names:
+            k += 1
+        r = normalize_roi(roi, k)
+        self.rois.append(r)
+        return r
+
+    def roi_by_id(self, roi_id: str) -> Optional[dict]:
+        return next((r for r in self.rois if r["id"] == roi_id), None)
 
     # ---- shape helpers -------------------------------------------------
     @property
@@ -38,7 +56,7 @@ class Scene:
 
     # ---- class masks -----------------------------------------------------
     def class_masks(self) -> Dict[str, np.ndarray]:
-        """{class name: boolean mask} from the label map and the rectangular ROIs."""
+        """{class name: boolean mask} from the label map and the ROIs (rectangles and polygons)."""
         h, w, _ = self.cube.shape
         out: Dict[str, np.ndarray] = {}
         if self.labels is not None:
@@ -48,9 +66,8 @@ class Scene:
                 nm = self.class_names.get(int(cid), f"class_{int(cid)}")
                 out[nm] = out.get(nm, np.zeros((h, w), bool)) | (self.labels == cid)
         for roi in self.rois:
-            r0, c0, r1, c1 = roi["rect"]
             m = out.setdefault(roi["class"], np.zeros((h, w), bool))
-            m[max(r0, 0):min(r1, h), max(c0, 0):min(c1, w)] = True
+            m |= roi_mask(roi, h, w)
         return {k: v for k, v in out.items() if v.any()}
 
     def rgb(self, bands=None, stretch=(2, 98)):
@@ -79,12 +96,23 @@ class Scene:
 # ----------------------------------------------------------------------
 # Native format: .npz keeps the cube, wavelengths, geo and labels together
 # ----------------------------------------------------------------------
+def _roi_meta(r):
+    d = {"id": r["id"], "name": r["name"], "class": r["class"], "kind": r["kind"]}
+    if r["kind"] == "rect":
+        d["rect"] = [int(v) for v in r["rect"]]
+    else:
+        d["vertices"] = [[float(x), float(y)] for x, y in r["vertices"]]
+    if r.get("saved_to"):
+        d["saved_to"] = list(r["saved_to"])          # libraries the ROI was saved to (ROI Manager column)
+    return d
+
+
 def save_scene(scene: Scene, path: str):
     meta = {
         "name": scene.name,
         "geo": scene.geo.to_dict() if scene.geo else None,
         "class_names": {str(k): v for k, v in scene.class_names.items()},
-        "rois": [{"class": r["class"], "rect": list(r["rect"])} for r in scene.rois],
+        "rois": [_roi_meta(r) for r in scene.rois],
     }
     arrays = {"cube": scene.cube.astype(np.float32), "meta": np.array(json.dumps(meta))}
     if scene.wavelengths is not None:
@@ -105,7 +133,7 @@ def _load_npz(path):
         geo=GeoInfo.from_dict(meta.get("geo")),
         labels=z["labels"] if "labels" in z.files else None,
         class_names={int(k): v for k, v in meta.get("class_names", {}).items()},
-        rois=[{"class": r["class"], "rect": tuple(r["rect"])} for r in meta.get("rois", [])],
+        rois=list(meta.get("rois", [])),            # old files ({class, rect}) are upgraded by Scene.__post_init__
         path=path)
 
 
@@ -152,6 +180,12 @@ def load_envi(path):
         cube = raw.reshape(nl, nb, ns).transpose(0, 2, 1)
     else:
         cube = raw.reshape(nl, ns, nb)
+    if "data ignore value" in h:                                  # no-data value -> gaps
+        try:
+            ign = float(h["data ignore value"])
+            cube = np.where(cube == ign, np.nan, cube.astype(np.float32))
+        except ValueError:
+            pass
     wl = None
     if "wavelength" in h:
         wl = np.array([float(v) for v in _hdr_list(h["wavelength"])])

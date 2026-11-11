@@ -9,6 +9,7 @@ from several scenes.
 | Mosaic (georeferenced or side by side), composite, 4-D stack | `hvva/core/mosaic.py` — tab *Mosaic / Stack* |
 | Signature export: CSV, JSON, ENVI spectral library `.sli` (+ `_std.sli`) | `hvva/core/export.py` — tab *Signature Export* |
 | **Material spectral library in PostgreSQL** (libraries → datasets → materials → samples → spectra): browse, search, add, import CSV, compare, save aggregated signatures / pixels, spectral-angle matching | `hvva/library/` + `hvva/gui/library_panel.py` — tab *Library* (see below) |
+| **ROI Analysis** (moved from the DS3 viewer): rectangle / polygon ROIs on any number of images, ROI Manager across images, class means pooled over images, anomaly map, DS3-ROIs JSON, ROIs saved class by class to the library database | `hvva/core/rois.py` + `hvva/gui/roi_panel.py` — tab *ROI Analysis* (see below) |
 | Georeferencing kept with every scene (CRS + affine transform; ENVI map info, GeoTIFF, `.npz`) | `hvva/core/geo.py` — tab *Georeferencing* |
 | Plugins (drop a `.py` into `plugins/`) | `hvva/core/plugins.py`, `plugins/` — tab *Plugins* |
 
@@ -22,6 +23,44 @@ names like `gt`/`labels`) and a wavelength vector (names like `wavelength`) by i
 was found and lets you change every choice; headless use the options `--cube-key --band-axis --labels-key --wl-key
 --wl-range --raw --labels-file`. Ground truth in a separate file (e.g. `PaviaU_gt.mat`) works in both.
 `.mat`/HDF5 need `scipy`/`h5py`; NetCDF4 needs `netCDF4`; Zarr needs `zarr` (each is only required for its format).
+
+**Sensor products (GeoTIFF).** No-data values become gaps; band wavelengths come from the file's metadata or, for
+**EnMAP**, from the product's `*-METADATA.XML` (keep it in the same folder as `*-SPECTRAL_IMAGE.TIF`): 224 bands →
+209 sorted bands (VNIR/SWIR overlap resolved), L2A reflectance scaled to 0–1, -32768 → gaps. Open the
+`SPECTRAL_IMAGE` file — `QL_*` files are RGB quicklooks and `QL_QUALITY_*` are masks; the open dialog warns about
+both.
+
+## ROI Analysis (tab *ROI Analysis*)
+
+The DS3 viewer's *ROI Tools* and *ROI Manager*, moved here and extended to several images and the database.
+
+* **Draw.** Tick *Enable ROI selection*, pick *Rectangle (drag)* or *Polygon (click points; click the first point
+  to close, Esc restarts)*, type or pick a class, then *Add selection to ROI list* (or tick *Add as soon as it is
+  drawn*). The pending selection is dashed yellow; ROIs are outlined in their class colour and numbered.
+  Switch images in the *Scenes* tab and keep drawing — one class can have ROIs in many images, several ROIs per
+  image. *Show anomaly map* (distance from the image mean spectrum) helps to find rare materials.
+* **ROI Manager.** One table for all images (or the current one): image, ROI, class, shape, pixels and the
+  libraries it was saved to. Delete / Clear / Set class / Rename; double-click a row to jump to its image.
+  *Plot ROI spectra* (mean ± std per ROI) and *Plot class means* (pixels of all ROIs of a class pooled over all
+  images, resampled to a common grid if the images differ). *Save / Load ROIs...* use the viewer's DS3-ROIs JSON
+  (version 2 adds the image name and ROI id; the viewer opens it, and HyperVista opens the viewer's files).
+* **Save ROIs to library database...** stores the selected ROIs, the current image's or all of them, class by
+  class: *class mean ± std pooled over all ROIs of the class*, *one mean ± std per ROI*, or *individual pixel
+  spectra* (capped per ROI). Each class becomes a material (category e.g. `Field ROIs/vegetation`), its spectra
+  are samples, and every ROI is a row of the new `rois` table (class, image, rectangle/polygon pixel geometry, map
+  geometry + CRS when georeferenced, bounding box, pixel count). Each spectrum records its ROI class
+  (`spectra.roi_class`), its ROI (`spectra.roi_id`) and every ROI it was computed from (`spectrum_rois`). Saving
+  the same ROIs again adds nothing; a ROI that was changed is updated and gets a new sample.
+* **Load ROIs from library database...** lists the stored ROIs (all libraries or one). ROIs drawn on the current
+  image (same name and size) come back with their ids; on another georeferenced image of the same area (same CRS)
+  they are placed through their map coordinates. The same dialog deletes ROIs from the database (keeping or
+  deleting their spectra).
+* The Library tab shows, for a spectrum saved this way, its ROI class and where it came from.
+* ROIs are stored with the scene (`.npz`), and the *Aggregation*, *Mosaic* and export tabs use them (polygons
+  included) like label-map classes.
+
+An existing database gets the `rois` and `spectrum_rois` tables and the `spectra.roi_id` / `roi_class` columns
+the first time HyperVista or the API server connects (`database/migrations/002_rois.sql`); no data is changed.
 
 ## Library database (tab *Library*)
 

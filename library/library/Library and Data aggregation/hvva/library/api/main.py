@@ -20,6 +20,12 @@ Added for HyperVista:
     POST /api/libraries/{id}/categories/rename   {"old_path", "new_path"}
     PATCH /api/materials                     {"ids": [...], "category"?: path|null, "acquisition_type"?: tag|null}
     PATCH /api/spectra/{id}                  {"acquisition_type": tag|null}
+    ROI analysis (migration 002):
+    POST /api/libraries/{id}/roi-spectra     {"dataset_name", "rois": [...], "items": [...]}  (ROIs + their spectra)
+    GET  /api/libraries/{id}/rois?scene_name=&class_name=          GET /api/rois?scene_name=&class_name=
+    GET  /api/libraries/{id}/roi-classes     GET /api/libraries/{id}/roi-classes/{class}/spectra
+    GET  /api/rois/{id}   GET /api/rois/{id}/spectra   DELETE /api/rois/{id}?delete_spectra=true
+    GET  /api/spectra/{id}/rois
 """
 from __future__ import annotations
 
@@ -107,6 +113,38 @@ class SpectraSave(BaseModel):
     items: List[SpectrumItem]
 
 
+class RoiRecord(BaseModel):
+    uid: str = Field(..., min_length=1, max_length=64)
+    name: Optional[str] = None
+    class_: str = Field(..., alias="class", min_length=1, max_length=255)
+    kind: str
+    geometry: dict
+    scene_name: Optional[str] = None
+    scene_path: Optional[str] = None
+    image_rows: Optional[int] = None
+    image_cols: Optional[int] = None
+    geometry_map: Optional[dict] = None
+    crs: Optional[str] = None
+    bbox: Optional[List[Optional[int]]] = None
+    n_pixels: Optional[int] = None
+    metadata: Optional[dict] = None
+
+
+class RoiSpectrumItem(SpectrumItem):
+    class_: Optional[str] = Field(None, alias="class")
+    sample_name: Optional[str] = None
+    roi_uids: List[str] = []
+    uid: Optional[str] = None
+
+
+class RoiSpectraSave(BaseModel):
+    dataset_name: str = Field("HyperVista ROIs", min_length=1, max_length=255)
+    category: Optional[str] = None
+    acquisition_type: Optional[str] = None
+    rois: List[RoiRecord] = []
+    items: List[RoiSpectrumItem] = []
+
+
 class MaterialsPatch(BaseModel):
     ids: List[str] = Field(..., min_length=1)
     category: Optional[str] = None             # only applied when present in the body (null = uncategorised)
@@ -187,6 +225,34 @@ def save_spectra(library_id: str, payload: SpectraSave, db: Session = Depends(ge
     except HTTPException:
         db.rollback()
         raise
+
+
+@libraries.post("/{library_id}/roi-spectra")
+def save_roi_spectra(library_id: str, payload: RoiSpectraSave, db: Session = Depends(get_db)):
+    rois = [r.model_dump(by_alias=True) for r in payload.rois]
+    items = [it.model_dump(by_alias=True) for it in payload.items]
+    try:
+        return _nf(repo.save_roi_spectra, db, library_id, payload.dataset_name, rois, items, payload.category,
+                   payload.acquisition_type)
+    except HTTPException:
+        db.rollback()
+        raise
+
+
+@libraries.get("/{library_id}/rois")
+def get_library_rois(library_id: str, scene_name: Optional[str] = None, class_name: Optional[str] = None,
+                     db: Session = Depends(get_db)):
+    return _nf(repo.list_rois, db, library_id, scene_name, class_name)
+
+
+@libraries.get("/{library_id}/roi-classes")
+def get_roi_classes(library_id: str, db: Session = Depends(get_db)):
+    return _nf(repo.roi_classes, db, library_id)
+
+
+@libraries.get("/{library_id}/roi-classes/{class_name}/spectra")
+def get_roi_class_spectra(library_id: str, class_name: str, db: Session = Depends(get_db)):
+    return _nf(repo.roi_spectra, db, None, library_id, class_name)
 
 
 @libraries.post("/{library_id}/import-csv")
@@ -276,6 +342,31 @@ def get_sample_spectra(sample_id: str, db: Session = Depends(get_db)):
 @api.patch("/spectra/{spectrum_id}", tags=["Spectra"])
 def patch_spectrum(spectrum_id: str, payload: SpectrumPatch, db: Session = Depends(get_db)):
     return _nf(repo.set_spectrum_acquisition, db, spectrum_id, payload.acquisition_type)
+
+
+@api.get("/spectra/{spectrum_id}/rois", tags=["ROIs"])
+def get_spectrum_rois(spectrum_id: str, db: Session = Depends(get_db)):
+    return _nf(repo.spectrum_roi_info, db, spectrum_id)
+
+
+@api.get("/rois", tags=["ROIs"])
+def get_all_rois(scene_name: Optional[str] = None, class_name: Optional[str] = None, db: Session = Depends(get_db)):
+    return _nf(repo.list_rois, db, None, scene_name, class_name)
+
+
+@api.get("/rois/{roi_id}", tags=["ROIs"])
+def get_roi(roi_id: str, db: Session = Depends(get_db)):
+    return _nf(repo.get_roi, db, roi_id)
+
+
+@api.get("/rois/{roi_id}/spectra", tags=["ROIs"])
+def get_roi_spectra(roi_id: str, db: Session = Depends(get_db)):
+    return _nf(repo.roi_spectra, db, roi_id)
+
+
+@api.delete("/rois/{roi_id}", tags=["ROIs"])
+def delete_roi(roi_id: str, delete_spectra: bool = False, db: Session = Depends(get_db)):
+    return _nf(repo.delete_roi, db, roi_id, delete_spectra)
 
 
 @api.get("/spectra/{spectrum_id}", tags=["Spectra"])

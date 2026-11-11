@@ -1,5 +1,42 @@
 # Library module → PostgreSQL material library (DS3 backend)
 
+## v3.2 — satellite / airborne GeoTIFF products (EnMAP and others)
+* GeoTIFF loading reads the **no-data value** (GDAL nodata tag; EnMAP -32768) and turns it into gaps (NaN), so
+  borders and bad bands no longer show as -32768 spikes; ENVI `data ignore value` likewise.
+* **Band wavelengths** are read from GDAL / ENVI band metadata or band descriptions, and from sensor metadata next
+  to the image: an EnMAP `*-METADATA.XML` gives the centre wavelength and FWHM of all 224 bands; L2A reflectance
+  (×10000) is scaled to 0–1, L1B/L1C DN converted with the per-band gain/offset; the VNIR/SWIR overlap
+  (900–1000 nm) keeps the SWIR bands so wavelengths increase (209 bands).
+* Quicklooks (`QL_VNIR/QL_SWIR`, 8-bit RGB) and quality layers are recognised and the open dialog says to use the
+  `SPECTRAL_IMAGE` instead. The dialog shows what was found and no longer silently spreads 400–1000 nm over files
+  without wavelengths (that is now an explicit, unticked option, default range 400–2500 nm).
+* Multi-page TIFFs open with all bands also when rasterio is installed; compressed TIFFs without rasterio ask for
+  `imagecodecs`.
+* Library import of images (class means / image mean / pixels) skips no-data bands instead of rejecting every
+  pixel.
+* Test: synthetic EnMAP L2A product (`tests/test_loaders.py`).
+
+## v3.1 — ROI Analysis moved from the viewer; ROIs class by class in the database
+* New **ROI Analysis** tab (next to *Scenes*) with the DS3 viewer's ROI tools and ROI Manager: rectangle and
+  polygon ROIs, editable class, pending selection, outlines in class colours, anomaly map, delete / clear / set
+  class / rename, plot ROI spectra, plot class means, save / load DS3-ROIs JSON (compatible with the viewer). It
+  works across all loaded images: one table for every image, class means pooled over images.
+* **Database:** migration `002_rois.sql` — table `rois` (one row per ROI with class, image, pixel and map
+  geometry, pixel count), columns `spectra.roi_id` and `spectra.roi_class`, link table `spectrum_rois`.
+  Applied automatically on connect (PostgreSQL and SQLite); `schema.sql` updated for new installs.
+* *Save ROIs to library database...*: selected / current image / all ROIs, stored as pooled class means, one mean
+  per ROI or pixel spectra; class = material, ROIs = samples; idempotent. *Load ROIs from library database...*
+  puts stored ROIs back on the same image or, through map coordinates, on another georeferenced image; deletes
+  ROIs (with or without their spectra).
+* Repository / both clients / API: `save_roi_spectra`, `list_rois`, `get_roi`, `roi_classes`, `roi_spectra`,
+  `spectrum_roi_info`, `delete_roi`; `spectrum_dict` includes `roi_id` and `roi_class`.
+* Scenes: ROIs have id / name / kind and may be polygons; `class_masks()`, aggregation, mosaic, `.npz` files and
+  plugins handle them; old scene files still load. The rectangle-ROI controls left the *Scenes* tab.
+* Library tab: a spectrum saved from ROIs shows its class and source ROI(s) / image(s).
+* Also included: library-wide duplicate check on import, and the data-folder auto-import asks before importing.
+* Tests: `tests/test_rois.py` (core + database, SQLite and PostgreSQL), `tests/test_gui_rois.py` (whole tab,
+  headless). Verified on Python 3.10 and 3.13, and migration of an existing v3.0 PostgreSQL database.
+
 ## v3.0 — universal import (any spectral data format)
 * New `hvva/library/formats/` package: a registry of readers, each detecting its own files, plus shared
   normalisation (units → nm incl. µm and wavenumber, reflectance → 0–1 from percent / ×10000, bad values → gaps,
