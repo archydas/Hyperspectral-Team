@@ -1,0 +1,19 @@
+numpy
+matplotlib
+PyQt5        # GUI only; core/, library/ and the CLI do not need it
+scipy        # .mat v5
+h5py         # HDF5, MATLAB v7.3, NetCDF4
+netCDF4      # optional
+zarr         # optional
+pytest       # tests only
+tifffile     # optional: plain TIFF input
+imagecodecs  # optional: compressed (LZW / Deflate) TIFFs when rasterio is not installed
+rasterio     # optional: GeoTIFF CRS + transform
+sqlalchemy>=2.0      # library database (GUI Library tab, importer, API)
+psycopg2-binary      # PostgreSQL driver
+fastapi              # optional: library API server (python -m hvva.library.api)
+uvicorn[standard]    # optional: runs the API server
+pyarrow              # optional: Parquet files (OpenSpecLib and generic)
+openpyxl             # optional: Excel .xlsx spectra
+Pillow               # map tiles (scene view 'Map'); usually installed with matplotlib
+pyproj               # optional: map view for CRSs other than WGS84 UTM / lon-lat / web mercator

@@ -1,0 +1,9 @@
+PyQt5
+matplotlib
+numpy
+spectral
+scikit-learn
+scikit-image
+pyinstaller
+# Optional: only needed for the "2D CNN" tab (large download; Python 3.10/3.11 recommended)
+tensorflow

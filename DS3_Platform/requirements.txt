@@ -1,0 +1,25 @@
+# DS3 - everything the Library, Image and Analysis modules use
+numpy
+scipy
+matplotlib
+PyQt5
+sqlalchemy>=2.0          # spectral library database
+psycopg2-binary          # PostgreSQL driver (Docker container material_library_db)
+h5py                     # HDF5, MATLAB v7.3, NetCDF4
+tifffile                 # TIFF / EnMAP GeoTIFF
+imagecodecs              # compressed TIFFs
+Pillow                   # map tiles
+openpyxl                 # Excel spectra
+pyarrow                  # Parquet spectra
+spectral                 # ENVI reading in the Image module
+scikit-learn             # K-Means, PCA, RF / SVM (Image module)
+scikit-image             # image filters (Image module)
+# optional
+netCDF4
+zarr
+rasterio                 # GeoTIFF CRS + transform
+pyproj                   # map view for other CRSs
+fastapi                  # optional library API server
+uvicorn[standard]
+pytest                   # tests
+# tensorflow             # only for the Image module's 2D CNN tab (Python 3.10/3.11)
