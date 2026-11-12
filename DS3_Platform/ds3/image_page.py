@@ -322,14 +322,16 @@ class LibraryLinkTab(W.QWidget):
         l3 = W.QVBoxLayout(g3)
         for t, fn, tip in (
                 ("Store pixel spectrum to library…", self.on_store_pixel, "The last clicked pixel (with its window)"),
+                ("ROI class means to library…", self.on_roi_means, "Mean ± std of every ROI class drawn in the "
+                                                                    "ROI Analysis tab"),
                 ("Class spectra from map…", self.on_class_map_means, "Ground-truth map such as PaviaU_gt.mat "
                                                                      "(.mat .npy .tif .h5 ...): one mean spectrum per "
                                                                      "class, saved to a library"),
                 ("Register image in library", self.on_register, "Record the image (path, size, wavelengths, "
                                                                 "unit) in the images table"),
                 ("Back to the image display", self.on_back, "Leave the classification map"),
-                ("Send image to Data Aggregation", self.on_send, "Copy the active cube (after preprocessing) to Data "
-                                                      "Aggregation, where ROIs are drawn and aggregated"),
+                ("Send image + ROIs to Data Aggregation", self.on_send, "Copy the active cube (after preprocessing) and "
+                                                             "its ROIs to Data Aggregation for aggregation"),
                 ("Open this file in Data Aggregation (map view)", self.on_open_analysis,
                  "Load the same file in Data Aggregation, which reads its georeferencing and shows it on a map")):
             b = W.QPushButton(t)
@@ -864,12 +866,12 @@ class LibraryLinkTab(W.QWidget):
     def on_send(self):
         if not self.need_image():
             return
-        sc = self.page.as_scene(with_rois=False)          # ROIs are drawn in Data Aggregation, not in the Viewer
+        sc = self.page.as_scene(with_rois=True)           # the ROIs of the ROI Analysis tab go along
         self.page.shell.analysis.win.add_scene(sc)
         self.page.shell.show_module("analysis")
         self.page.shell.analysis.win.tabs.setCurrentIndex(0)
-        self.page.shell.flash(f"'{sc.name}' sent to Data Aggregation: draw its ROIs in the ROI Analysis tab "
-                              "(Tools ▸ Get ROIs from Data Aggregation brings them back to Viewer and Analysis).")
+        self.page.shell.flash(f"'{sc.name}' sent to Data Aggregation with {len(sc.rois)} ROI(s) "
+                              "(Tools ▸ Get ROIs from Data Aggregation brings ROIs drawn there back).")
 
     def select_or_send(self):
         """Select this image's scene in Data Aggregation (same name and size), sending it first if it is not there."""
@@ -896,228 +898,6 @@ class LibraryLinkTab(W.QWidget):
         else:
             self.page.shell.flash("Opened in Data Aggregation. The file has no georeferencing, so the map "
                                   "view is not available for it.")
-
-
-class RoiLinkTab(W.QWidget):
-    """'ROIs' tab of Viewer and Analysis: the Data Aggregation ROI Analysis toolbar, connected.
-
-    ROIs are drawn in Data Aggregation (one place, one ROI Manager); this tab links the Viewer's image to its
-    Data Aggregation scene (same file / name / size), mirrors that scene's ROIs into the Viewer - automatically
-    on every change when 'Keep in sync' is on - and gives the Viewer tools that use ROIs (Classification,
-    Spectral Matching, Segmentation, Unmixing, Data Correction) the ROI list and selection they expect."""
-
-    def __init__(self, page):
-        super().__init__()
-        self.page = page
-        self.v = page.viewer
-        self._sig = None
-        an = page.shell.analysis.win
-        self.an = an
-        # ---- 1. link to Data Aggregation
-        g1 = W.QGroupBox("Link to Data Aggregation")
-        l1 = W.QVBoxLayout(g1)
-        self.lbl_link = label("", None, wrap=True, rich=True)
-        l1.addWidget(self.lbl_link)
-        self.chk_sync = W.QCheckBox("Keep ROIs in sync with Data Aggregation (automatic)")
-        self.chk_sync.setChecked(True)
-        self.chk_sync.setToolTip("Every ROI added, deleted, renamed or re-classed in Data Aggregation is copied here "
-                                 "at once")
-        self.chk_sync.toggled.connect(lambda on: on and self.sync(force=True))
-        l1.addWidget(self.chk_sync)
-        for text, fn, tip in (
-                ("Send / select this image in Data Aggregation", self.on_link,
-                 "Adds the Viewer's image (after preprocessing) to Data Aggregation, or selects it if it is there"),
-                ("Draw ROIs in Data Aggregation  ▸", self.on_draw,
-                 "Opens Data Aggregation ▸ ROI Analysis on this image with ROI selection switched on"),
-                ("Get ROIs from Data Aggregation now", lambda: self.sync(force=True, quiet=False),
-                 "Copies the linked scene's ROIs into the Viewer"),
-                ("Load ROI file into Data Aggregation…", self.on_load_file,
-                 "DS3-ROIs JSON, GeoJSON or ENVI ROI ASCII, loaded onto the linked scene (then synced here)"),
-                ("Save ROIs to file…", self.on_save_file, "DS3-ROIs JSON / GeoJSON / ENVI ROI ASCII"),
-                ("Save ROIs to library database…", self.on_save_db,
-                 "The ROI shapes + their spectra into the spectral library (as in Data Aggregation)"),
-                ("Load ROIs from library database…", self.on_load_db,
-                 "ROIs stored in the library, onto the linked scene")):
-            b = W.QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            l1.addWidget(b)
-        l1.addWidget(label("ROIs are used here by: Classification (training samples), Spectral Matching (SAM "
-                           "with ROI classes), Segmentation (label source 'ROIs'), Unmixing (endmember from an "
-                           "ROI mean) and Data Correction (empirical line targets, dark pixel, flat field).",
-                           "small", wrap=True))
-        l1.addStretch(1)
-        g1.setMinimumWidth(330)
-        g1.setMaximumWidth(460)
-        # ---- 2. ROI Manager (the viewer's own list widget, moved here)
-        g2 = W.QGroupBox("ROI Manager (from Data Aggregation)")
-        l2 = W.QVBoxLayout(g2)
-        v = self.v
-        top = W.QHBoxLayout()
-        top.addWidget(v.roi_summary_label, 1)
-        top.addWidget(v.cb_show_outlines)
-        l2.addLayout(top)
-        v.roi_list.setSelectionMode(W.QAbstractItemView.ExtendedSelection)
-        v.roi_list.setMinimumHeight(150)
-        l2.addWidget(v.roi_list, 1)
-        l2.addWidget(label("Select ROIs here for tools that ask for 'selected ROIs' (Plot ROI spectra, dark pixel, "
-                           "flat field, endmember). Nothing selected = all ROIs.", "small", wrap=True))
-        r = W.QHBoxLayout()
-        for text, fn in (("Plot ROI spectra", v.on_show_roi_spectra), ("Plot class means", v.on_show_class_spectra),
-                         ("Selected ROI mean → endmember", self.on_endmember)):
-            b = W.QPushButton(text)
-            b.clicked.connect(fn)
-            r.addWidget(b)
-        l2.addLayout(r)
-        r = W.QHBoxLayout()
-        for text, fn in (("Show in Data Aggregation", self.on_show_in_da), ("Clear ROIs in the Viewer", self.on_clear)):
-            b = W.QPushButton(text)
-            b.clicked.connect(fn)
-            r.addWidget(b)
-        r.addStretch(1)
-        l2.addLayout(r)
-        lay = W.QHBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.addWidget(g1)
-        lay.addWidget(g2, 1)
-        # every ROI change in Data Aggregation goes through roipanel.refresh() -> sync from there
-        rp = an.roipanel
-        orig = rp.refresh
-
-        def refresh(*a, _o=orig, **k):
-            _o(*a, **k)
-            try:
-                self.sync()
-            except Exception as e:                                               # noqa: BLE001
-                self.page.shell.flash(f"⚠ ROI sync: {e}")
-        rp.refresh = refresh
-        self.update_status()
-
-    # ------------------------------------------------------------ link
-    def linked_scene(self):
-        """The Data Aggregation scene of this image: same size, preferring the same file, then the same name."""
-        v = self.v
-        if v.cube is None:
-            return None
-        h, w = v.cube.shape[:2]
-        cands = [sc for sc in self.an.scenes if tuple(sc.cube.shape[:2]) == (h, w)]
-        if not cands:
-            return None
-        path, name = getattr(v, "_ds3_path", None), self.page.image_name()
-        same = lambda a, b: bool(a and b) and os.path.normcase(os.path.abspath(str(a))) == \
-            os.path.normcase(os.path.abspath(str(b)))                                   # noqa: E731
-        cands.sort(key=lambda sc: (not same(sc.path, path), sc.name != name, not sc.rois))
-        return cands[0]
-
-    def update_status(self):
-        v, sc = self.v, self.linked_scene()
-        if v.cube is None:
-            t = "No image open. Open one (File ▸ Open Image File…), then link it to Data Aggregation."
-        elif sc is None:
-            h, w = v.cube.shape[:2]
-            t = (f"<b>Not linked.</b> Data Aggregation has no scene of {h} × {w} pixels. Click <i>Send / select "
-                 "this image in Data Aggregation</i> (or <i>Draw ROIs in Data Aggregation</i>).")
-        else:
-            ncls = len({r["class"] for r in sc.rois})
-            t = (f"<b>Linked to</b> Data Aggregation scene <b>{sc.name}</b> ({sc.cube.shape[0]} × "
-                 f"{sc.cube.shape[1]}): {len(sc.rois)} ROI(s) in {ncls} class(es). "
-                 f"Viewer: {len(v.rois)} ROI(s).")
-        self.lbl_link.setText(t)
-
-    @staticmethod
-    def _signature(sc):
-        if sc is None:
-            return None
-        out = []
-        for r in sc.rois:
-            geo = r.get("rect") or r.get("vertices") or (len(r.get("pixels") or []), tuple((r.get("pixels") or [])[:3]))
-            out.append((r["id"], r["name"], r["class"], r["kind"], repr(geo)))
-        return (id(sc), tuple(out))
-
-    def sync(self, force=False, quiet=True):
-        """Copy the linked scene's ROIs into the Viewer when they changed (or when forced)."""
-        if self.v.cube is None:
-            return self.update_status()
-        sc = self.linked_scene()
-        sig = self._signature(sc)
-        if force or (self.chk_sync.isChecked() and sig != self._sig and sc is not None):
-            self._sig = sig
-            if sc is not None:
-                self.page.rois_from_scene(sc, quiet=quiet)
-            elif not quiet:
-                self.page.rois_from_analysis(quiet=False)
-        self.update_status()
-
-    def _ensure_linked(self):
-        if self.v.cube is None:
-            W.QMessageBox.information(self, "No image", "Open an image first (File ▸ Open Image File…).")
-            return None
-        sc = self.linked_scene()
-        if sc is None:
-            self.page.link.on_send()
-            sc = self.linked_scene()
-        if sc is not None:
-            self.an.select_scene(sc)
-        return sc
-
-    def on_link(self):
-        sc = self._ensure_linked()
-        if sc is not None:
-            self.page.shell.show_module("image")
-            self.sync(force=True)
-            self.page.shell.flash(f"Linked to Data Aggregation scene '{sc.name}'.")
-
-    def on_draw(self):
-        if self._ensure_linked() is not None:
-            self.page.shell.on_draw_roi()
-
-    def _on_scene(self, fn):
-        if self._ensure_linked() is not None:
-            self.page.shell.show_module("image")
-            fn()
-            self.sync(force=True)
-
-    def on_load_file(self):
-        self._on_scene(self.an.roipanel.on_load_json)
-
-    def on_save_file(self):
-        if self._ensure_linked() is not None:
-            self.an.roipanel.on_save_json()
-
-    def on_save_db(self):
-        if self._ensure_linked() is not None:
-            self.an.roipanel.on_save_db()
-
-    def on_load_db(self):
-        self._on_scene(self.an.roipanel.on_load_db)
-
-    def on_show_in_da(self):
-        if self._ensure_linked() is not None:
-            self.page.shell.analysis.goto_tab("ROI Analysis")
-
-    def on_clear(self):
-        v = self.v
-        v.rois = []
-        self._sig = None
-        v._refresh_roi_list()
-        v._refresh_class_combo()
-        v._draw_roi_patch()
-        self.update_status()
-        self.page.shell.flash("ROIs cleared in Viewer and Analysis (Data Aggregation keeps its ROIs; turn off "
-                              "'Keep in sync' to stop them coming back).")
-
-    def on_endmember(self):
-        v = self.v
-        if v.cube is None or not v.rois:
-            return W.QMessageBox.information(self, "No ROIs", "Get ROIs from Data Aggregation first.")
-        rows = sorted(v._selected_roi_rows())
-        if not rows:
-            return W.QMessageBox.information(self, "No ROI selected", "Select the ROI(s) for the endmember first.")
-        mask = np.zeros(v.cube.shape[:2], bool)
-        for r in rows:
-            mask |= np.asarray(v.rois[r]["mask"], bool)
-        v.last_roi_mean_full = np.nanmean(np.asarray(v.cube[mask], np.float64), axis=0)
-        v.on_add_endmember_from_roi()
 
 
 class ImagePage(W.QWidget):
@@ -1174,20 +954,11 @@ class ImagePage(W.QWidget):
                     if self.link is not None:
                         self.link._class_map = None
                         self.link.draw_markers()
-                    if getattr(self, "roilink", None) is not None:
-                        v.rois = []                      # ROIs of the previous image do not fit this one
-                        self.roilink._sig = None
-                        v._refresh_roi_list()
-                        self.roilink.sync()
                     self.shell.refresh_counts()
                     self.shell.update_title()
             v.load_cube_file = load_and_track
-            for i in reversed(range(v.tabs.count())):    # DS3: ROIs are drawn in Data Aggregation, not here
-                if v.tabs.tabText(i) == "ROI Analysis":
-                    v.tabs.removeTab(i)
-            v.cb_roi.setChecked(False)
-            self._orig_union = v._selected_roi_union
-            v._selected_roi_union = self._pick_roi_union          # selection in the ROIs tab, else ask
+            # The viewer keeps its own ROI Analysis tab (draw / save / load ROIs, class assignment, ROI spectra);
+            # ROIs drawn in Data Aggregation can be added to it with Tools > Get ROIs from Data Aggregation.
             self._relayout(v)
             self.viewer = v
             self._wait.setParent(None)
@@ -1201,8 +972,6 @@ class ImagePage(W.QWidget):
             self._lay.addWidget(v, 1)
             self.link = LibraryLinkTab(self)
             v.tabs.insertTab(0, self._wrap(self.link), "Library")
-            self.roilink = RoiLinkTab(self)
-            v.tabs.insertTab(1, self._wrap(self.roilink), "ROIs (Data Aggregation)")
             v.tabs.setCurrentIndex(0)
             self.shell.libpanel_libraries_changed.connect(self.link.refresh_libraries)
         finally:
@@ -1291,88 +1060,63 @@ class ImagePage(W.QWidget):
                     v.prep_pages.setCurrentIndex(i)
         self.shell.show_module("image")
 
-    # ------------------------------------------------------------ ROIs come from Data Aggregation
-    def _pick_roi_union(self, what):
-        """Replacement for the viewer's 'ROIs selected in the ROI Manager' (that tab is removed in DS3)."""
-        v = self.viewer
-        if v.rois and v._selected_roi_rows():
-            return self._orig_union(what)                 # ROIs selected in the 'ROIs (Data Aggregation)' tab
-        if not v.rois:
-            W.QMessageBox.information(self, "No ROIs", f"The {what} ROI comes from Data Aggregation: draw it there "
-                                      "(ROI Analysis tab); the 'ROIs (Data Aggregation)' tab brings it here.")
-            return None
-        items = [f"{i + 1}. {r['name']} [{r['class']}] - {int(np.asarray(r['mask']).sum())} px"
-                 for i, r in enumerate(v.rois)]
-        choice, ok = W.QInputDialog.getItem(self, f"{what.capitalize()} ROI", f"Use which ROI as the {what} ROI?",
-                                            items, 0, False)
-        if not ok:
-            return None
-        return np.asarray(v.rois[items.index(choice)]["mask"], bool).copy()
-
+    # ------------------------------------------------------------ ROIs: Viewer tab + Data Aggregation
     def rois_from_analysis(self, quiet=False):
-        """Copy the ROIs drawn in Data Aggregation onto the Viewer's image (for Classification, Spectral Matching,
-        Segmentation, Unmixing, Data Correction). Uses the linked scene (same size; same file / name preferred)."""
+        """Copy the ROIs drawn in Data Aggregation onto the Viewer's image (for Classification, SAM, Unmixing,
+        empirical line ...). Uses the Data Aggregation scene of the same size, preferring the same file/name."""
+        from hvva.core.rois import roi_mask
         v = self.ensure()
         if v is None or v.cube is None:
             if not quiet:
                 W.QMessageBox.information(self, "No image", "Open an image in Viewer and Analysis first.")
             return 0
-        sc = self.roilink.linked_scene() if getattr(self, "roilink", None) else None
-        if sc is None or not sc.rois:
-            if not quiet:
-                h, w = v.cube.shape[:2]
-                W.QMessageBox.information(self, "No ROIs", f"No Data Aggregation scene of {h} x {w} pixels has ROIs. "
-                                          "Use the 'ROIs (Data Aggregation)' tab: Send / select this image in Data "
-                                          "Aggregation, then Draw ROIs in Data Aggregation.")
-            return 0
-        n = self.rois_from_scene(sc, quiet=quiet)
-        if getattr(self, "roilink", None):
-            self.roilink._sig = self.roilink._signature(sc)
-            self.roilink.update_status()
-        return n
-
-    def rois_from_scene(self, sc, quiet=True):
-        """Mirror the ROIs of Data Aggregation scene *sc* into the Viewer (rectangles, polygons; pixel lists as
-        mask ROIs). Keeps the Viewer's ROI selection by name where possible."""
-        from hvva.core.rois import roi_mask
-        v = self.viewer
         h, w = v.cube.shape[:2]
-        keep = {v.rois[i]["name"] for i in v._selected_roi_rows() if i < len(v.rois)}
-        loaded = []
+        scenes = [sc for sc in self.shell.analysis.win.scenes if tuple(sc.cube.shape[:2]) == (h, w) and sc.rois]
+        if not scenes:
+            if not quiet:
+                W.QMessageBox.information(self, "No ROIs", f"No Data Aggregation scene of {h} x {w} pixels has ROIs. "
+                                          "Send the image there (Library tab ▸ Send image to Data Aggregation), "
+                                          "draw ROIs in its ROI Analysis tab, then try again. "
+                                          "(You can also draw ROIs directly in this Viewer's ROI Analysis tab.)")
+            return 0
+        path, name = getattr(v, "_ds3_path", None), self.image_name()
+        scenes.sort(key=lambda sc: (sc.path != path or not path, sc.name != name))
+        sc = scenes[0]
+        loaded, skipped = [], 0
         for r in sc.rois:
-            mask = roi_mask(r, h, w)
-            if not mask.any():
-                continue
             if r["kind"] == "rect":
                 r0, c0, r1, c1 = (int(x) for x in r["rect"])
                 roi = {"kind": "rect", "rect": (r0, r1 - 1, c0, c1 - 1)}
             elif r["kind"] == "polygon":
                 roi = {"kind": "polygon", "vertices": [(float(x), float(y)) for x, y in r["vertices"]]}
-            else:                                                   # pixel list -> the viewer's 'mask' ROI
-                roi = {"kind": "mask", "rect": v._bbox_of(mask)}
+            else:
+                skipped += 1                                  # pixel-list ROIs have no outline the viewer can draw
+                continue
+            mask = roi_mask(r, h, w)
+            if not mask.any():
+                skipped += 1
+                continue
             roi.update(name=str(r["name"]), **{"class": str(r["class"])}, mask=mask, bbox=v._bbox_of(mask))
             loaded.append(roi)
-        v.rois = loaded
-        v.roi_counter = max(getattr(v, "roi_counter", 0), len(loaded))
-        for fn in ("_refresh_roi_list", "_refresh_class_combo"):
+        if not loaded:
+            if not quiet:
+                W.QMessageBox.information(self, "No ROIs", "Those ROIs are pixel lists (not rectangles or polygons) "
+                                          "and cannot be shown in Viewer and Analysis.")
+            return 0
+        existing = getattr(v, "rois", None) or []
+        # ROIs of the viewer's own ROI Analysis tab are kept; Data Aggregation ROIs with the same name replace theirs
+        names = {r["name"] for r in loaded}
+        v.rois = [r for r in existing if r.get("name") not in names] + loaded
+        v.roi_counter = max(getattr(v, "roi_counter", 0), len(v.rois))
+        for fn in ("_refresh_roi_list", "_refresh_class_combo", "_draw_roi_patch"):
             try:
                 getattr(v, fn)()
             except Exception:                                                    # noqa: BLE001
                 pass
-        if keep:
-            for i, roi in enumerate(loaded):
-                if roi["name"] in keep:
-                    v.roi_list.item(i).setSelected(True)
-        try:
-            v._draw_roi_patch()
-        except Exception:                                                        # noqa: BLE001
-            pass
         classes = sorted({r["class"] for r in loaded})
-        if loaded or not quiet:
-            self.shell.flash(f"{len(loaded)} ROI(s) from Data Aggregation scene '{sc.name}'"
-                             + (f" ({', '.join(classes)})" if classes else "")
-                             + " — Classification, Spectral Matching, Segmentation, Unmixing and Data Correction "
-                               "use them now.")
+        self.shell.flash(f"{len(loaded)} ROI(s) from Data Aggregation scene '{sc.name}' ({', '.join(classes)})"
+                         + (f"; {skipped} pixel-list ROI(s) skipped" if skipped else "")
+                         + ". Classification, Spectral Matching, Segmentation and Unmixing use them now.")
         return len(loaded)
 
     def as_scene(self, with_rois=True):

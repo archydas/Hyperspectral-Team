@@ -4145,7 +4145,7 @@ def build_seg_samples(rows, cols, valid_px, source, gt, rois, roi_class_names):
     n_conflict = 0
     if source in ("rois", "both"):
         if not rois:
-            raise RuntimeError("ROIs for at least two classes are needed: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+            raise RuntimeError("Draw ROIs for at least two classes first (ROI Analysis tab).")
         seen_cls = -np.ones((rows, cols), dtype=np.int32)
         conflict = np.zeros((rows, cols), dtype=bool)
         for ri, roi in enumerate(rois):
@@ -6281,7 +6281,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.seg_source = QtWidgets.QComboBox()
         self.seg_source.addItems(["ROIs drawn in this app", "Ground-truth file",
                                   "Ground-truth file + ROIs (ROIs add / override classes)"])
-        self.seg_source.setToolTip("ROIs: drawn in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation. Ground-truth file: a label map with one class id "
+        self.seg_source.setToolTip("ROIs: the ROI Analysis tab. Ground-truth file: a label map with one class id "
                                    "per pixel (.mat, .npy, .tif, .png, ENVI, HDF5, CSV ...).\n"
                                    "Combined: classes come from the file, ROIs add or override labels by class name.")
         l1.addWidget(self.seg_source, 0, 1, 1, 2)
@@ -6784,7 +6784,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.btn_el_plot_refs.setEnabled(False)
         self.btn_el_plot_refs.clicked.connect(self.on_el_plot_references)
         lay.addWidget(self.btn_el_plot_refs)
-        self.el_status_label = info_label("Draw ROIs on the reference targets in Data Aggregation, Tools ▸ Get ROIs from Data Aggregation, then add their field spectra.")
+        self.el_status_label = info_label("Draw ROIs on reference targets (ROI Analysis tab), then add their field spectra.")
         lay.addWidget(self.el_status_label)
         lay.addStretch(1)
 
@@ -8585,12 +8585,12 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         if choice == 1:
             if self.pending_sel is None or self.pending_sel["mask"].shape != shape:
                 QtWidgets.QMessageBox.information(self, "No selection",
-                                                  "No ROIs yet: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+                                                  "Draw a ROI on the image first (ROI Analysis tab).")
                 return None
             return [("Current selection", self.pending_sel["mask"])]
         rois = [r for r in self.rois if r["mask"].shape == shape]
         if not rois:
-            QtWidgets.QMessageBox.information(self, "No saved ROIs", "No ROIs yet: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+            QtWidgets.QMessageBox.information(self, "No saved ROIs", "Save at least one ROI first (ROI Analysis tab).")
             return None
         if choice == 2:
             return [(f"{r['name']} ({r['class']})", r["mask"]) for r in rois]
@@ -11025,7 +11025,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             if use_rois:
                 names = self._class_list()
                 if not names:
-                    raise RuntimeError("No labelled ROIs: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+                    raise RuntimeError("Add labelled ROIs first in the ROI Analysis tab.")
                 refs = []
                 for name in names:
                     union = np.zeros((rows, cols), dtype=bool)
@@ -11549,7 +11549,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             if len(good) < len(self.rois):
                 QtWidgets.QMessageBox.warning(self, "ROIs", "Some ROIs belong to a differently sized image and are ignored.")
             if src == "rois" and len({r["class"] for r in good}) < 2:
-                QtWidgets.QMessageBox.information(self, "ROIs", "ROIs for at least 2 classes are needed: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+                QtWidgets.QMessageBox.information(self, "ROIs", "Draw ROIs for at least 2 classes first (ROI Analysis tab).")
                 return None
         if self.seg_gt is not None and self.seg_gt["labels"].shape != self.cube.shape[:2]:
             QtWidgets.QMessageBox.warning(
@@ -11859,7 +11859,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "No ROIs",
                 "Draw an ROI on each reference target and add it to the ROI list first "
-                "(draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation)."
+                "(ROI Analysis tab)."
             )
             return
         items = [f"{i + 1}. {r['name']} [{r['class']}] - {int(r['mask'].sum())} px" for i, r in enumerate(self.rois)]

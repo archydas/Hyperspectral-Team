@@ -320,13 +320,14 @@ class DS3Window(W.QMainWindow):
         # Tools
         m = mb.addMenu("Tools")
         self._act(m, "Collect Spectra by Clicking Pixels", self.on_collect)
-        self._act(m, "Draw ROIs (Data Aggregation)", self.on_draw_roi)
         self._act(m, "Clear Collected Spectra", lambda: self.image.link and self.image.link.on_clear())
-        self._act(m, "ROIs Linked to Data Aggregation (Viewer and Analysis)", lambda: self.image.goto_tab("ROIs"))
-        self._act(m, "Get ROIs from Data Aggregation (into Viewer and Analysis)", self.on_rois_to_viewer)
-        self._act(m, "Load ROI File into Viewer and Analysis…", lambda: self._viewer_call("on_load_rois"))
         m.addSeparator()
-        self._act(m, "Send Image to Data Aggregation", lambda: self._link_call("on_send"))
+        self._act(m, "Draw ROIs (Viewer and Analysis: ROI Analysis tab)", self.on_draw_roi_viewer)
+        self._act(m, "Save ROIs…", lambda: self._viewer_call("on_save_rois"))
+        self._act(m, "Load ROIs…", lambda: self._viewer_call("on_load_rois"))
+        self._act(m, "Draw ROIs in Data Aggregation", self.on_draw_roi)
+        self._act(m, "Get ROIs from Data Aggregation (add to Viewer and Analysis)", self.on_rois_to_viewer)
+        self._act(m, "Send Image + ROIs to Data Aggregation", lambda: self._link_call("on_send"))
         m.addSeparator()
         sub = m.addMenu("Preprocessing")
         for t in ("Normalisation", "Units", "Common Grid", "Indices & Features", "Statistics"):
@@ -359,7 +360,7 @@ class DS3Window(W.QMainWindow):
             self._act(sub, t, lambda t=t, e=expr: self.on_index(t, e))
         sub.addSeparator()
         self._act(sub, "More indices and band features…", lambda: self.image.goto_tab("Preprocessing", "Indices"))
-        self._act(m, "Anomaly Detection (RX)…", lambda: self._viewer_call("on_compute_anomaly"))
+        self._act(m, "Anomaly Detection (RX)…", lambda: self._viewer_run("ROI Analysis", "on_compute_anomaly"))
         self._act(m, "Signal-to-Noise Ratio…", lambda: self._viewer_run("Spectral Analysis", "on_compute_snr"))
         sub = m.addMenu("Classification")
         self._act(sub, "Supervised Classification (RF, SVM, …)…", lambda: self.image.goto_tab("Classification"))
@@ -481,8 +482,19 @@ class DS3Window(W.QMainWindow):
             self.show_module("image")
             self.image.rois_from_analysis()
 
+    def on_draw_roi_viewer(self):
+        """Open the ROI Analysis tab of Viewer and Analysis and switch ROI selection on."""
+        v = self._viewer()
+        if v is None:
+            return
+        self.image.goto_tab("ROI Analysis")
+        if hasattr(v, "cb_roi"):
+            v.cb_roi.setChecked(True)
+        self.flash("ROI Analysis: drag a rectangle or click a polygon on the image, choose a class, then "
+                   "'Add selection to ROI list'.")
+
     def on_draw_roi(self):
-        """ROIs are drawn in Data Aggregation (ROI Analysis tab); the Viewer has no ROI tab in DS3."""
+        """Draw ROIs in Data Aggregation (its ROI Analysis tab) on the image of Viewer and Analysis."""
         if self.current_module() == "image" and self.image.viewer is not None and self.image.viewer.cube is not None:
             self.image.link.select_or_send()
         self.analysis.goto_tab("ROI Analysis")
@@ -552,10 +564,10 @@ class DS3Window(W.QMainWindow):
             "3. Click a pixel for its spectrum. In the Library tab: pixel window, 'Collect on' to gather "
             "several spectra, Compare angles, Export CSV, Build library.\n"
             "4. Best matches / Classification map compare the image with the spectral library database.\n"
-            "5. ROIs: the 'ROIs (Data Aggregation)' tab links this image to its Data Aggregation scene. Click "
-            "'Draw ROIs in Data Aggregation', draw them in its ROI Analysis tab, and they are copied here "
-            "automatically (Keep ROIs in sync). Classification, Spectral Matching, Segmentation, Unmixing and Data "
-            "Correction use them; select ROIs in that tab's ROI Manager for tools that ask for selected ROIs.\n"
+            "5. ROI Analysis tab (Tools ▸ Draw ROIs): draw rectangles / polygons with classes, ROI Manager, ROI "
+            "spectra, save / load ROIs. ROIs drawn in Data Aggregation can be added with Tools ▸ Get ROIs from "
+            "Data Aggregation. Classification, Spectral Matching, Segmentation, Unmixing and Data Correction use "
+            "them.\n"
             "6. Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality "
             "Reduction (PCA / MNF), Classification, Spectral Matching and Segmentation tabs, or the Spectral menu, "
             "process and analyse the image."))

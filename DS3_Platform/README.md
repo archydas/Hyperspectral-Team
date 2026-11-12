@@ -7,7 +7,7 @@ that carry every feature of our tools:
 |---|---|---|
 | **Library** | HyperVista Library v3.4 (`hvva` library panel) | All spectral libraries as cards (main libraries from the libraries folder + built libraries), search libraries and materials across all libraries, then the full library browser: category tree, materials, spectrum, compare, match / save, acquisition · unit · purity · covers filters, Builder, Resampling, Export, import of any spectra format |
 | **Data Aggregation** | HyperVista Library v3.4 (data aggregation window) | Scenes, ROI Analysis, Wavelength Grid, Aggregation, Mosaic / Stack, Signature Export, map view (georeferenced files), Plugins. The Georeferencing tab is left out in DS3. |
-| **Viewer and Analysis** | DS3 Hyperspectral Viewer & Analysis Tool (`viewer/HyperVista_v1_0.py`, the team's modified viewer) + DS3 **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality Reduction (PCA / MNF), Classification (classical models, cross-validation, saved models), Spectral Matching (SAM), Segmentation (deep models, ground-truth files) — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation). No ROI Analysis tab of its own: a **ROIs (Data Aggregation)** tab mirrors the ROIs drawn in Data Aggregation. |
+| **Viewer and Analysis** | DS3 Hyperspectral Viewer & Analysis Tool (`viewer/HyperVista_v1_0.py`, the team's modified viewer) + DS3 **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality Reduction (PCA / MNF), Classification (classical models, cross-validation, saved models), Spectral Matching (SAM), Segmentation (deep models, ground-truth files) — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation). Its own **ROI Analysis** tab is kept as in the modified viewer code. |
 
 All three share **one database connection** (PostgreSQL in Docker or a local SQLite file).
 
@@ -15,19 +15,15 @@ All three share **one database connection** (PostgreSQL in Docker or a local SQL
 
 ### Where ROIs live
 
-ROIs are drawn in one place, **Data Aggregation ▸ ROI Analysis**, and are connected to Viewer and Analysis through
-its **ROIs (Data Aggregation)** tab:
+Viewer and Analysis keeps its own **ROI Analysis** tab, exactly as in the modified viewer code: draw rectangles /
+polygons with classes, ROI Manager, ROI / class spectra, anomaly map, save / load ROIs (Tools ▸ Draw ROIs (Viewer and
+Analysis), Save ROIs, Load ROIs). Data Aggregation has its own ROI Analysis tab for multi-scene aggregation. The two
+are connected:
 
-1. Open the image in Viewer and Analysis → tab **ROIs (Data Aggregation)** → **Send / select this image in Data
-   Aggregation** (links it to its Data Aggregation scene: same file, name or size).
-2. **Draw ROIs in Data Aggregation ▸** → draw rectangles / polygons with classes in its ROI Analysis tab.
-3. With **Keep ROIs in sync** on (default), every ROI added, deleted, renamed or re-classed there appears at once
-   in the Viewer's ROI Manager (outlines on the image too). Opening an image whose file is already a Data
-   Aggregation scene picks its ROIs up straight away.
-4. Classification (ROIs as training samples), Spectral Matching (SAM with ROI classes), Segmentation (label source
-   *ROIs*), Unmixing (selected ROI mean → endmember) and Data Correction (empirical line, dark pixel, flat field)
-   use them. Tools asking for *selected* ROIs use the selection in that tab's ROI Manager, or ask which one.
-5. The tab also loads / saves ROI files and saves / loads ROIs to the library database on the linked scene.
+* **Send image + ROIs to Data Aggregation** (Library tab or Tools menu) copies the cube and its ROIs there.
+* **Tools ▸ Get ROIs from Data Aggregation** adds the ROIs drawn in Data Aggregation (same-size scene, same file /
+  name preferred) to the Viewer's ROI list; ROIs with the same name are replaced, the others are kept.
+* ROI files (DS3-ROIs JSON) are the same format in both.
 
 ## Install and run (Windows)
 
@@ -66,7 +62,7 @@ TensorFlow is optional (only the Viewer's 2D CNN tab).
 |---|---|
 | File | Open Image File (Ctrl+O), Open Previously Opened Image, Open Zarr Folder, Open Spectral Library File, Import ASD Field Spectra, Available Bands List, Save Image View (PNG/JPG/PDF/SVG), Export Active Cube, Add Scenes / Raw Binary Cube / Demo Scenes to Data Aggregation, Connect Library Database, Home, Exit |
 | View | Home, Library (Ctrl+1), Data Aggregation (Ctrl+2), Viewer (Ctrl+3), Zoom In / Out, Fit (Ctrl+0), Map Background, Processing History, Revert to Original Cube |
-| Tools | Collect Spectra, Draw ROIs (Data Aggregation), Clear Collected, Get ROIs from Data Aggregation (into Viewer and Analysis), Load ROI File into Viewer and Analysis, Send Image to Data Aggregation, Preprocessing ▸ (Normalisation, Units, Common Grid, Indices & Features, Statistics), Band Management, Data Correction, Collected Spectra (Data Aggregation), Library Images, Plugins |
+| Tools | Collect Spectra, Clear Collected, Draw ROIs (Viewer and Analysis: ROI Analysis tab), Save ROIs, Load ROIs, Draw ROIs in Data Aggregation, Get ROIs from Data Aggregation (add to Viewer and Analysis), Send Image + ROIs to Data Aggregation, Preprocessing ▸ (Normalisation, Units, Common Grid, Indices & Features, Statistics), Band Management, Data Correction, Collected Spectra (Data Aggregation), Library Images, Plugins |
 | Spectral | Spectral Libraries ▸ Builder / Viewer / Resampling / Export · Spectral Analyst · Mapping Methods ▸ SAM (library) / SAM (ROI classes) / Linear Unmixing / K-Means · Transforms ▸ PCA / Band Math · Spectral Indices ▸ NDVI, NDRE, SAVI, EVI, NDWI, NDBI, PRI (+ more in Indices & Features) · Anomaly Detection (RX) · Signal-to-Noise · Classification ▸ RF / SVM, 2D CNN · Data Aggregation |
 | Help | Supported Formats, Using the Viewer, Using Library and Data Aggregation, About |
 
