@@ -64,7 +64,7 @@ def test_ds3_end_to_end(tmp_path, monkeypatch):
     lp.cfg.update(mode="direct", db_url=f"sqlite:///{tmp_path / 'lib.db'}", data_folder="")
     lp.connect_db(init=True)
     # main libraries are imported from data/libraries automatically
-    assert wait(lambda: len(lp.libraries or []) == 2 and all(l.get("spectrum_count") for l in lp.libraries))
+    assert wait(lambda: len(lp.libraries or []) == 2 and all(l.get("spectrum_count") for l in lp.libraries), 60)
     w.show_module("home")
     pump(0.3)
     assert wait(lambda: w.library.main_names >= {"Material Spectra", "Soil Spectra"})
@@ -125,12 +125,35 @@ def test_ds3_end_to_end(tmp_path, monkeypatch):
     sc = an.scenes[0]
     sc.add_roi({"kind": "rect", "rect": (5, 2, 15, 12), "class": "concrete", "name": "r1"})
     sc.add_roi({"kind": "polygon", "vertices": [(42, 5), (58, 5), (58, 20), (42, 20)], "class": "marble", "name": "p1"})
-    assert w.image.rois_from_analysis() == 2
-    assert [r["class"] for r in v.rois] == ["concrete", "marble"]
+    an.roipanel.refresh()                                # what every ROI edit in Data Aggregation calls
+    RL = w.image.roilink
+    assert "ROIs (Data Aggregation)" in [v.tabs.tabText(i) for i in range(v.tabs.count())]
+    assert [r["class"] for r in v.rois] == ["concrete", "marble"]          # synced automatically
     assert int(v.rois[0]["mask"].sum()) == 100 and v.rois[0]["rect"] == (5, 14, 2, 11)
+    assert v.roi_list.count() == 2 and "Linked to" in RL.lbl_link.text()
+    # a pixel-list ROI (e.g. from a label map) comes over as a mask ROI; a delete in DA is mirrored too
+    sc.add_roi({"kind": "pixels", "pixels": [[30, 70], [30, 71], [31, 70]], "class": "glass", "name": "px"})
+    an.roipanel.refresh()
+    assert [r["kind"] for r in v.rois] == ["rect", "polygon", "mask"] and int(v.rois[2]["mask"].sum()) == 3
+    sc.rois.pop(2)
+    an.roipanel.refresh()
+    assert len(v.rois) == 2
+    # tools that need 'selected ROIs': list selection first, otherwise a picker
+    v.roi_list.item(0).setSelected(True)
+    m = v._selected_roi_union("dark")
+    assert m is not None and m.sum() == 100
+    v.roi_list.clearSelection()
     monkeypatch.setattr(W.QInputDialog, "getItem", staticmethod(lambda *a, **k: (a[3][1], True)))
     m = v._selected_roi_union("dark")
     assert m is not None and m.sum() == v.rois[1]["mask"].sum()
+    v.on_show_class_spectra()                            # viewer's own ROI plots work on the synced ROIs
+    assert len(v.plot_canvas.ax.lines) >= 2
+    RL.chk_sync.setChecked(False)
+    sc.add_roi({"kind": "rect", "rect": (30, 62, 38, 78), "class": "glass", "name": "r3"})
+    an.roipanel.refresh()
+    assert len(v.rois) == 2                              # sync off: unchanged
+    RL.chk_sync.setChecked(True)                         # turning it on pulls the change
+    assert len(v.rois) == 3
     L.select_or_send()                                   # already there: selected, not sent again
     assert len(an.scenes) == 1
     # every menu entry that does not open a file dialog

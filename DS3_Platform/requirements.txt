@@ -24,5 +24,6 @@ pyproj                   # map view for other CRSs
 fastapi                  # optional library API server
 uvicorn[standard]
 pytest                   # tests
-# tensorflow             # only for the Segmentation tab's deep models (Python 3.10/3.11)
-# tf-keras keras_cv_attention_models   # only for the AttentionGCN segmentation model
+tensorflow               # Segmentation tab's deep models (Python 3.10/3.11)
+tf-keras                 # only for the AttentionGCN segmentation model
+keras_cv_attention_models  # only for the AttentionGCN segmentation model

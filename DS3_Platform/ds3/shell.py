@@ -1,4 +1,4 @@
-"""The DS3 main window: ENVI-style menu bar, module sidebar (Library · Data Aggregation · Viewer), pages, status bar."""
+"""The DS3 main window: ENVI-style menu bar, module sidebar (Library · Data Aggregation · Viewer and Analysis), pages, status bar."""
 from __future__ import annotations
 
 import os
@@ -115,7 +115,7 @@ class DS3Window(W.QMainWindow):
     def _build_sidebar(self):
         side = W.QWidget()
         side.setObjectName("ds3Sidebar")
-        side.setFixedWidth(220)
+        side.setFixedWidth(236)
         lay = W.QVBoxLayout(side)
         lay.setContentsMargins(10, 12, 10, 10)
         lay.setSpacing(2)
@@ -136,7 +136,7 @@ class DS3Window(W.QMainWindow):
         self.nav = {}
         grp = self.nav_grp = W.QButtonGroup(self)
         grp.setExclusive(True)
-        for key, text in (("library", "Library"), ("analysis", "Data Aggregation"), ("image", "Viewer")):
+        for key, text in (("library", "Library"), ("analysis", "Data Aggregation"), ("image", "Viewer and Analysis")):
             b = W.QPushButton("  " + text)
             style.prop(b, ds3="nav")
             b.setCheckable(True)
@@ -308,7 +308,7 @@ class DS3Window(W.QMainWindow):
         self._act(m, "Home (3 modules)", lambda: self.show_module("home"))
         self._act(m, "Library", lambda: self.show_module("library"), "Ctrl+1")
         self._act(m, "Data Aggregation", lambda: self.show_module("analysis"), "Ctrl+2")
-        self._act(m, "Viewer", lambda: self.show_module("image"), "Ctrl+3")
+        self._act(m, "Viewer and Analysis", lambda: self.show_module("image"), "Ctrl+3")
         m.addSeparator()
         self._act(m, "Zoom In", lambda: self.on_zoom(1 / 1.25), "Ctrl++")
         self._act(m, "Zoom Out", lambda: self.on_zoom(1.25), "Ctrl+-")
@@ -322,8 +322,9 @@ class DS3Window(W.QMainWindow):
         self._act(m, "Collect Spectra by Clicking Pixels", self.on_collect)
         self._act(m, "Draw ROIs (Data Aggregation)", self.on_draw_roi)
         self._act(m, "Clear Collected Spectra", lambda: self.image.link and self.image.link.on_clear())
-        self._act(m, "Get ROIs from Data Aggregation (into the Viewer)", self.on_rois_to_viewer)
-        self._act(m, "Load ROI File into the Viewer…", lambda: self._viewer_call("on_load_rois"))
+        self._act(m, "ROIs Linked to Data Aggregation (Viewer and Analysis)", lambda: self.image.goto_tab("ROIs"))
+        self._act(m, "Get ROIs from Data Aggregation (into Viewer and Analysis)", self.on_rois_to_viewer)
+        self._act(m, "Load ROI File into Viewer and Analysis…", lambda: self._viewer_call("on_load_rois"))
         m.addSeparator()
         self._act(m, "Send Image to Data Aggregation", lambda: self._link_call("on_send"))
         m.addSeparator()
@@ -346,11 +347,12 @@ class DS3Window(W.QMainWindow):
         self._act(m, "Spectral Analyst…", lambda: self._link_call("on_best_matches"))
         sub = m.addMenu("Mapping Methods")
         self._act(sub, "Spectral Angle Mapper (library)…", lambda: self._link_call("on_classify_library"))
-        self._act(sub, "Spectral Angle Mapper (ROI classes)…", lambda: self.image.goto_tab("Classification"))
+        self._act(sub, "Spectral Angle Mapper (ROI classes)…", lambda: self.image.goto_tab("Spectral Matching"))
         self._act(sub, "Linear Spectral Unmixing…", lambda: self.image.goto_tab("Unmixing"))
         self._act(sub, "K-Means Clustering…", lambda: self.image.goto_tab("Spectral Analysis"))
         sub = m.addMenu("Transforms")
-        self._act(sub, "Principal Components (PCA)…", lambda: self.image.goto_tab("PCA"))
+        self._act(sub, "Principal Components (PCA)…", lambda: self.image.goto_tab("Dimensionality Reduction"))
+        self._act(sub, "Minimum Noise Fraction (MNF)…", lambda: self.image.goto_tab("Dimensionality Reduction"))
         self._act(sub, "Band Math…", self.on_bandmath)
         sub = m.addMenu("Spectral Indices")
         for t, expr in INDICES:
@@ -360,14 +362,15 @@ class DS3Window(W.QMainWindow):
         self._act(m, "Anomaly Detection (RX)…", lambda: self._viewer_call("on_compute_anomaly"))
         self._act(m, "Signal-to-Noise Ratio…", lambda: self._viewer_run("Spectral Analysis", "on_compute_snr"))
         sub = m.addMenu("Classification")
-        self._act(sub, "Random Forest / SVM…", lambda: self.image.goto_tab("Classification"))
-        self._act(sub, "2D CNN…", lambda: self.image.goto_tab("2D CNN"))
+        self._act(sub, "Supervised Classification (RF, SVM, …)…", lambda: self.image.goto_tab("Classification"))
+        self._act(sub, "Deep Learning Segmentation…", lambda: self.image.goto_tab("Segmentation"))
+        self._act(sub, "Spectral Matching (SAM)…", lambda: self.image.goto_tab("Spectral Matching"))
         m.addSeparator()
         self._act(m, "Data Aggregation…", lambda: self.analysis.goto_tab("Aggregation"))
         # Help
         m = mb.addMenu("Help")
         self._act(m, "Supported Formats", lambda: self._viewer_call("show_formats_dialog", need_cube=False))
-        self._act(m, "Using the Viewer", self.on_help_image)
+        self._act(m, "Using Viewer and Analysis", self.on_help_image)
         self._act(m, "Using Library and Data Aggregation", self.on_help_library)
         m.addSeparator()
         self._act(m, "About DS3", self.on_about)
@@ -542,17 +545,20 @@ class DS3Window(W.QMainWindow):
 
     # ------------------------------------------------------------ help
     def on_help_image(self):
-        W.QMessageBox.information(self, "Using the Viewer", (
+        W.QMessageBox.information(self, "Using Viewer and Analysis", (
             "1. File ▸ Open Image File… (.hdr of an ENVI image, GeoTIFF / EnMAP SPECTRAL_IMAGE, .mat, HDF5, "
             "NetCDF, Zarr, …).\n"
             "2. File ▸ Available Bands List: Gray Scale or RGB, click a band per colour, Load.\n"
             "3. Click a pixel for its spectrum. In the Library tab: pixel window, 'Collect on' to gather "
             "several spectra, Compare angles, Export CSV, Build library.\n"
             "4. Best matches / Classification map compare the image with the spectral library database.\n"
-            "5. ROIs are drawn in Data Aggregation (Library tab ▸ Send image to Data Aggregation). For the "
-            "Classification tab, bring them here with Tools ▸ Get ROIs from Data Aggregation.\n"
-            "6. Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, PCA, Classification "
-            "and 2D CNN tabs, or the Spectral menu, process and analyse the image."))
+            "5. ROIs: the 'ROIs (Data Aggregation)' tab links this image to its Data Aggregation scene. Click "
+            "'Draw ROIs in Data Aggregation', draw them in its ROI Analysis tab, and they are copied here "
+            "automatically (Keep ROIs in sync). Classification, Spectral Matching, Segmentation, Unmixing and Data "
+            "Correction use them; select ROIs in that tab's ROI Manager for tools that ask for selected ROIs.\n"
+            "6. Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality "
+            "Reduction (PCA / MNF), Classification, Spectral Matching and Segmentation tabs, or the Spectral menu, "
+            "process and analyse the image."))
 
     def on_help_library(self):
         W.QMessageBox.information(self, "Library and Data Aggregation", (
@@ -560,7 +566,7 @@ class DS3Window(W.QMainWindow):
             "(Reload main libraries); built libraries come from the Builder, images or imports. Click a card for "
             "the category tree, materials, spectrum, compare, match and the filters (acquisition, unit, purity, "
             "covers). Spectral ▸ Spectral Libraries: Builder, Viewer, Resampling, Export.\n\n"
-            "Data Aggregation: add scenes (or send the image from the Viewer), draw ROIs per class, Wavelength "
+            "Data Aggregation: add scenes (or send the image from Viewer and Analysis), draw ROIs per class, Wavelength "
             "Grid ▸ Aggregation ▸ Signature Export (CSV / JSON / ENVI .sli or the library). Mosaic / Stack, the "
             "map background (for georeferenced files), Plugins."))
 
@@ -569,7 +575,7 @@ class DS3Window(W.QMainWindow):
             f"<b>{APP_TITLE}</b><br>version {__version__}<br><br>"
             "Spectral library, hyperspectral image module and data aggregation in one program, backed by a "
             "real database (PostgreSQL or SQLite).<br><br>"
-            "Viewer: HyperVista viewer v1.0. Library and Data Aggregation: HyperVista Library v3.4.<br>"
+            "Viewer and Analysis: DS3 Hyperspectral Viewer & Analysis Tool. Library and Data Aggregation: HyperVista Library v3.4.<br>"
             f"Database: {self.libpanel.client.describe() if self.libpanel.client else 'not connected'}"
             "<br><br><b>Kapih Team</b>"))
 

@@ -11,5 +11,5 @@ counters and module cards.
 """
 APP_NAME = "DS3"
 APP_TITLE = "DS3 — Deep Spectral Signature System"
-__version__ = "2.3"
+__version__ = "2.4"
 SETTINGS_ORG = "Kapih Team"

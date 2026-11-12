@@ -1,5 +1,20 @@
 # DS3 — what changed (main branch → DS3 interface)
 
+## v2.4
+* **ROIs connected between Data Aggregation and Viewer and Analysis.** New tab **ROIs (Data Aggregation)** in
+  Viewer and Analysis (the Data Aggregation ROI toolbar, connected):
+  * links the open image to its Data Aggregation scene (same file → same name → same size); *Send / select this
+    image in Data Aggregation*, *Draw ROIs in Data Aggregation ▸*;
+  * **Keep ROIs in sync** (default on): every ROI change in Data Aggregation (add, delete, rename, set class, load
+    from file or database) is mirrored into the Viewer at once; rectangles and polygons keep their outlines,
+    pixel-list ROIs (from label maps / GeoJSON points) come over as mask ROIs;
+  * the Viewer's own ROI Manager list sits in this tab: select ROIs there for the tools that ask for selected ROIs
+    (dark pixel, flat field, endmember); Plot ROI spectra, Plot class means, Selected ROI mean → endmember;
+  * Load ROI file / Save ROIs to file / Save to and Load from the library database, on the linked scene.
+* Checked: SAM with ROI classes (Spectral Matching) and Random Forest / SVM training (Classification) run on the
+  synced ROIs.
+* Tools ▸ *ROIs Linked to Data Aggregation* opens the tab.
+
 ## v2.3
 * "Viewer" renamed **Viewer and Analysis** (sidebar, home card, page title, View menu Ctrl+3, Tools menu, help).
 * `viewer/HyperVista_v1_0.py` replaced by the team's modified viewer (`modified_code_for_viewer_and_analysis.py`,

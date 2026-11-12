@@ -1,4 +1,4 @@
-# DS3 — Deep Spectral Signature System (desktop, v2.3)
+# DS3 — Deep Spectral Signature System (desktop, v2.4)
 
 One PyQt5 program with the **DS3 interface** (the look of the `DS3_demo` web prototype) and **three modules** (sidebar order: Library · Data Aggregation · Viewer and Analysis)
 that carry every feature of our tools:
@@ -7,7 +7,7 @@ that carry every feature of our tools:
 |---|---|---|
 | **Library** | HyperVista Library v3.4 (`hvva` library panel) | All spectral libraries as cards (main libraries from the libraries folder + built libraries), search libraries and materials across all libraries, then the full library browser: category tree, materials, spectrum, compare, match / save, acquisition · unit · purity · covers filters, Builder, Resampling, Export, import of any spectra format |
 | **Data Aggregation** | HyperVista Library v3.4 (data aggregation window) | Scenes, ROI Analysis, Wavelength Grid, Aggregation, Mosaic / Stack, Signature Export, map view (georeferenced files), Plugins. The Georeferencing tab is left out in DS3. |
-| **Viewer and Analysis** | DS3 Hyperspectral Viewer & Analysis Tool (`viewer/HyperVista_v1_0.py`, the team's modified viewer) + DS3 **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality Reduction (PCA / MNF), Classification (classical models, cross-validation, saved models), Spectral Matching (SAM), Segmentation (deep models, ground-truth files) — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation). No ROI Analysis tab: ROIs come from Data Aggregation. |
+| **Viewer and Analysis** | DS3 Hyperspectral Viewer & Analysis Tool (`viewer/HyperVista_v1_0.py`, the team's modified viewer) + DS3 **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality Reduction (PCA / MNF), Classification (classical models, cross-validation, saved models), Spectral Matching (SAM), Segmentation (deep models, ground-truth files) — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation). No ROI Analysis tab of its own: a **ROIs (Data Aggregation)** tab mirrors the ROIs drawn in Data Aggregation. |
 
 All three share **one database connection** (PostgreSQL in Docker or a local SQLite file).
 
@@ -15,10 +15,19 @@ All three share **one database connection** (PostgreSQL in Docker or a local SQL
 
 ### Where ROIs live
 
-ROIs are drawn only in **Data Aggregation ▸ ROI Analysis** (Viewer and Analysis has no ROI tab in DS3). Its
-Classification, Spectral Matching, Segmentation, Unmixing and empirical-line tools still use ROIs: bring them over with
-**Tools ▸ Get ROIs from Data Aggregation** (the Data Aggregation scene of the same size, e.g. after
-*Library tab ▸ Send image to Data Aggregation*), or **Tools ▸ Load ROI File into Viewer and Analysis** (DS3-ROIs JSON).
+ROIs are drawn in one place, **Data Aggregation ▸ ROI Analysis**, and are connected to Viewer and Analysis through
+its **ROIs (Data Aggregation)** tab:
+
+1. Open the image in Viewer and Analysis → tab **ROIs (Data Aggregation)** → **Send / select this image in Data
+   Aggregation** (links it to its Data Aggregation scene: same file, name or size).
+2. **Draw ROIs in Data Aggregation ▸** → draw rectangles / polygons with classes in its ROI Analysis tab.
+3. With **Keep ROIs in sync** on (default), every ROI added, deleted, renamed or re-classed there appears at once
+   in the Viewer's ROI Manager (outlines on the image too). Opening an image whose file is already a Data
+   Aggregation scene picks its ROIs up straight away.
+4. Classification (ROIs as training samples), Spectral Matching (SAM with ROI classes), Segmentation (label source
+   *ROIs*), Unmixing (selected ROI mean → endmember) and Data Correction (empirical line, dark pixel, flat field)
+   use them. Tools asking for *selected* ROIs use the selection in that tab's ROI Manager, or ask which one.
+5. The tab also loads / saves ROI files and saves / loads ROIs to the library database on the linked scene.
 
 ## Install and run (Windows)
 
