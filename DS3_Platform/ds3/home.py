@@ -21,7 +21,7 @@ class HomePage(W.QWidget):
             "Welcome to DS3",
             "A workspace for managing spectral libraries, exploring and processing hyperspectral images, and "
             "aggregating material signatures across scenes. Your libraries are listed under Library; combine "
-            "scenes under Data Aggregation; open an image under Viewer."))
+            "scenes under Data Aggregation; open and analyse an image under Viewer and Analysis."))
         self.st_libs, self.st_mats, self.st_imgs, self.st_specs = (StatCard(t) for t in
                                                                     ("Libraries", "Materials", "Images opened", "Spectra"))
         stats = CardGrid(min_width=200, max_cols=4, spacing=14)
@@ -35,8 +35,8 @@ class HomePage(W.QWidget):
             ModuleCard("analysis", "Data Aggregation", "Aggregate scenes into class signatures on a common grid, "
                        "mosaic and stack; export CSV, JSON or ENVI .sli.", "Open Data Aggregation",
                        lambda: shell.show_module("analysis")),
-            ModuleCard("image", "Viewer", "Open a hyperspectral image, pick pixels, preprocess, classify, "
-                       "unmix and compare with a library.", "Open Viewer", lambda: shell.show_module("image")),
+            ModuleCard("image", "Viewer and Analysis", "Open a hyperspectral image, preprocess, reduce (PCA / MNF), "
+                       "classify, segment, unmix and compare with a library.", "Open Viewer and Analysis", lambda: shell.show_module("image")),
         ])
         lay.addWidget(mods)
         self.lbl_hint = label("", "small", wrap=True)

@@ -1,13 +1,13 @@
-# DS3 — Deep Spectral Signature System (desktop, v2.2)
+# DS3 — Deep Spectral Signature System (desktop, v2.3)
 
-One PyQt5 program with the **DS3 interface** (the look of the `DS3_demo` web prototype) and **three modules** (sidebar order: Library · Data Aggregation · Viewer)
+One PyQt5 program with the **DS3 interface** (the look of the `DS3_demo` web prototype) and **three modules** (sidebar order: Library · Data Aggregation · Viewer and Analysis)
 that carry every feature of our tools:
 
 | Module | Comes from | What it does |
 |---|---|---|
 | **Library** | HyperVista Library v3.4 (`hvva` library panel) | All spectral libraries as cards (main libraries from the libraries folder + built libraries), search libraries and materials across all libraries, then the full library browser: category tree, materials, spectrum, compare, match / save, acquisition · unit · purity · covers filters, Builder, Resampling, Export, import of any spectra format |
 | **Data Aggregation** | HyperVista Library v3.4 (data aggregation window) | Scenes, ROI Analysis, Wavelength Grid, Aggregation, Mosaic / Stack, Signature Export, map view (georeferenced files), Plugins. The Georeferencing tab is left out in DS3. |
-| **Viewer** | HyperVista viewer v1.0 (`viewer/HyperVista_v1_0.py`, only message texts changed) + new **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, PCA, Classification, 2D CNN — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation) |
+| **Viewer and Analysis** | DS3 Hyperspectral Viewer & Analysis Tool (`viewer/HyperVista_v1_0.py`, the team's modified viewer) + DS3 **Library** tab | Display (single band / RGB), Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality Reduction (PCA / MNF), Classification (classical models, cross-validation, saved models), Spectral Matching (SAM), Segmentation (deep models, ground-truth files) — plus the DS3 image↔library features (collect spectra, compare angles, CSV, best matches, library SAM map, store to library, send to Data Aggregation). No ROI Analysis tab: ROIs come from Data Aggregation. |
 
 All three share **one database connection** (PostgreSQL in Docker or a local SQLite file).
 
@@ -15,10 +15,10 @@ All three share **one database connection** (PostgreSQL in Docker or a local SQL
 
 ### Where ROIs live
 
-ROIs are drawn only in **Data Aggregation ▸ ROI Analysis** (the Viewer has no ROI tab in DS3). The Viewer's
-Classification, SAM (ROI classes), Unmixing and empirical-line tools still use ROIs: bring them over with
+ROIs are drawn only in **Data Aggregation ▸ ROI Analysis** (Viewer and Analysis has no ROI tab in DS3). Its
+Classification, Spectral Matching, Segmentation, Unmixing and empirical-line tools still use ROIs: bring them over with
 **Tools ▸ Get ROIs from Data Aggregation** (the Data Aggregation scene of the same size, e.g. after
-*Library tab ▸ Send image to Data Aggregation*), or **Tools ▸ Load ROI File into the Viewer** (DS3-ROIs JSON).
+*Library tab ▸ Send image to Data Aggregation*), or **Tools ▸ Load ROI File into Viewer and Analysis** (DS3-ROIs JSON).
 
 ## Install and run (Windows)
 
@@ -57,7 +57,7 @@ TensorFlow is optional (only the Viewer's 2D CNN tab).
 |---|---|
 | File | Open Image File (Ctrl+O), Open Previously Opened Image, Open Zarr Folder, Open Spectral Library File, Import ASD Field Spectra, Available Bands List, Save Image View (PNG/JPG/PDF/SVG), Export Active Cube, Add Scenes / Raw Binary Cube / Demo Scenes to Data Aggregation, Connect Library Database, Home, Exit |
 | View | Home, Library (Ctrl+1), Data Aggregation (Ctrl+2), Viewer (Ctrl+3), Zoom In / Out, Fit (Ctrl+0), Map Background, Processing History, Revert to Original Cube |
-| Tools | Collect Spectra, Draw ROIs (Data Aggregation), Clear Collected, Get ROIs from Data Aggregation (into the Viewer), Load ROI File into the Viewer, Send Image to Data Aggregation, Preprocessing ▸ (Normalisation, Units, Common Grid, Indices & Features, Statistics), Band Management, Data Correction, Collected Spectra (Data Aggregation), Library Images, Plugins |
+| Tools | Collect Spectra, Draw ROIs (Data Aggregation), Clear Collected, Get ROIs from Data Aggregation (into Viewer and Analysis), Load ROI File into Viewer and Analysis, Send Image to Data Aggregation, Preprocessing ▸ (Normalisation, Units, Common Grid, Indices & Features, Statistics), Band Management, Data Correction, Collected Spectra (Data Aggregation), Library Images, Plugins |
 | Spectral | Spectral Libraries ▸ Builder / Viewer / Resampling / Export · Spectral Analyst · Mapping Methods ▸ SAM (library) / SAM (ROI classes) / Linear Unmixing / K-Means · Transforms ▸ PCA / Band Math · Spectral Indices ▸ NDVI, NDRE, SAVI, EVI, NDWI, NDBI, PRI (+ more in Indices & Features) · Anomaly Detection (RX) · Signal-to-Noise · Classification ▸ RF / SVM, 2D CNN · Data Aggregation |
 | Help | Supported Formats, Using the Viewer, Using Library and Data Aggregation, About |
 
@@ -72,11 +72,11 @@ DS3_Platform/
     shell.py                   main window: menus, sidebar, pages, status, spectral indices, zoom
     home.py                    Home page (counters + module cards)
     library_page.py            Library page (cards, search, folder banner) + detail view (library panel)
-    image_page.py              Viewer page (viewer) + the new Library tab (collect / match / SAM / store / send)
+    image_page.py              Viewer and Analysis page (viewer) + the new Library tab (collect / match / SAM / store / send)
     analysis_page.py           Data Aggregation page (data aggregation window)
     style.py, widgets.py       DS3 colours, QSS, matplotlib theme, cards, chips, icons
   hvva/                        HyperVista Library v3.4 (one change: spectrum counts per library)
-  viewer/HyperVista_v1_0.py    the viewer from main (only 5 message texts changed)
+  viewer/HyperVista_v1_0.py    DS3 Viewer & Analysis Tool (team's modified viewer; ROI messages point to Data Aggregation)
   database/ plugins/ data/ assets/ tests/ docs/
 ```
 

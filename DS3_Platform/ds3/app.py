@@ -9,7 +9,7 @@ import sys
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="DS3", description="DS3 - Deep Spectral Signature System")
-    ap.add_argument("image", nargs="?", help="hyperspectral image to open in the Viewer")
+    ap.add_argument("image", nargs="?", help="hyperspectral image to open in Viewer and Analysis")
     ap.add_argument("--db", help="library database URL (overrides the saved connection)")
     ap.add_argument("--init", action="store_true", help="create the database tables if they are missing")
     args = ap.parse_args(argv)

@@ -13,7 +13,9 @@ openpyxl                 # Excel spectra
 pyarrow                  # Parquet spectra
 spectral                 # ENVI reading in the Image module
 scikit-learn             # K-Means, PCA, RF / SVM (Image module)
-scikit-image             # image filters (Image module)
+scikit-image             # image filters (Viewer and Analysis)
+joblib                   # save / load trained classifiers (Viewer and Analysis)
+psutil                   # free-memory check before deep-learning training (optional)
 # optional
 netCDF4
 zarr
@@ -22,4 +24,5 @@ pyproj                   # map view for other CRSs
 fastapi                  # optional library API server
 uvicorn[standard]
 pytest                   # tests
-# tensorflow             # only for the Image module's 2D CNN tab (Python 3.10/3.11)
+# tensorflow             # only for the Segmentation tab's deep models (Python 3.10/3.11)
+# tf-keras keras_cv_attention_models   # only for the AttentionGCN segmentation model

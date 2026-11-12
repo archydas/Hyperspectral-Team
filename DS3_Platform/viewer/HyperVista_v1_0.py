@@ -163,7 +163,7 @@ def apply_dark_theme(app):
 try:
     from sklearn.cluster import MiniBatchKMeans
     from sklearn.decomposition import NMF, PCA
-    from sklearn.model_selection import StratifiedKFold, GroupKFold
+    from sklearn.model_selection import StratifiedKFold, GroupKFold, train_test_split
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.svm import SVC
     from sklearn.preprocessing import StandardScaler
@@ -180,7 +180,7 @@ try:
 except ImportError:                      # scikit-learn < 1.0
     StratifiedGroupKFold = None
 
-# TensorFlow is optional (2D CNN). It is imported lazily because it is slow to load.
+# TensorFlow is optional (Segmentation tab). It is imported lazily because it is slow to load.
 TF_AVAILABLE = importlib.util.find_spec("tensorflow") is not None
 
 APP_NAME = "DS3"
@@ -1971,36 +1971,6 @@ def build_label_images(rois, class_names, rows, cols):
     return cls_img, roi_img, conflict
 
 
-def split_train_test(y, roi_id, test_frac, mode, rng):
-    """Return boolean test-mask over samples.
-
-    mode "pixels": stratified random pixel split.
-    mode "rois":   hold out whole ROIs per class (needs >=2 ROIs of a class,
-                   otherwise that class falls back to a pixel split).
-    """
-    test = np.zeros(len(y), dtype=bool)
-    if test_frac <= 0:
-        return test
-    for c in np.unique(y):
-        in_c = np.flatnonzero(y == c)
-        used_roi_split = False
-        if mode == "rois":
-            rois_c = np.unique(roi_id[in_c])
-            if len(rois_c) >= 2:
-                k = int(round(len(rois_c) * test_frac))
-                k = min(max(k, 1), len(rois_c) - 1)
-                chosen = rng.choice(rois_c, size=k, replace=False)
-                test[in_c[np.isin(roi_id[in_c], chosen)]] = True
-                used_roi_split = True
-        if not used_roi_split:
-            if len(in_c) < 2:
-                continue
-            k = int(round(len(in_c) * test_frac))
-            k = min(max(k, 1), len(in_c) - 1)
-            test[rng.choice(in_c, size=k, replace=False)] = True
-    return test
-
-
 def cap_per_class(idx, y, max_per_class, rng):
     """Randomly keep at most max_per_class samples of each class among idx."""
     if max_per_class <= 0:
@@ -2012,51 +1982,6 @@ def cap_per_class(idx, y, max_per_class, rng):
             ic = rng.choice(ic, size=max_per_class, replace=False)
         keep.append(ic)
     return np.sort(np.concatenate(keep)) if keep else idx
-
-
-# Registry of supervised classifiers. To plug in another model (e.g. a CNN
-# wrapper) add an entry that returns an object with fit(X, y) / predict(X).
-def _make_random_forest():
-    return RandomForestClassifier(
-        n_estimators=200, n_jobs=-1, random_state=0, class_weight="balanced"
-    )
-
-
-def _make_svm_rbf():
-    return Pipeline([
-        ("scale", StandardScaler()),
-        ("svc", SVC(kernel="rbf", C=10.0, gamma="scale", class_weight="balanced")),
-    ])
-
-
-class PcaSvm:
-    """PCA (up to 100 components) followed by an SVM, as in the reference SVM_HSIn.py."""
-
-    def __init__(self, n_components=100, kernel="poly"):
-        self.n_components = n_components
-        self.kernel = kernel
-
-    def fit(self, X, y):
-        n = int(max(1, min(self.n_components, X.shape[1], X.shape[0] - 1)))
-        self.pca = PCA(n_components=n, random_state=0)
-        Xp = self.pca.fit_transform(X)
-        self.svc = SVC(kernel=self.kernel, class_weight="balanced")
-        self.svc.fit(Xp, y)
-        return self
-
-    def predict(self, X):
-        return self.svc.predict(self.pca.transform(X))
-
-
-def _make_pca_svm_poly():
-    return PcaSvm(n_components=100, kernel="poly")
-
-
-CLASSIFIERS = {
-    "Random forest": _make_random_forest,
-    "SVM (RBF kernel)": _make_svm_rbf,
-    "SVM (PCA + poly kernel)": _make_pca_svm_poly,
-}
 
 
 def format_report(names, y_true, y_pred, n_train, n_test, split_desc):
@@ -2093,183 +2018,6 @@ class TaskCancelled(Exception):
 def _check_cancel(cancel):
     if cancel is not None and cancel.is_set():
         raise TaskCancelled()
-
-
-def _get_features(cube, feature_source, pca_scores, pca_valid):
-    """(N, F) float32 feature matrix and the mask of valid pixels."""
-    rows, cols, bands = cube.shape
-    if feature_source == "pca":
-        k = pca_scores.shape[2]
-        return pca_scores.reshape(-1, k).astype(np.float32), pca_valid.copy()
-    return prepare_features(cube.reshape(-1, bands))
-
-
-def _collect_samples(valid_px, rois, class_names, rows, cols):
-    """Labelled pixels from the ROIs.
-
-    Returns (flat pixel indices, class ids 0..K-1, ROI ids, class names used,
-    number of ambiguous pixels that were dropped).
-    """
-    cls_img, roi_img, conflict = build_label_images(rois, class_names, rows, cols)
-    ok = (cls_img.ravel() >= 0) & ~conflict.ravel() & valid_px
-    samp_idx = np.flatnonzero(ok)
-    y_all = cls_img.ravel()[samp_idx]
-    rid = roi_img.ravel()[samp_idx]
-    present = np.unique(y_all)
-    if len(present) < 2:
-        raise RuntimeError("Need labelled pixels from at least 2 different classes.")
-    remap = -np.ones(len(class_names), dtype=int)
-    remap[present] = np.arange(len(present))
-    used_names = [class_names[i] for i in present]
-    return samp_idx, remap[y_all], rid, used_names, int(conflict.sum())
-
-
-def _split_notes(report, n_conflict, split_mode, has_test):
-    if n_conflict:
-        report += (f"\n\nNote: {n_conflict} pixels lie in ROIs of different classes "
-                   "and were excluded from training.")
-    if split_mode == "pixels" and has_test:
-        report += ("\n\nNote: neighbouring pixels are highly correlated, so a random pixel split "
-                   "tends to over-estimate accuracy. 'Hold out whole ROIs' is a stricter test.")
-    return report
-
-
-def run_supervised(cube, rois, class_names, feature_source, pca_scores, pca_valid,
-                   clf_name, test_frac, split_mode, max_per_class,
-                   progress=None, cancel=None):
-    """Train a classifier on labelled ROI pixels and classify the whole image.
-
-    Runs in a worker thread (no GUI calls). Returns a dict with the label image,
-    class names that were used, and a text report.
-    """
-    def say(msg):
-        if progress is not None:
-            progress(msg)
-
-    rows, cols, bands = cube.shape
-    rng = np.random.default_rng(0)
-
-    say("Preparing features...")
-    X_all, valid_px = _get_features(cube, feature_source, pca_scores, pca_valid)
-    samp_idx, y, rid_all, used_names, n_conflict = _collect_samples(
-        valid_px, rois, class_names, rows, cols)
-    _check_cancel(cancel)
-
-    test_mask = split_train_test(y, rid_all, test_frac, split_mode, rng)
-    sample_ids = np.arange(len(y))
-    train_ids = cap_per_class(sample_ids[~test_mask], y, max_per_class, rng)
-    test_ids = cap_per_class(sample_ids[test_mask], y, max_per_class, rng) \
-        if test_mask.any() else np.array([], dtype=int)
-
-    if len(np.unique(y[train_ids])) < 2:
-        raise RuntimeError("Training set contains fewer than 2 classes after splitting.")
-
-    say(f"Training {clf_name} on {len(train_ids)} pixels...")
-    clf = CLASSIFIERS[clf_name]()
-    clf.fit(X_all[samp_idx[train_ids]], y[train_ids])
-    _check_cancel(cancel)
-
-    split_desc = ("hold-out whole ROIs" if split_mode == "rois" else "random pixels")
-    if len(test_ids) > 0:
-        say("Evaluating on held-out samples...")
-        y_pred = clf.predict(X_all[samp_idx[test_ids]])
-        report = format_report(used_names, y[test_ids], y_pred,
-                               len(train_ids), len(test_ids), split_desc)
-    else:
-        report = (f"No hold-out set (test fraction = 0). Trained on {len(train_ids)} pixels.\n"
-                  "Set a test fraction above 0 to get accuracy figures.")
-    report = _split_notes(report, n_conflict, split_mode, len(test_ids) > 0)
-
-    labels_flat = -np.ones(rows * cols, dtype=np.int32)
-    valid_idx = np.flatnonzero(valid_px)
-    chunk = 100000
-    for s0 in range(0, len(valid_idx), chunk):
-        _check_cancel(cancel)
-        say(f"Classifying image... {min(s0 + chunk, len(valid_idx))}/{len(valid_idx)} pixels")
-        sel = valid_idx[s0:s0 + chunk]
-        labels_flat[sel] = clf.predict(X_all[sel])
-
-    return {
-        "labels": labels_flat.reshape(rows, cols),
-        "names": used_names,
-        "report": report,
-        "title": f"{clf_name}",
-    }
-
-
-def run_crossval(cube, rois, class_names, feature_source, pca_scores, pca_valid,
-                 clf_name, n_folds, split_mode, max_per_class,
-                 progress=None, cancel=None):
-    """k-fold cross-validation on the labelled ROI pixels (as in the reference SVM script).
-
-    split_mode "pixels": stratified random folds. "rois": whole ROIs are held out per fold.
-    """
-    def say(msg):
-        if progress is not None:
-            progress(msg)
-
-    rows, cols, bands = cube.shape
-    rng = np.random.default_rng(0)
-    say("Preparing features...")
-    X_all, valid_px = _get_features(cube, feature_source, pca_scores, pca_valid)
-    samp_idx, y, rid, used_names, n_conflict = _collect_samples(
-        valid_px, rois, class_names, rows, cols)
-
-    ids = np.arange(len(y))
-    if split_mode == "rois":
-        rois_per_class = [len(np.unique(rid[y == c])) for c in np.unique(y)]
-        k = min(n_folds, min(rois_per_class))
-        if k < 2:
-            raise RuntimeError(
-                "Hold-out by ROI needs at least 2 ROIs in every class. "
-                "Add more ROIs or switch to random pixels."
-            )
-        if StratifiedGroupKFold is not None:
-            splitter = StratifiedGroupKFold(n_splits=k, shuffle=True, random_state=0)
-        else:
-            splitter = GroupKFold(n_splits=k)
-        splits = list(splitter.split(ids, y, rid))
-        desc = f"{k}-fold cross-validation, whole ROIs held out"
-    else:
-        k = min(n_folds, int(np.bincount(y).min()))
-        if k < 2:
-            raise RuntimeError("Each class needs at least 2 labelled pixels for cross-validation.")
-        splits = list(StratifiedKFold(n_splits=k, shuffle=True, random_state=0).split(ids, y))
-        desc = f"{k}-fold stratified cross-validation, random pixels"
-
-    fold_acc, y_true, y_pred = [], [], []
-    for f, (tr, te) in enumerate(splits):
-        _check_cancel(cancel)
-        say(f"Cross-validation fold {f + 1}/{k} ({clf_name})...")
-        tr = cap_per_class(tr, y, max_per_class, rng)
-        te = cap_per_class(te, y, max_per_class, rng)
-        if len(np.unique(y[tr])) < 2 or len(te) == 0 or not set(y[te]) <= set(y[tr]):
-            fold_acc.append(float("nan"))      # a test class never seen in training
-            continue
-        clf = CLASSIFIERS[clf_name]()
-        clf.fit(X_all[samp_idx[tr]], y[tr])
-        pred = clf.predict(X_all[samp_idx[te]])
-        fold_acc.append(float(accuracy_score(y[te], pred)))
-        y_true.append(y[te])
-        y_pred.append(pred)
-
-    if not y_true:
-        raise RuntimeError("No fold could be evaluated (each training fold needs 2+ classes).")
-    y_true = np.concatenate(y_true)
-    y_pred = np.concatenate(y_pred)
-    accs = np.array(fold_acc)
-    good = ~np.isnan(accs)
-
-    lines = [f"Classifier: {clf_name}", f"{desc}", ""]
-    for f, a in enumerate(accs):
-        lines.append(f"  Fold {f + 1}: " + (
-            "skipped (a test class had no training pixels)" if np.isnan(a) else f"{100.0 * a:.2f}%"))
-    lines.append(f"Average accuracy: {100.0 * accs[good].mean():.2f}%  "
-                 f"(+/- {100.0 * accs[good].std():.2f}%)")
-    lines.append("")
-    report = "\n".join(lines) + format_report(used_names, y_true, y_pred, None, len(y_true), desc)
-    report = _split_notes(report, n_conflict, split_mode, False)
-    return {"report": report}
 
 
 # ----------------------------------------------------------------------
@@ -2456,6 +2204,217 @@ def mnf_smile_reduction(cube, n_components, max_samples=200000, chunk=200000):
     for s0 in range(0, flat.shape[0], chunk):
         z = (flat[s0:s0 + chunk] - mean) @ T[:, :k]
         flat_out[s0:s0 + chunk] = z @ Tinv[:k, :] + mean
+    return out
+
+
+def rescale01(img):
+    """Rescale an array to [0, 1] (min-max over its finite values). A constant image gives zeros and
+    non-finite pixels are set to 0, so the result can always be displayed."""
+    a = np.asarray(img, dtype=np.float64)
+    fin = np.isfinite(a)
+    if not fin.any():
+        return np.zeros(a.shape, dtype=np.float64)
+    lo, hi = float(a[fin].min()), float(a[fin].max())
+    out = (a - lo) / (hi - lo) if hi > lo else np.zeros(a.shape, dtype=np.float64)
+    out[~fin] = 0.0
+    return out
+
+
+class _CovAcc:
+    """Streaming mean / covariance of row vectors (float64, shifted by the first row for stability)."""
+
+    def __init__(self, nb):
+        self.n = 0
+        self.shift = None
+        self.s1 = np.zeros(nb)
+        self.s2 = np.zeros((nb, nb))
+
+    def add(self, X):
+        if X.shape[0] == 0:
+            return
+        if self.shift is None:
+            self.shift = np.array(X[0], dtype=np.float64)
+        Y = X - self.shift
+        self.n += Y.shape[0]
+        self.s1 += Y.sum(axis=0)
+        self.s2 += Y.T @ Y
+
+    def mean(self):
+        return self.shift + self.s1 / self.n
+
+    def cov(self):
+        m = self.s1 / self.n
+        return (self.s2 - self.n * np.outer(m, m)) / max(self.n - 1, 1)
+
+
+MNF_NOISE_LAGS = ("horizontal", "vertical", "both")
+
+
+def dimred_transform(cube, method="MNF", n_components=10, noise_lag="horizontal", progress=None, cancel=None):
+    """Spectral dimensionality reduction by PCA or by the maximum noise fraction (MNF) transform.
+
+    MNF follows Green, Berman, Switzer and Craig (IEEE TGRS 26(1), 1988). With Z = S + N and
+    Sigma = Sigma_S + Sigma_N, the noise fraction of the component a'Z is  a' Sigma_N a / a' Sigma a.
+    The MNF vectors are the eigenvectors of  Sigma_N Sigma^-1  (generalised problem  Sigma_N a = mu Sigma a,
+    mu = noise fraction); they are normed to a'a = 1 and the transform is  Y = A'(Z - mean).
+    Sigma is the sample covariance. Sigma_N is not known, so it is estimated as in section V of the paper
+    (minimum/maximum autocorrelation factors): with the proportional covariance model and strongly
+    autocorrelated signal, Sigma_N ~ Sigma_delta / 2, where Sigma_delta = Cov{Z(x) - Z(x + delta)} is the
+    covariance of differences between neighbouring pixels (delta = one pixel to the right, one pixel down, or
+    both pooled).
+
+    The paper orders MNF components by decreasing noise fraction (noisiest first). Here the components are
+    returned in order of decreasing image quality (increasing noise fraction, i.e. highest signal-to-noise
+    ratio first), the order in which they are normally used for dimensionality reduction. Bands are scaled to
+    unit variance for numerical conditioning; the MNF transform is invariant to band scaling, and the
+    returned coefficients are expressed in the original band units.
+
+    PCA uses the eigenvectors of the sample covariance matrix, in order of decreasing variance.
+
+    n_components: 1 .. bands for PCA; 1 .. bands - 1 for MNF (reduction needs fewer components than bands).
+    NaN handling: all-NaN pixels are ignored (their scores are NaN); all-NaN bands are dropped; other NaNs
+    are replaced by the band mean.
+
+    Returns a dict: scores (rows, cols, k) float32; valid_pixels (rows*cols bool); coefficients (bands_used, k);
+    mean (bands_used,); band_index (bands_used,); method; noise_lag; and
+      PCA: explained_ratio (k,), eigenvalues (k,)
+      MNF: noise_fraction (k,), snr (k,), noise_fraction_all (bands_used,).
+    """
+    method = str(method).upper()
+    if method not in ("PCA", "MNF"):
+        raise ValueError("method must be 'PCA' or 'MNF'")
+    if noise_lag not in MNF_NOISE_LAGS:
+        raise ValueError(f"noise_lag must be one of {MNF_NOISE_LAGS}")
+    cube = np.asarray(cube)
+    if cube.ndim != 3:
+        raise ValueError("The data must be a (rows, cols, bands) cube.")
+    rows, cols, B = cube.shape
+    say = progress or (lambda m: None)
+
+    def check():
+        if cancel is not None and cancel.is_set():
+            raise TaskCancelled()
+
+    block_rows = max(1, 50000 // max(cols, 1))
+
+    # ---- pass 1: valid pixels, valid bands, band means -------------------------------------------
+    valid_pix = np.zeros((rows, cols), dtype=bool)
+    cnt = np.zeros(B)
+    tot = np.zeros(B)
+    for r0 in range(0, rows, block_rows):
+        check()
+        blk = np.asarray(cube[r0:r0 + block_rows], dtype=np.float64)
+        fin = np.isfinite(blk)
+        vp = fin.any(axis=2)
+        valid_pix[r0:r0 + block_rows] = vp
+        fin &= vp[:, :, None]
+        cnt += fin.sum(axis=(0, 1))
+        tot += np.where(fin, blk, 0.0).sum(axis=(0, 1))
+    if not valid_pix.any():
+        raise ValueError("All pixels are NaN; the transform is undefined.")
+    band_index = np.flatnonzero(cnt > 0)
+    Bv = band_index.size
+    if Bv < 2:
+        raise ValueError("At least two valid bands are needed.")
+    band_mean = tot[band_index] / cnt[band_index]
+    k = int(n_components)
+    kmax = Bv if method == "PCA" else Bv - 1
+    if k < 1 or k > kmax:
+        what = "at most the number of bands" if method == "PCA" else "less than the number of spectral bands"
+        raise ValueError(f"The number of {method} components must be between 1 and {kmax} "
+                         f"({what}, {Bv} valid bands).")
+    use_h = noise_lag in ("horizontal", "both")
+    use_v = noise_lag in ("vertical", "both")
+    if method == "MNF":
+        if use_h and cols < 2:
+            raise ValueError("Horizontal noise estimation needs at least two columns.")
+        if use_v and rows < 2:
+            raise ValueError("Vertical noise estimation needs at least two rows.")
+
+    def load(r0, r1):
+        """Filled float64 block (rows, cols, Bv) for rows r0:r1 and its validity mask."""
+        blk = np.asarray(cube[r0:r1], dtype=np.float64)[:, :, band_index]
+        blk = np.where(np.isfinite(blk), blk, band_mean)
+        return blk, valid_pix[r0:r1]
+
+    # ---- pass 2: covariance of the data and of the neighbour differences ---------------------------
+    acc = _CovAcc(Bv)
+    acc_d = _CovAcc(Bv)
+    for r0 in range(0, rows, block_rows):
+        check()
+        say(f"{method}: estimating covariance ({min(rows, r0 + block_rows)}/{rows} rows)...")
+        r1 = min(r0 + block_rows, rows)
+        nb = r1 - r0
+        blk, vp = load(r0, min(r1 + 1, rows))        # one extra row for the vertical differences
+        acc.add(blk[:nb][vp[:nb]])
+        if method == "MNF":
+            if use_h:
+                d = blk[:nb, 1:] - blk[:nb, :-1]
+                ok = vp[:nb, 1:] & vp[:nb, :-1]
+                acc_d.add(d[ok])
+            if use_v and blk.shape[0] > 1:
+                d = blk[1:] - blk[:-1]
+                ok = vp[1:] & vp[:-1]
+                acc_d.add(d[ok])
+    if acc.n < 2:
+        raise ValueError("Not enough valid pixels.")
+    mean = acc.mean()
+    Sigma = acc.cov()
+
+    out = {"method": method, "noise_lag": noise_lag if method == "MNF" else None,
+           "band_index": band_index, "mean": mean, "valid_pixels": valid_pix.ravel().copy()}
+
+    if method == "PCA":
+        w, V = np.linalg.eigh((Sigma + Sigma.T) / 2.0)
+        order = np.argsort(w)[::-1]
+        w, V = np.maximum(w[order], 0.0), V[:, order]
+        A = V[:, :k]
+        out["eigenvalues"] = w[:k]
+        out["explained_ratio"] = (w[:k] / w.sum()) if w.sum() > 0 else np.zeros(k)
+    else:
+        if acc_d.n < 2:
+            raise ValueError("Not enough neighbouring valid pixels to estimate the noise.")
+        Sn = acc_d.cov() / 2.0                       # Sigma_N ~ Sigma_delta / 2
+        s = np.sqrt(np.maximum(np.diag(Sigma), 0.0))
+        s = np.where(s > 0, s, 1.0)
+        Ss = Sigma / np.outer(s, s)
+        Sns = Sn / np.outer(s, s)
+        Ss = (Ss + Ss.T) / 2.0
+        Sns = (Sns + Sns.T) / 2.0
+        ridge = 1e-10 * np.eye(Bv)
+        from scipy.linalg import eigh as _geigh
+        try:
+            mu, Vs = _geigh(Sns, Ss + ridge)         # Sigma_N a = mu Sigma a ; ascending mu
+        except np.linalg.LinAlgError:                # Sigma numerically singular: use the pseudo-inverse
+            mu, Vs = np.linalg.eig(np.linalg.pinv(Ss) @ Sns)
+            mu, Vs = mu.real, Vs.real
+        Aall = Vs / s[:, None]                       # back to the original band units
+        Aall /= np.maximum(np.linalg.norm(Aall, axis=0), 1e-300)     # paper: a'a = 1
+        num = np.einsum("ij,ik,kj->j", Aall, Sn, Aall)
+        den = np.maximum(np.einsum("ij,ik,kj->j", Aall, Sigma, Aall), 1e-300)
+        nf = np.clip(num / den, 0.0, 1.0)            # noise fraction of every component
+        order = np.argsort(nf, kind="stable")        # best image quality (lowest noise fraction) first
+        Aall, nf = Aall[:, order], nf[order]
+        A = Aall[:, :k]
+        out["noise_fraction"] = nf[:k]
+        out["noise_fraction_all"] = nf
+        out["snr"] = (1.0 - nf[:k]) / np.maximum(nf[:k], 1e-12)
+
+    # deterministic sign: the largest coefficient of every component is positive
+    sign = np.sign(A[np.argmax(np.abs(A), axis=0), np.arange(A.shape[1])])
+    A = A * np.where(sign == 0, 1.0, sign)
+    out["coefficients"] = A
+
+    # ---- pass 3: scores ----------------------------------------------------------------------------
+    scores = np.full((rows, cols, k), np.nan, dtype=np.float32)
+    for r0 in range(0, rows, block_rows):
+        check()
+        say(f"{method}: computing components ({min(rows, r0 + block_rows)}/{rows} rows)...")
+        blk, vp = load(r0, min(r0 + block_rows, rows))
+        z = (blk - mean) @ A
+        z[~vp] = np.nan
+        scores[r0:r0 + block_rows] = z
+    out["scores"] = scores
     return out
 
 
@@ -3077,150 +3036,2122 @@ def run_nmf_unmix(cube, n_end, band_lo, band_hi, max_fit_px, seed=42,
     }
 
 
-# ----------------------------------------------------------------------
-# 2D CNN on PCA patches (reference: ai_hsi.py)
-# ----------------------------------------------------------------------
-def gather_patches(windows, ids, cols):
-    """(B, ps, ps, C) float32 patches centred on flat pixel indices ids."""
-    r = ids // cols
-    c = ids % cols
-    return np.ascontiguousarray(windows[r, c].transpose(0, 2, 3, 1), dtype=np.float32)
+# ======================================================================
+# Deep models for spectral-spatial classification (ported from the Survey_2024 notebook)
+# TensorFlow is imported lazily; all layers are defined inside build_seg_registry().
+# ======================================================================
+SEG_MODEL_INFO = {   # name: (description, ticked by default)
+    "HybridFormer": ("Hybrid ViT: patch embedding, CLS token, 4 transformer blocks, cross-attention", False),
+    "SSMamba": ("Spectral-spatial Mamba-style state-space model", False),
+    "MHSAMamba": ("Mamba-style model with multi-head self-attention", False),
+    "WaveMamba": ("Mamba-style model on Haar wavelet sub-bands (repaired: the notebook version cannot run)", False),
+    "MorpMamba": ("Mamba-style model with morphological erosion / dilation tokens", False),
+    "Xtreme_Exception": ("(2+1)D Xception, 65 M parameters: very slow and memory hungry", False),
+    "Exception2D": ("2-D Xception, 9 M parameters", False),
+    "CNN2D": ("4-layer 2-D CNN (fast)", True),
+    "IN2D": ("2-D Inception network", False),
+    "IN3D": ("3-D Inception network, 189 M parameters: very memory hungry", False),
+    "HybIN": ("Hybrid 3-D / 2-D Inception network", False),
+    "CNN3D": ("Fast and compact 3-D CNN", True),
+    "HybCNN": ("Hybrid 3-D / 2-D CNN", True),
+    "AttentionGCN": ("Attention + graph (GloRe-style) CNN; needs tf-keras, keras_cv_attention_models and patch size 8", False),
+    "SCSNet": ("SCS network (stacked cosine-similarity convolutions)", False),
+    "PyFormer": ("Pyramid 3-D CNN + transformer. Disabled in the notebook; very memory hungry", False),
+}
 
 
-def build_cnn(input_shape, n_classes, net_size="reference"):
-    """Keras 2D CNN. 'reference' is the architecture from the notebook; 'compact' is lighter."""
+_SEG_REGISTRY = None
+
+
+def seg_tf_ready():
+    """Import TensorFlow (once) and return (tf, keras). Prefers tf-keras (Keras 2) when installed,
+    because the notebook models and keras_cv_attention_models were written for it."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    if "tensorflow" not in sys.modules and importlib.util.find_spec("tf_keras") is not None:
+        os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
     import tensorflow as tf
-    from tensorflow.keras import layers, models
+    return tf, tf.keras
 
-    tf.keras.utils.set_random_seed(42)
-    if net_size == "compact":
-        widths, dense = [32, 64, 128], 128
+
+def build_seg_registry():
+    """{name: spec}. spec = dict(build=fn(WS, k, n_classes) -> keras model, input='2d'|'3d', desc, needs, fixed_ws, note)."""
+    global _SEG_REGISTRY
+    if _SEG_REGISTRY is not None:
+        return _SEG_REGISTRY
+    tf, keras = seg_tf_ready()
+    layers = keras.layers
+    regularizers = keras.regularizers
+    Model = keras.models.Model
+    Input = keras.layers.Input
+
+    # ------------------------------------------------------------------ 2D Xception
+    def Exception2D(WS, k, Nc):
+        def entry_flow(inputs):
+            x = layers.Conv2D(32, (3, 3), strides=(2, 2), padding="same")(inputs)
+            x = layers.Activation("relu")(x)
+            x = layers.Conv2D(64, 3, padding="same")(x)
+            x = layers.Activation("relu")(x)
+            prev = x
+            for size in [128, 256, 512]:
+                x = layers.Activation("relu")(x)
+                x = layers.SeparableConv2D(size, (3, 3), padding="same")(x)
+                x = layers.Activation("relu")(x)
+                x = layers.SeparableConv2D(size, (3, 3), padding="same")(x)
+                x = layers.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
+                residual = layers.Conv2D(size, (1, 1), strides=(2, 2), padding="same")(prev)
+                x = layers.Add()([x, residual])
+                prev = x
+            return x
+
+        def middle_flow(x, num_blocks=8):
+            prev = x
+            for _ in range(num_blocks):
+                x = layers.Activation("relu")(x)
+                x = layers.SeparableConv2D(512, (3, 3), padding="same")(x)
+                x = layers.Activation("relu")(x)
+                x = layers.SeparableConv2D(512, (3, 3), padding="same")(x)
+                x = layers.Activation("relu")(x)
+                x = layers.SeparableConv2D(512, (3, 3), padding="same")(x)
+                x = layers.Add()([x, prev])
+                prev = x
+            return x
+
+        def exit_flow(x):
+            prev = x
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(512, (3, 3), padding="same")(x)
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(728, (3, 3), padding="same")(x)
+            x = layers.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
+            residual = layers.Conv2D(728, (1, 1), strides=(2, 2), padding="same")(prev)
+            x = layers.Add()([x, residual])
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(512, (3, 3), padding="same")(x)
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(728, (3, 3), padding="same")(x)
+            x = layers.GlobalAveragePooling2D()(x)
+            return layers.Dense(Nc, activation="softmax")(x)
+
+        inputs = Input(shape=(WS, WS, k))
+        return Model(inputs, exit_flow(middle_flow(entry_flow(inputs))), name="Exception2D")
+
+    # ------------------------------------------------------------------ (2+1)D Xception
+    class Conv2Plus1D(layers.Layer):
+        """Spatial 3-D convolution followed by a spectral one (https://arxiv.org/abs/1711.11248)."""
+
+        def __init__(self, filters, kernel_size, padding, **kw):
+            super().__init__(**kw)
+            self.seq = keras.Sequential([
+                layers.Conv3D(filters=filters, kernel_size=(1, kernel_size[1], kernel_size[2]), padding=padding),
+                layers.Conv3D(filters=filters, kernel_size=(kernel_size[0], 1, 1), padding=padding),
+            ])
+
+        def call(self, x):
+            return self.seq(x)
+
+    def Xtreme_Exception(WS, k, Nc):
+        def entry_block(inputs):
+            x = layers.Conv3D(filters=32, kernel_size=(5, 5, 3), activation="relu", padding="same")(inputs)
+            x = layers.Conv3D(filters=64, kernel_size=(3, 3, 3), activation="relu", padding="same")(x)
+            prev = x
+            for size in [128, 256, 512]:
+                x = Conv2Plus1D(filters=size, kernel_size=(3, 3, 3), padding="same")(x)
+                x = Conv2Plus1D(filters=size, kernel_size=(3, 3, 3), padding="same")(x)
+                x = layers.MaxPooling3D(pool_size=(3, 3, 3), padding="same")(x)
+                residual = layers.Conv3D(size, kernel_size=(3, 3, 3), strides=(3, 3, 3), padding="same")(prev)
+                x = layers.Add()([x, residual])
+                prev = x
+            return x
+
+        def middle_block(x, num_blocks=8):
+            prev = x
+            for _ in range(num_blocks):
+                x = layers.Activation("relu")(x)
+                x = Conv2Plus1D(filters=128, kernel_size=(5, 3, 3), padding="same")(x)
+                x = layers.Activation("relu")(x)
+                x = Conv2Plus1D(filters=256, kernel_size=(5, 3, 3), padding="same")(x)
+                x = layers.Activation("relu")(x)
+                x = Conv2Plus1D(filters=512, kernel_size=(5, 3, 3), padding="same")(x)
+                x = layers.Add()([x, prev])
+                prev = x
+            return x
+
+        def exit_block(x):
+            prev = x
+            x = layers.Activation("relu")(x)
+            x = Conv2Plus1D(filters=512, kernel_size=(3, 3, 3), padding="same")(x)
+            x = layers.Activation("relu")(x)
+            x = Conv2Plus1D(filters=728, kernel_size=(3, 3, 3), padding="same")(x)
+            x = layers.MaxPooling3D(pool_size=(3, 3, 3), padding="same")(x)
+            residual = layers.Conv3D(728, kernel_size=(3, 3, 3), padding="same")(prev)
+            x = layers.Add()([x, residual])
+            x = layers.Activation("relu")(x)
+            x = Conv2Plus1D(filters=512, kernel_size=(3, 3, 3), padding="same")(x)
+            x = layers.Activation("relu")(x)
+            x = Conv2Plus1D(filters=256, kernel_size=(3, 3, 3), padding="same")(x)
+            x = layers.Dropout(0.4)(x)
+            x = layers.GlobalAveragePooling3D()(x)
+            return layers.Dense(Nc, activation="softmax")(x)
+
+        inputs = Input(shape=(WS, WS, k, 1))
+        return Model(inputs, exit_block(middle_block(entry_block(inputs))), name="Xtreme_Exception")
+
+    # ------------------------------------------------------------------ plain CNNs
+    def CNN2D(WS, k, Nc):
+        inp = Input((WS, WS, k))
+        x = layers.Conv2D(8, (3, 3), padding="same", activation="relu")(inp)
+        x = layers.Conv2D(16, (3, 3), padding="same", activation="relu")(x)
+        x = layers.Conv2D(32, (3, 3), padding="same", activation="relu")(x)
+        x = layers.Conv2D(64, (3, 3), padding="same", activation="relu")(x)
+        x = layers.Flatten()(x)
+        x = layers.Dense(256, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(128, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        return Model(inp, layers.Dense(Nc, activation="softmax")(x), name="CNN2D")
+
+    def IN2D(WS, k, Nc):
+        inp = Input(shape=(WS, WS, k))
+        l1 = layers.Conv2D(30, (1, 1), padding="same", activation="relu")(inp)
+        l1 = layers.Conv2D(20, (1, 1), padding="same", activation="relu")(l1)
+        l1 = layers.Conv2D(10, (3, 3), padding="same", activation="relu")(l1)
+        l2 = layers.Conv2D(40, (1, 1), padding="same", activation="relu")(inp)
+        l2 = layers.Conv2D(20, (1, 1), padding="same", activation="relu")(l2)
+        l2 = layers.Conv2D(10, (5, 5), padding="same", activation="relu")(l2)
+        l3 = layers.MaxPooling2D((3, 3), strides=(1, 1), padding="same")(inp)
+        l3 = layers.Conv2D(20, (1, 1), padding="same", activation="relu")(l3)
+        l3 = layers.Conv2D(10, (1, 1), padding="same", activation="relu")(l3)
+        mid = layers.concatenate([l1, l2, l3], axis=3)
+        x = layers.Conv2D(128, (1, 1), activation="relu")(mid)
+        x = layers.Flatten()(x)
+        x = layers.Dense(1200, activation="relu")(x)
+        x = layers.Dense(600, activation="relu")(x)
+        x = layers.Dense(150, activation="relu")(x)
+        return Model([inp], layers.Dense(Nc, activation="softmax")(x), name="IN2D")
+
+    def IN3D(WS, k, Nc):
+        inp = Input(shape=(WS, WS, k, 1))
+        l1 = layers.Conv3D(30, (5, 5, 7), padding="same", activation="relu")(inp)
+        l1 = layers.Conv3D(20, (3, 3, 5), padding="same", activation="relu")(l1)
+        l1 = layers.Conv3D(10, (3, 3, 3), padding="same", activation="relu")(l1)
+        l2 = layers.Conv3D(40, (5, 5, 7), padding="same", activation="relu")(inp)
+        l2 = layers.Conv3D(20, (3, 3, 5), padding="same", activation="relu")(l2)
+        l2 = layers.Conv3D(10, (3, 3, 3), padding="same", activation="relu")(l2)
+        l3 = layers.Conv3D(60, (5, 5, 7), padding="same", activation="relu")(inp)
+        l3 = layers.Conv3D(30, (3, 3, 5), padding="same", activation="relu")(l3)
+        l3 = layers.Conv3D(10, (3, 3, 3), padding="same", activation="relu")(l3)
+        mid = layers.concatenate([l1, l2, l3], axis=3)
+        x = layers.Conv3D(128, (1, 1, 1), activation="relu")(mid)
+        x = layers.Flatten()(x)
+        x = layers.Dense(512, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(128, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(64, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        return Model([inp], layers.Dense(Nc, activation="softmax")(x), name="IN3D")
+
+    def HybIN(WS, k, Nc):
+        inp = Input(shape=(WS, WS, k, 1))
+
+        def branch(f1, f2):
+            b = layers.Conv3D(f1, (5, 5, 7), padding="same", activation="relu")(inp)
+            b = layers.Conv3D(f2, (3, 3, 5), padding="same", activation="relu")(b)
+            b = layers.Conv3D(10, (3, 3, 3), padding="same", activation="relu")(b)
+            s = b.shape
+            b = layers.Reshape((s[1], s[2], s[3] * s[4]))(b)
+            b = layers.MaxPooling2D((3, 3), strides=(1, 1), padding="same")(b)
+            b = layers.Conv2D(16, (1, 1), padding="same", activation="relu")(b)
+            b = layers.Conv2D(32, (1, 1), padding="same", activation="relu")(b)
+            b = layers.Conv2D(64, (1, 1), padding="same", activation="relu")(b)
+            return b
+
+        mid = layers.concatenate([branch(30, 20), branch(40, 20), branch(60, 30)], axis=3)
+        x = layers.Conv2D(128, (1, 1), padding="same", activation="relu")(mid)
+        x = layers.Flatten()(x)
+        x = layers.Dense(512, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(128, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(64, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        return Model([inp], layers.Dense(Nc, activation="softmax")(x), name="HybIN")
+
+    def HybCNN(WS, k, Nc):
+        inp = Input((WS, WS, k, 1))
+        x = layers.Conv3D(8, (3, 3, 7), padding="same", activation="relu")(inp)
+        x = layers.Conv3D(16, (3, 3, 5), padding="same", activation="relu")(x)
+        x = layers.Conv3D(32, (3, 3, 3), padding="same", activation="relu")(x)
+        s = x.shape
+        x = layers.Reshape((s[1], s[2], s[3] * s[4]))(x)
+        x = layers.Conv2D(64, (3, 3), padding="same", activation="relu")(x)
+        x = layers.Flatten()(x)
+        x = layers.Dense(256, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(128, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        return Model(inp, layers.Dense(Nc, activation="softmax")(x), name="HybCNN")
+
+    def CNN3D(WS, k, Nc):
+        inp = Input((WS, WS, k, 1))
+        x = layers.Conv3D(8, (3, 3, 7), padding="same", activation="relu")(inp)
+        x = layers.Conv3D(16, (3, 3, 5), padding="same", activation="relu")(x)
+        x = layers.Conv3D(32, (3, 3, 3), padding="same", activation="relu")(x)
+        x = layers.Conv3D(64, (3, 3, 3), padding="same", activation="relu")(x)
+        x = layers.Flatten()(x)
+        x = layers.Dense(256, activation="relu")(x)
+        x = layers.Dense(128, activation="relu")(x)
+        return Model(inp, layers.Dense(Nc, activation="softmax")(x), name="CNN3D")
+
+    # ------------------------------------------------------------------ Attention GCN (needs keras_cv_attention_models)
+    def AttentionGCN(WS, k, Nc):
+        from keras_cv_attention_models import attention_layers
+        if WS != 8:
+            raise ValueError("AttentionGCN is hard-coded for 8x8 patches; set the patch size to 8.")
+        inp = Input(shape=(WS, WS, k), name="input")
+        conv1 = layers.Conv2D(8, kernel_size=1, activation="relu", name="conv1",
+                              kernel_regularizer=regularizers.l2(0.0005))(inp)
+        nn = attention_layers.cot_attention(conv1, kernel_size=3)
+        g = layers.Reshape((8, WS * WS))(conv1)
+        g = layers.Conv1D(16, 1, activation="relu", name="squeezer", kernel_regularizer=regularizers.l2(0.0001))(g)
+        g = layers.Reshape((8, 16))(g)
+        g = layers.Conv1D(64, 1, activation="relu", name="gconv", kernel_regularizer=regularizers.l2(0.0001))(g)
+        g = layers.Reshape((8, 64))(g)
+        g = layers.Conv1D(64, 1, activation="relu", name="unsqueezer", kernel_regularizer=regularizers.l2(0.0001))(g)
+        g = layers.Reshape((64, 8))(g)
+        glore = layers.Reshape((8, WS, WS))(g)
+        block1 = layers.concatenate([conv1, glore], axis=-1)
+        block12 = layers.concatenate([conv1, block1, nn], axis=-1)
+        conv2 = layers.Conv2D(32, kernel_size=1, activation="relu", name="conv2",
+                              kernel_regularizer=regularizers.l2(0.0005))(block12)
+        g2 = layers.Reshape((32, WS * WS))(conv2)
+        g2 = layers.Conv1D(64, 1, activation="relu", name="squeezer2", kernel_regularizer=regularizers.l2(0.0001))(g2)
+        g2 = layers.Reshape((64, 32))(g2)
+        g2 = layers.Conv1D(32, 1, activation="relu", name="gconv2", kernel_regularizer=regularizers.l2(0.0001))(g2)
+        g2 = layers.Reshape((64, 32))(g2)
+        g2 = layers.Conv1D(8 * 8, 1, activation="relu", name="unsqueezer2",
+                           kernel_regularizer=regularizers.l2(0.0001))(g2)
+        g2 = layers.Reshape((8 * 8, 64))(g2)
+        glore2 = layers.Reshape((8, 8, 64))(g2)
+        block2 = layers.concatenate([conv2, glore2], axis=-1)
+        block21 = layers.concatenate([conv2, block2, nn], axis=-1)
+        conv3 = layers.Conv2D(32, kernel_size=1, activation="relu", name="conv3",
+                              kernel_regularizer=regularizers.l2(0.0005))(block21)
+        conv4 = layers.Conv2D(64, kernel_size=3, activation="relu", name="conv4",
+                              kernel_regularizer=regularizers.l2(0.0005))(conv3)
+        conv5 = layers.Conv2D(128, kernel_size=1, activation="relu", name="conv5",
+                              kernel_regularizer=regularizers.l2(0.0005))(conv4)
+        x = layers.Flatten()(conv5)
+        x = layers.Dense(100, activation="relu", name="fc1", kernel_regularizer=regularizers.l2(0.01))(x)
+        x = layers.Dense(20, activation="relu", name="fc2", kernel_regularizer=regularizers.l2(0.01))(x)
+        out = layers.Dense(Nc, activation="softmax", name="fc3", kernel_regularizer=regularizers.l2(0.0001))(x)
+        return Model(inputs=inp, outputs=out, name="AttentionGCN")
+
+    # ------------------------------------------------------------------ SCSNet
+    class SCS(layers.Layer):
+        def __init__(self, kernel_size, units=32, stride=1, depthwise_separable=False, padding="same", **kw):
+            super().__init__(**kw)
+            self.depthwise_separable = depthwise_separable
+            self.units = units
+            assert kernel_size in [1, 3, 5], "other size not supported"
+            self.kernel_size = kernel_size
+            self.stack = {1: (lambda x: x), 3: self.stack3x3, 5: self.stack5x5}[kernel_size]
+            self.stride = stride
+            self.padding_mode = padding
+            if padding == "same":
+                self.pad, self.pad_1, self.clip = self.kernel_size // 2, 1, 0
+            else:
+                self.pad, self.pad_1, self.clip = 0, 0, self.kernel_size // 2
+
+        def build(self, input_shape):
+            self.in_shape = input_shape
+            self.out_y = math.ceil((self.in_shape[1] - 2 * self.clip) / self.stride)
+            self.out_x = math.ceil((self.in_shape[2] - 2 * self.clip) / self.stride)
+            self.flat_size = self.out_x * self.out_y
+            self.channels = self.in_shape[3]
+            ks2 = self.kernel_size ** 2
+            shape_w = (1, ks2, self.units) if self.depthwise_separable else (1, self.channels * ks2, self.units)
+            self.w = self.add_weight(shape=shape_w, initializer="glorot_uniform", name="w", trainable=True)
+            self.b = self.add_weight(shape=(self.units,), initializer="zeros", trainable=True, name="b")
+            self.p = self.add_weight(shape=(self.units,), initializer=keras.initializers.Constant(value=2.0),
+                                     trainable=True, name="p")
+            super().build(input_shape)
+
+        @staticmethod
+        def l2_normal(x, axis=None, epsilon=1e-12):
+            square_sum = tf.reduce_sum(tf.square(x), axis, keepdims=True)
+            return tf.sqrt(tf.maximum(square_sum, epsilon))
+
+        @staticmethod
+        def sigplus(x):
+            return tf.nn.sigmoid(x) * tf.nn.softplus(x)
+
+        def stack3x3(self, image):
+            x = tf.shape(image)[2]
+            y = tf.shape(image)[1]
+            c, p, s = self.clip, self.pad, self.stride
+            P = lambda t, pads: tf.pad(t, tf.constant(pads))[:, ::s, ::s, :]
+            return tf.stack([
+                P(image[:, :y - 1 - c:, :x - 1 - c, :], [[0, 0], [p, 0], [p, 0], [0, 0]]),
+                P(image[:, :y - 1 - c, c:x - c, :], [[0, 0], [p, 0], [0, 0], [0, 0]]),
+                P(image[:, :y - 1 - c, 1 + c:, :], [[0, 0], [p, 0], [0, p], [0, 0]]),
+                P(image[:, c:y - c, :x - 1 - c, :], [[0, 0], [0, 0], [p, 0], [0, 0]]),
+                image[:, c:y - c:s, c:x - c:s, :],
+                P(image[:, c:y - c, 1 + c:, :], [[0, 0], [0, 0], [0, p], [0, 0]]),
+                P(image[:, 1 + c:, :x - 1 - c, :], [[0, 0], [0, p], [p, 0], [0, 0]]),
+                P(image[:, 1 + c:, c:x - c, :], [[0, 0], [0, p], [0, 0], [0, 0]]),
+                P(image[:, 1 + c:, 1 + c:, :], [[0, 0], [0, p], [0, p], [0, 0]]),
+            ], axis=3)
+
+        def stack5x5(self, image):
+            x = tf.shape(image)[2]
+            y = tf.shape(image)[1]
+            c, p, p1, s = self.clip, self.pad, self.pad_1, self.stride
+            P = lambda t, pads: tf.pad(t, tf.constant(pads))[:, ::s, ::s, :]
+            return tf.stack([
+                P(image[:, :y - 2 - c:, :x - 2 - c, :], [[0, 0], [p, 0], [p, 0], [0, 0]]),
+                P(image[:, :y - 2 - c:, 1:x - 1 - c, :], [[0, 0], [p, 0], [p1, p1], [0, 0]]),
+                P(image[:, :y - 2 - c:, c:x - c, :], [[0, 0], [p, 0], [0, 0], [0, 0]]),
+                P(image[:, :y - 2 - c:, 1 + c:-1, :], [[0, 0], [p, 0], [p1, p1], [0, 0]]),
+                P(image[:, :y - 2 - c:, 2 + c:, :], [[0, 0], [p, 0], [0, p], [0, 0]]),
+
+                P(image[:, 1:y - 1 - c:, :x - 2 - c, :], [[0, 0], [p1, p1], [p, 0], [0, 0]]),
+                P(image[:, 1:y - 1 - c:, 1:x - 1 - c, :], [[0, 0], [p1, p1], [p1, p1], [0, 0]]),
+                P(image[:, 1:y - 1 - c:, c:x - c, :], [[0, 0], [p1, p1], [0, 0], [0, 0]]),
+                P(image[:, 1:y - 1 - c:, 1 + c:-1, :], [[0, 0], [p1, p1], [p1, p1], [0, 0]]),
+                P(image[:, 1:y - 1 - c:, 2 + c:, :], [[0, 0], [p1, p1], [0, p], [0, 0]]),
+
+                P(image[:, c:y - c, :x - 2 - c, :], [[0, 0], [0, 0], [p, 0], [0, 0]]),
+                P(image[:, c:y - c, 1:x - 1 - c, :], [[0, 0], [0, 0], [p1, p1], [0, 0]]),
+                image[:, c:y - c, c:x - c, :][:, ::s, ::s, :],
+                P(image[:, c:y - c, 1 + c:-1, :], [[0, 0], [0, 0], [p1, p1], [0, 0]]),
+                P(image[:, c:y - c, 2 + c:, :], [[0, 0], [0, 0], [0, p], [0, 0]]),
+
+                P(image[:, 1 + c:-1, :x - 2 - c, :], [[0, 0], [p1, p1], [p, 0], [0, 0]]),
+                P(image[:, 1 + c:-1, 1:x - 1 - c, :], [[0, 0], [p1, p1], [p1, p1], [0, 0]]),
+                P(image[:, 1 + c:-1, c:x - c, :], [[0, 0], [p1, p1], [0, 0], [0, 0]]),
+                P(image[:, 1 + c:-1, 1 + c:-1, :], [[0, 0], [p1, p1], [p1, p1], [0, 0]]),
+                P(image[:, 1 + c:-1, 2 + c:, :], [[0, 0], [p1, p1], [0, p], [0, 0]]),
+
+                P(image[:, 2 + c:, :x - 2 - c, :], [[0, 0], [0, p], [p, 0], [0, 0]]),
+                P(image[:, 2 + c:, 1:x - 1 - c, :], [[0, 0], [0, p], [p1, p1], [0, 0]]),
+                P(image[:, 2 + c:, c:x - c, :], [[0, 0], [0, p], [0, 0], [0, 0]]),
+                P(image[:, 2 + c:, 1 + c:-1, :], [[0, 0], [0, p], [p1, p1], [0, 0]]),
+                P(image[:, 2 + c:, 2 + c:, :], [[0, 0], [0, p], [0, p], [0, 0]]),
+            ], axis=3)
+
+        def call_body(self, inputs):
+            channels = tf.shape(inputs)[-1]
+            x = self.stack(inputs)
+            x = tf.reshape(x, (-1, self.flat_size, channels * (self.kernel_size ** 2)))
+            x_norm = self.l2_normal(x, axis=2)
+            w_norm = self.l2_normal(self.w, axis=1)
+            x = tf.matmul(x / x_norm, self.w / w_norm)
+            sign = tf.sign(x)
+            x = tf.abs(x) + 1e-12
+            x = tf.pow(x + self.sigplus(self.b), self.sigplus(self.p))
+            x = sign * x
+            return tf.reshape(x, (-1, self.out_y, self.out_x, self.units))
+
+        def call(self, inputs, training=None):
+            if self.depthwise_separable:
+                x = tf.vectorized_map(self.call_body, tf.expand_dims(tf.transpose(inputs, (3, 0, 1, 2)), axis=-1))
+                x = tf.transpose(x, (1, 2, 3, 4, 0))
+                return tf.reshape(x, (-1, self.out_y, self.out_x, self.channels * self.units))
+            return self.call_body(inputs)
+
+        def compute_output_shape(self, input_shape):
+            oy = math.ceil((input_shape[1] - 2 * self.clip) / self.stride)
+            ox = math.ceil((input_shape[2] - 2 * self.clip) / self.stride)
+            ch = input_shape[3] * self.units if self.depthwise_separable else self.units
+            return (input_shape[0], oy, ox, ch)
+
+    class MaxAbsPool2D(layers.Layer):
+        def __init__(self, pool_size, pad_to_fit=False, **kw):
+            super().__init__(**kw)
+            self.pad = pad_to_fit
+            self.pool_size = pool_size
+
+        def compute_output_shape(self, s):
+            if self.pad:
+                return (s[0], int(math.ceil(s[1] / self.pool_size)), int(math.ceil(s[2] / self.pool_size)), s[3])
+            return (s[0], s[1] // self.pool_size, s[2] // self.pool_size, s[3])
+
+        def build(self, input_shape):
+            self.in_shape = input_shape
+            self.out_shape_ = self.compute_output_shape(self.in_shape)
+            mod_y = input_shape[1] % self.pool_size
+            y1 = mod_y // 2
+            mod_x = input_shape[2] % self.pool_size
+            x1 = mod_x // 2
+            self.padding_ = ((0, 0), (y1, mod_y - y1), (x1, mod_x - x1), (0, 0))
+            super().build(input_shape)
+
+        def stack(self, inputs):
+            if self.pad:
+                inputs = tf.pad(inputs, self.padding_)
+            max_h = (tf.shape(inputs)[1] // self.pool_size) * self.pool_size
+            max_w = (tf.shape(inputs)[2] // self.pool_size) * self.pool_size
+            return tf.stack([inputs[:, i:max_h:self.pool_size, j:max_w:self.pool_size, :]
+                             for i in range(self.pool_size) for j in range(self.pool_size)], axis=-1)
+
+        def call(self, inputs, training=None):
+            stacked = self.stack(inputs)
+            inds = tf.argmax(tf.abs(stacked), axis=-1, output_type=tf.int32)
+            ks = tf.shape(stacked)
+            idx = tf.stack([*tf.meshgrid(tf.range(0, ks[0]), tf.range(0, ks[1]), tf.range(0, ks[2]),
+                                         tf.range(0, ks[3]), indexing="ij"), inds], axis=-1)
+            x = tf.gather_nd(stacked, idx)
+            return tf.reshape(x, (-1, *self.out_shape_[1:]))
+
+    def SCSNet(WS, k, Nc):
+        return keras.Sequential([
+            Input(shape=(WS, WS, k)),
+            SCS(5, 50, 1, depthwise_separable=True, padding="same"),
+            SCS(5, 60, 1, padding="same"),
+            SCS(5, 70, 1, padding="same"),
+            layers.MaxPool2D((2, 2)),
+            SCS(3, 30, 1, padding="same"),
+            SCS(3, 20, 1, padding="same"),
+            layers.MaxPool2D((2, 2)),
+            SCS(1, 30, 1, padding="same"),
+            SCS(1, 20, 1, padding="same"),
+            MaxAbsPool2D(2, True),
+            layers.Flatten(),
+            layers.Dense(Nc, activation="softmax"),
+        ], name="SCSNet")
+
+    # ------------------------------------------------------------------ Transformers
+    def get_positional_encoding(max_len, d_emb):
+        pos = np.arange(max_len)[:, np.newaxis]
+        i = np.arange(d_emb)[np.newaxis, :]
+        angles = pos / np.power(10000, 2 * i / d_emb)
+        pe = np.zeros((max_len, d_emb))
+        pe[:, ::2] = np.sin(angles[:, ::2])
+        pe[:, 1::2] = np.cos(angles[:, 1::2])
+        return pe[np.newaxis, ...].astype("float32")
+
+    class TransformerBlock(layers.Layer):
+        def __init__(self, num_heads, d_model, dff, dropout_rate=0.1, layernorm_eps=1e-6, **kw):
+            super().__init__(**kw)
+            self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
+            self.dropout1 = layers.Dropout(dropout_rate)
+            self.layernorm1 = layers.LayerNormalization(epsilon=layernorm_eps)
+            self.dense1 = layers.Dense(dff, activation="relu")
+            self.dense2 = layers.Dense(d_model)
+            self.dropout2 = layers.Dropout(dropout_rate)
+            self.layernorm2 = layers.LayerNormalization(epsilon=layernorm_eps)
+
+        def call(self, x, training=None):
+            a = self.dropout1(self.mha(x, x), training=training)
+            a = self.layernorm1(x + a)
+            f = self.dropout2(self.dense2(self.dense1(a)), training=training)
+            return self.layernorm2(a + f)
+
+    class HybridFormerModel(keras.Model):
+        """Hybrid ViT: CLS token + transformer blocks + cross-attention between CLS and the patch tokens.
+        The notebook's cross-attention mixed the CLS query of batch item 0 into every sample (a broadcasting
+        side effect of tf.matmul); here each sample uses its own query."""
+
+        def __init__(self, WS, k, Nc, num_transformer_layers=4, num_heads=8, dff=4 * 64, **kw):
+            super().__init__(**kw)
+            self.ps = min(WS, WS, k)
+            self.emb = 64
+            self.patch_embed = layers.Conv3D(self.emb, kernel_size=(1, self.ps, self.ps),
+                                             strides=(1, self.ps, self.ps), padding="valid", name="patch_embed")
+            num_patches = (WS // self.ps) * (WS // self.ps) * (k // self.ps)
+            self.pos = tf.constant(get_positional_encoding(num_patches + 1, self.emb))
+            self.blocks = [TransformerBlock(num_heads, self.emb, dff, 0.1, 1e-3, name=f"transformer_layer_{i}")
+                           for i in range(num_transformer_layers)]
+            self.q_dense = layers.Dense(self.emb)
+            self.k_dense = layers.Dense(self.emb)
+            self.f1 = layers.Dense(dff, activation="relu")
+            self.f2 = layers.Dense(dff, activation="relu")
+            self.out = layers.Dense(Nc, activation="softmax", name="output_layer")
+
+        def call(self, inputs, training=None):
+            x = tf.expand_dims(inputs, axis=1)                       # (B, 1, WS, WS, k)
+            pe = self.patch_embed(x)                                 # (B, 1, h, w, emb)
+            cls = tf.zeros_like(pe[:, :1, :, :, :])                  # zero CLS token (non-trainable, as in the notebook)
+            pe = tf.concat([cls, pe], axis=1) + self.pos
+            h = pe
+            for blk in self.blocks:
+                h = blk(h, training=training)
+            cls_out = h[:, 0, 0, 0]                                  # (B, emb)
+            q = self.q_dense(cls_out)                                # (B, emb)
+            kk = self.k_dense(pe[:, 1:, :, :, :])                    # (B, 1, h, w, emb)
+            v = pe[:, 1:, :, :, :]
+            B = tf.shape(kk)[0]
+            kk = tf.reshape(kk, [B, -1, self.emb])
+            v = tf.reshape(v, [B, -1, self.emb])
+            att = tf.matmul(q[:, tf.newaxis, :], kk, transpose_b=True) / tf.math.sqrt(tf.cast(self.emb, tf.float32))
+            att = tf.nn.softmax(att, axis=-1)
+            cross = tf.matmul(att, v)[:, 0, :]                       # (B, emb)
+            z = tf.concat([cls_out, cross], axis=-1)
+            return self.out(self.f2(self.f1(z)))
+
+    def HybridFormer(WS, k, Nc):
+        ps = min(WS, k)
+        if WS >= 2 * ps:
+            raise ValueError(f"HybridFormer needs patch size < 2 x min(patch size, components) "
+                             f"(here {WS} >= {2 * ps}). Use more components or a smaller patch.")
+        m = HybridFormerModel(WS, k, Nc, name="HybridFormer")
+        m(np.zeros((2, WS, WS, k), dtype="float32"))
+        return m
+
+    def pyramid_3d_cnn(WS, k, levels):
+        input_shape = (WS, WS, k, 1)
+        patch_size = min(input_shape[:3])
+        inputs = layers.Input(shape=input_shape)
+        x = inputs
+        outs = []
+        for _ in range(levels):
+            x = layers.Conv3D(32, kernel_size=(1, patch_size, patch_size), activation="relu", padding="same")(x)
+            x = layers.Conv3D(64, kernel_size=(1, patch_size, patch_size), activation="relu", padding="same")(x)
+            outs.append(x)
+        return Model(inputs=inputs, outputs=layers.concatenate(outs, axis=-1))
+
+    def PyFormerModel(WS, k, Nc):
+        num_layers, num_heads, mlp_dim = 2, 4, 64
+        inputs = layers.Input(shape=(WS, WS, k, 1))
+        x = pyramid_3d_cnn(WS, k, 2)(inputs)
+        x = layers.Activation("relu")(x)
+        for _ in range(num_layers):
+            x = layers.LayerNormalization()(x)
+            x = layers.MultiHeadAttention(num_heads=num_heads, key_dim=k)(x, x)
+            x = layers.Add()([x, inputs])
+            y = layers.Conv3D(filters=k, kernel_size=(1, WS, WS), activation="relu", padding="same")(x)
+            y = layers.Conv3D(filters=2 * mlp_dim, kernel_size=(1, WS, WS), activation="relu", padding="same")(y)
+            x = layers.Add()([x, y])
+        x = layers.Flatten()(x)
+        x = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(0.01))(x)
+        return Model(inputs=inputs, outputs=layers.Dense(Nc, activation="softmax")(x), name="PyFormer")
+
+    # ------------------------------------------------------------------ Mamba-style models
+    class MHA(layers.Layer):
+        def __init__(self, embed_dim, num_heads, dropout=0.1, **kw):
+            super().__init__(**kw)
+            self.num_heads = num_heads
+            self.head_dim = embed_dim // num_heads
+            self.all_head_size = num_heads * self.head_dim
+            self.query = layers.Dense(self.all_head_size)
+            self.key = layers.Dense(self.all_head_size)
+            self.value = layers.Dense(self.all_head_size)
+            self.drop = layers.Dropout(dropout)
+
+        def call(self, query, key, value, training=None):
+            B = tf.shape(query)[0]
+            nq = int(np.prod(query.shape[1:-1]))            # static token counts (the recurrence needs them)
+            nk = int(np.prod(key.shape[1:-1]))
+
+            def split(t, n):
+                return tf.transpose(tf.reshape(t, [B, n, self.num_heads, self.head_dim]), [0, 2, 1, 3])
+
+            q, kk, v = split(self.query(query), nq), split(self.key(key), nk), split(self.value(value), nk)
+            sc = tf.matmul(q, kk, transpose_b=True) / tf.sqrt(tf.cast(self.head_dim, tf.float32))
+            out = tf.matmul(tf.nn.softmax(sc, axis=-1), v)
+            out = tf.reshape(tf.transpose(out, [0, 2, 1, 3]), [B, nq, self.all_head_size])
+            return self.drop(out, training=training)
+
+    class TokenGeneration(layers.Layer):
+        """Spatial / spectral token projections exactly as in the notebook (including its transpose/reshape)."""
+
+        def __init__(self, out_channels, **kw):
+            super().__init__(**kw)
+            self.spatial_tokens = layers.Dense(out_channels)
+            self.spectral_tokens = layers.Dense(out_channels)
+
+        def call(self, x):
+            B, H, W, C = x.shape
+            n = tf.shape(x)[0]
+            sp = self.spatial_tokens(tf.reshape(tf.transpose(x, [0, 2, 3, 1]), [n, H * W, C]))
+            se = self.spectral_tokens(tf.reshape(x, [n, H * W, C]))
+            return sp, se
+
+    class FeatureEnhancement(layers.Layer):
+        def __init__(self, out_channels, **kw):
+            super().__init__(**kw)
+            self.spatial_gate = keras.Sequential([layers.Dense(out_channels), layers.Activation("sigmoid"),
+                                                  layers.Reshape((1, out_channels))])
+            self.spectral_gate = keras.Sequential([layers.Dense(out_channels), layers.Activation("sigmoid"),
+                                                   layers.Reshape((1, out_channels))])
+
+        def call(self, sp, se, center):
+            return sp * self.spatial_gate(center), se * self.spectral_gate(center)
+
+    class StateSpace(layers.Layer):
+        """Linear recurrence over the token axis: s_t = A s_{t-1} + B x_t."""
+
+        def __init__(self, state_dim, **kw):
+            super().__init__(**kw)
+            self.state_dim = state_dim
+            self.state_transition = layers.Dense(state_dim)
+            self.state_update = layers.Dense(state_dim)
+
+        def call(self, x):
+            state = tf.zeros([tf.shape(x)[0], self.state_dim])
+            n = x.shape[1] if x.shape[1] is not None else None
+            if n is None:
+                raise ValueError("The token axis must have a static length.")
+            for t in range(n):
+                state = self.state_transition(state) + self.state_update(x[:, t, :])
+            return state
+
+    class SSMambaModel(keras.Model):
+        def __init__(self, out_channels, state_dim, Nc, **kw):
+            super().__init__(**kw)
+            self.token_generation = TokenGeneration(out_channels)
+            self.feature_enhancement = FeatureEnhancement(out_channels)
+            self.state_space_model = StateSpace(state_dim)
+            self.classifier = layers.Dense(Nc, activation="softmax")
+
+        def call(self, x, training=None):
+            sp, se = self.token_generation(x)
+            center = sp[:, x.shape[1] // 2, :]
+            sp_e, se_e = self.feature_enhancement(sp, se, center)
+            return self.classifier(self.state_space_model(tf.concat([sp_e, se_e], axis=-1)))
+
+    class MHSAMambaModel(keras.Model):
+        def __init__(self, out_channels, num_heads, state_dim, Nc, dropout=0.1, **kw):
+            super().__init__(**kw)
+            self.token_generation = TokenGeneration(out_channels)
+            self.multi_head_attention = MHA(out_channels, num_heads, dropout)
+            self.feature_enhancement = FeatureEnhancement(out_channels)
+            self.state_space_model = StateSpace(state_dim)
+            self.classifier = layers.Dense(Nc, activation="softmax")
+
+        def call(self, x, training=None):
+            sp, se = self.token_generation(x)
+            center = sp[:, x.shape[1] // 2, :]
+            sp_e, se_e = self.feature_enhancement(sp, se, center)
+            att = self.multi_head_attention(sp_e, se_e, se_e, training=training)
+            return self.classifier(self.state_space_model(att))
+
+    def haar_dwt2(t):
+        """Single-level 2-D Haar (db1) wavelet transform of (B, H, W) -> (B, ceil(H/2), ceil(W/2), 4):
+        approximation, horizontal, vertical and diagonal detail (same sub-band order as pywt.dwt2)."""
+        H, W = t.shape[1], t.shape[2]
+        if H % 2:
+            t = tf.concat([t, t[:, -1:, :]], axis=1)
+        if W % 2:
+            t = tf.concat([t, t[:, :, -1:]], axis=2)
+        a, b = t[:, 0::2, 0::2], t[:, 0::2, 1::2]
+        c, d = t[:, 1::2, 0::2], t[:, 1::2, 1::2]
+        cA = (a + b + c + d) / 2.0
+        cH = (a + b - c - d) / 2.0
+        cV = (a - b + c - d) / 2.0
+        cD = (a - b - c + d) / 2.0
+        return tf.stack([cA, cH, cV, cD], axis=-1)
+
+    class WaveMambaModel(keras.Model):
+        """Spectral-spatial tokens -> gated enhancement -> Haar wavelet sub-bands -> state-space model.
+        (The notebook's wavelet version cannot run - it returns one prediction per token - so the sub-band
+        and channel axes are merged into the feature axis before the recurrence.)"""
+
+        def __init__(self, out_channels, state_dim, Nc, **kw):
+            super().__init__(**kw)
+            self.token_generation = TokenGeneration(out_channels)
+            self.feature_enhancement = FeatureEnhancement(out_channels)
+            self.state_space_model = StateSpace(state_dim)
+            self.classifier = layers.Dense(Nc, activation="softmax")
+
+        def call(self, x, training=None):
+            sp, se = self.token_generation(x)
+            center = sp[:, x.shape[1] // 2, :]
+            sp, se = self.feature_enhancement(sp, se, center)
+            sp, se = haar_dwt2(sp), haar_dwt2(se)                   # (B, HW/2, C/2, 4)
+            tok = tf.concat([sp, se], axis=-1)                       # (B, HW/2, C/2, 8)
+            s = tok.shape
+            tok = tf.reshape(tok, [tf.shape(tok)[0], s[1], s[2] * s[3]])
+            return self.classifier(self.state_space_model(tok))
+
+    class ErosionLayer(layers.Layer):
+        def __init__(self, kernel_size, **kw):
+            super().__init__(**kw)
+            self.kernel_size = kernel_size
+
+        def build(self, input_shape):
+            self.depthwise_conv = []
+            for _ in range(int(input_shape[-1])):
+                conv = layers.DepthwiseConv2D(self.kernel_size, padding="same", use_bias=False)
+                conv.build((None, None, None, 1))
+                conv.set_weights([np.ones((self.kernel_size, self.kernel_size, 1, 1), dtype="float32")])
+                self.depthwise_conv.append(conv)
+            super().build(input_shape)
+
+        def call(self, x):
+            return tf.concat([-self.depthwise_conv[i](x[..., i:i + 1]) for i in range(x.shape[-1])], axis=-1)
+
+    class DilationLayer(ErosionLayer):
+        def call(self, x):
+            return tf.concat([self.depthwise_conv[i](x[..., i:i + 1]) for i in range(x.shape[-1])], axis=-1)
+
+    class MorpTokenGeneration(layers.Layer):
+        def __init__(self, out_channels, kernel_size=5, **kw):
+            super().__init__(**kw)
+            self.erosion_spatial = ErosionLayer(kernel_size)
+            self.dilation_spatial = DilationLayer(kernel_size)
+            self.erosion_spectral = ErosionLayer(kernel_size)
+            self.dilation_spectral = DilationLayer(kernel_size)
+            self.conv = layers.Conv2D(out_channels, kernel_size=1)
+
+        def call(self, x):
+            es, ds = self.erosion_spatial(x), self.dilation_spatial(x)
+            xt = tf.transpose(x, [0, 3, 1, 2])
+            ee = tf.transpose(self.erosion_spectral(xt), [0, 2, 3, 1])
+            de = tf.transpose(self.dilation_spectral(xt), [0, 2, 3, 1])
+            return self.conv(tf.concat([es, ds], axis=-1)), self.conv(tf.concat([ee, de], axis=-1))
+
+    class MorpEnhancement(layers.Layer):
+        def __init__(self, out_channels, **kw):
+            super().__init__(**kw)
+            self.spatial_gate = keras.Sequential([layers.Dense(out_channels), layers.Activation("sigmoid")])
+            self.spectral_gate = keras.Sequential([layers.Dense(out_channels), layers.Activation("sigmoid")])
+
+        def call(self, sp, se, center):
+            g1 = self.spatial_gate(center)
+            sp_e = sp * g1[:, :, tf.newaxis]
+            g2 = tf.expand_dims(self.spectral_gate(center), axis=-2)
+            return sp_e, se * g2
+
+    class MorpMambaModel(keras.Model):
+        def __init__(self, out_channels, num_heads, state_dim, Nc, dropout=0.1, **kw):
+            super().__init__(**kw)
+            self.token_generation = MorpTokenGeneration(out_channels)
+            self.multi_head_attention = MHA(out_channels, num_heads, dropout)
+            self.feature_enhancement = MorpEnhancement(out_channels)
+            self.state_space_model = StateSpace(state_dim)
+            self.dense = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(0.01))
+            self.classifier = layers.Dense(Nc, activation="softmax")
+
+        def call(self, x, training=None):
+            sp, se = self.token_generation(x)                        # (B, H, W, C) each
+            center = sp[:, x.shape[1] // 2, :]                       # (B, W, C)
+            sp_e, se_e = self.feature_enhancement(sp, se, center)
+            att = self.multi_head_attention(sp_e, se_e, se_e, training=training)
+            return self.classifier(self.dense(self.state_space_model(att)))
+
+    def _built(model, WS, k):
+        model(np.zeros((2, WS, WS, k), dtype="float32"))
+        return model
+
+    def SSMamba(WS, k, Nc):
+        return _built(SSMambaModel(64, 128, Nc, name="SSMamba"), WS, k)
+
+    def MHSAMamba(WS, k, Nc):
+        return _built(MHSAMambaModel(64, 4, 128, Nc, name="MHSAMamba"), WS, k)
+
+    def WaveMamba(WS, k, Nc):
+        return _built(WaveMambaModel(64, 128, Nc, name="WaveMamba"), WS, k)
+
+    def MorpMamba(WS, k, Nc):
+        return _built(MorpMambaModel(64, 4, 128, Nc, name="MorpMamba"), WS, k)
+
+    R = {}
+
+    def add(name, fn, inp, desc, needs=(), fixed_ws=None, note="", experimental=False):
+        R[name] = dict(build=fn, input=inp, desc=desc, needs=tuple(needs), fixed_ws=fixed_ws, note=note,
+                       experimental=experimental)
+
+    add("HybridFormer", HybridFormer, "2d", "Hybrid ViT: patch embedding, CLS token, 4 transformer blocks, cross-attention")
+    add("SSMamba", SSMamba, "2d", "Spectral-spatial Mamba-style state-space model")
+    add("MHSAMamba", MHSAMamba, "2d", "Mamba-style model with multi-head self-attention")
+    add("WaveMamba", WaveMamba, "2d", "Mamba-style model on Haar wavelet sub-bands (repaired, see note)",
+        note="The notebook's wavelet network cannot run as written; this is a minimal repair.")
+    add("MorpMamba", MorpMamba, "2d", "Mamba-style model with morphological erosion/dilation tokens")
+    add("Xtreme_Exception", Xtreme_Exception, "3d", "(2+1)D Xception, very large")
+    add("Exception2D", Exception2D, "2d", "2-D Xception")
+    add("CNN2D", CNN2D, "2d", "4-layer 2-D CNN")
+    add("IN2D", IN2D, "2d", "2-D Inception network")
+    add("IN3D", IN3D, "3d", "3-D Inception network")
+    add("HybIN", HybIN, "3d", "Hybrid 3-D/2-D Inception network")
+    add("CNN3D", CNN3D, "3d", "Fast and compact 3-D CNN")
+    add("HybCNN", HybCNN, "3d", "Hybrid 3-D/2-D CNN")
+    add("AttentionGCN", AttentionGCN, "2d", "Attention + graph (GloRe-style) CNN", needs=("keras_cv_attention_models",),
+        fixed_ws=8, note="Needs keras_cv_attention_models and tf-keras (Keras 2); patch size must be 8.")
+    add("SCSNet", SCSNet, "2d", "SCS network (stacked cosine-similarity convolutions)")
+    add("PyFormer", PyFormerModel, "3d", "Pyramid 3-D CNN + transformer (disabled in the notebook; very memory hungry)",
+        experimental=True)
+    _SEG_REGISTRY = R
+    return R
+
+
+# ======================================================================
+# Segmentation / deep-learning classification: ground truth, samples, split, features, training
+# (workflow of the Survey_2024 notebook, generalised to any dataset and to ROIs)
+# ======================================================================
+SEG_SPLIT_MODES = [
+    ("pixels", "Per-class random pixels (as in the notebook)"),
+    ("regions", "Hold out whole regions (ROIs / connected areas)"),
+    ("blocks", "Hold out spatial blocks (disjoint image areas)"),
+    ("roi_train", "ROIs = training pixels, rest of ground truth = test"),
+]
+SEG_FEATURE_MODES = [
+    ("pca", "PCA, whitened (as in the notebook)"),
+    ("mnf", "MNF components"),
+    ("drtab", "PCA from the Dimensionality Reduction tab"),
+    ("full", "Full spectrum (standardised)"),
+]
+_GT_ARRAY_EXTS = {".mat", ".npy", ".npz", ".h5", ".hdf5", ".he5"}
+_GT_IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".gif"}
+_GT_TEXT_EXTS = {".csv", ".txt", ".tsv", ".dat_txt"}
+
+
+def _gt_candidates_from_dict(items):
+    """[(name, 2-D numeric ndarray)] from a {name: array} mapping."""
+    out = []
+    for k, v in items.items():
+        try:
+            a = np.asarray(v)
+        except Exception:
+            continue
+        a = np.squeeze(a)
+        if a.ndim == 2 and a.dtype.kind in "biuf" and min(a.shape) > 1:
+            out.append((str(k), a))
+    return out
+
+
+def _gt_pick(cands, choose, path):
+    if not cands:
+        raise HSILoadError(f"No 2-D numeric array (label map) was found in '{Path(path).name}'.")
+    pref = re.compile(r"gt|label|class|truth|map|mask|annot|seg", re.I)
+    cands = sorted(cands, key=lambda c: (bool(pref.search(c[0])), c[1].size), reverse=True)
+    if len(cands) == 1 or choose is None:
+        return cands[0]
+    labels = [f"{n}    [{' x '.join(map(str, a.shape))}, {a.dtype}]" for n, a in cands]
+    i = choose("Choose the ground-truth map", "This file holds several 2-D arrays. Which one is the label map?",
+               labels, 0)
+    if i is None:
+        raise HSILoadCancelled()
+    return cands[i]
+
+
+def _gt_colour_image_to_ids(rgb):
+    """Colour-coded label image -> integer ids (black = 0, other colours numbered by increasing value)."""
+    flat = rgb.reshape(-1, rgb.shape[-1])[:, :3].astype(np.int64)
+    code = (flat[:, 0] << 16) | (flat[:, 1] << 8) | flat[:, 2]
+    uniq, inv = np.unique(code, return_inverse=True)
+    if len(uniq) > 300:
+        raise HSILoadError("This looks like a photograph, not a colour-coded label map "
+                           f"({len(uniq)} different colours).")
+    ids = np.arange(len(uniq))
+    if uniq[0] == 0:                       # black stays background
+        pass
     else:
-        widths, dense = [64, 128, 256, 512], 512
+        ids = ids + 1
+    return ids[inv].reshape(rgb.shape[:2])
 
-    stack = [layers.Input(shape=input_shape)]
-    for bi, w in enumerate(widths):
-        stack.append(layers.Conv2D(w, (3, 3), activation="relu", padding="same"))
-        stack.append(layers.Conv2D(w, (3, 3), activation="relu", padding="same"))
-        if bi < len(widths) - 1:
-            stack.append(layers.MaxPooling2D((2, 2)))
-            stack.append(layers.Dropout(0.3))
+
+def _envi_class_names(path):
+    """Class names written into an ENVI classification header, if any."""
+    try:
+        hdr = find_envi_header(Path(path))
+        if hdr is None:
+            return None
+        txt = Path(hdr).read_text(errors="replace")
+        m = re.search(r"class names\s*=\s*\{(.*?)\}", txt, re.I | re.S)
+        if not m:
+            return None
+        return [s.strip() for s in m.group(1).replace("\n", " ").split(",") if s.strip()]
+    except Exception:
+        return None
+
+
+def read_label_map(path, choose=None):
+    """Read a ground-truth / label map from almost any raster or array file.
+
+    Returns dict(labels=int64 (rows, cols), names=list or None, note=str). `choose` is the optional
+    callback used when a file contains several 2-D arrays (same signature as for load_hyperspectral).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise HSILoadError(f"File not found:\n{p}")
+    ext = p.suffix.lower()
+    names = None
+    note = ""
+    arr = None
+    if ext == ".mat":
+        sio = _try_import("scipy.io")
+        d = None
+        if sio is not None:
+            try:
+                d = sio.loadmat(str(p))
+            except NotImplementedError:
+                d = None
+            except Exception as e:
+                raise HSILoadError(f"Failed to read MATLAB file:\n{e}")
+        if d is not None:
+            cands = _gt_candidates_from_dict({k: v for k, v in d.items() if not k.startswith("__")})
         else:
-            stack.append(layers.GlobalAveragePooling2D())
-    stack.append(layers.Dense(dense, activation="relu"))
-    stack.append(layers.Dropout(0.5))
-    stack.append(layers.Dense(n_classes, activation="softmax"))
+            h5py = _try_import("h5py")
+            if h5py is None:
+                raise HSILoadError("MATLAB v7.3 files need h5py:\n  pip install h5py")
+            items = {}
+            with h5py.File(str(p), "r") as f:
+                f.visititems(lambda n, o: items.__setitem__(n, np.transpose(o[()])) if isinstance(o, h5py.Dataset) else None)
+            cands = _gt_candidates_from_dict(items)
+        name, arr = _gt_pick(cands, choose, p)
+        note = f"variable '{name}'"
+    elif ext in (".npy", ".npz"):
+        obj = np.load(str(p), allow_pickle=False)
+        items = {p.stem: obj} if isinstance(obj, np.ndarray) else {k: obj[k] for k in obj.files}
+        name, arr = _gt_pick(_gt_candidates_from_dict(items), choose, p)
+        note = f"array '{name}'"
+    elif ext in (".h5", ".hdf5", ".he5"):
+        h5py = _try_import("h5py")
+        if h5py is None:
+            raise HSILoadError("Reading HDF5 files needs h5py:\n  pip install h5py")
+        items = {}
+        with h5py.File(str(p), "r") as f:
+            f.visititems(lambda n, o: items.__setitem__(n, o[()]) if isinstance(o, h5py.Dataset) else None)
+        name, arr = _gt_pick(_gt_candidates_from_dict(items), choose, p)
+        note = f"dataset '{name}'"
+    elif ext in _GT_TEXT_EXTS or ext == ".csv":
+        txt = p.read_text(errors="replace")
+        delim = "," if txt.count(",") > txt.count("\t") else None
+        arr = np.loadtxt(str(p), delimiter=delim)
+    elif ext in _GT_IMAGE_EXTS:
+        arr = None
+        if ext in (".tif", ".tiff"):
+            tf_ = _try_import("tifffile")
+            if tf_ is not None:
+                try:
+                    arr = tf_.imread(str(p))
+                except Exception:
+                    arr = None
+            if arr is None:
+                rio = _try_import("rasterio")
+                if rio is not None:
+                    with rio.open(str(p)) as ds:
+                        arr = ds.read()
+                        arr = arr[0] if arr.shape[0] == 1 else np.moveaxis(arr, 0, -1)
+        if arr is None:
+            pil = _try_import("PIL.Image")
+            if pil is None:
+                raise HSILoadError("Reading image files needs Pillow:\n  pip install pillow")
+            im = pil.open(str(p))
+            if im.mode == "P":
+                arr = np.array(im)                       # palette indices are the class ids
+            else:
+                arr = np.array(im)
+        arr = np.squeeze(arr)
+        if arr.ndim == 3:
+            if arr.shape[2] in (3, 4) and arr.dtype == np.uint8:
+                arr = _gt_colour_image_to_ids(arr)
+                note = "colour-coded image, each colour is one class"
+            elif arr.shape[0] <= 4 and arr.shape[1] > 4:
+                arr = arr[0]
+            else:
+                raise HSILoadError(f"The image has shape {arr.shape}; a label map must be a single band.")
+    else:
+        # ENVI classification files and any other raster the hyperspectral loader understands
+        try:
+            res = load_hyperspectral(str(p), choose=None, ask_axis=lambda shape, ax: ax)
+        except HSILoadError:
+            raise
+        cube = np.asarray(res["cube"])
+        if cube.ndim == 3 and cube.shape[2] == 1:
+            arr = cube[:, :, 0]
+        elif cube.ndim == 3 and cube.shape[2] > 1:
+            raise HSILoadError(f"'{p.name}' has {cube.shape[2]} bands; a label map must have a single band.")
+        else:
+            arr = np.squeeze(cube)
+        names = _envi_class_names(p)
+        note = res.get("format", "")
+    arr = np.asarray(arr)
+    if arr.ndim != 2:
+        raise HSILoadError(f"The label map must be 2-D (rows x columns); found shape {arr.shape}.")
+    if arr.dtype.kind == "f":
+        fin = arr[np.isfinite(arr)]
+        if fin.size and not np.allclose(fin, np.round(fin)):
+            raise HSILoadError("The array contains non-integer values, so it is not a class-label map.")
+        arr = np.where(np.isfinite(arr), np.round(arr), 0)
+    lab = arr.astype(np.int64)
+    n_unique = len(np.unique(lab))
+    if n_unique > 1000:
+        raise HSILoadError(f"The array has {n_unique} different values; this does not look like a label map.")
+    return {"labels": lab, "names": names, "note": note}
 
-    model = models.Sequential(stack)
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"])
-    return model
+
+def conform_label_map(lab, rows, cols):
+    """Make the label map match the cube (rows, cols). Transposed maps are fixed automatically."""
+    lab = np.asarray(lab)
+    if lab.shape == (rows, cols):
+        return lab, ""
+    if lab.shape == (cols, rows):
+        return lab.T.copy(), "The label map was transposed to match the image."
+    raise ValueError(f"The label map is {lab.shape[0]} x {lab.shape[1]} (rows x columns) but the image is "
+                     f"{rows} x {cols}. Both must cover the same area with the same pixel grid.")
 
 
-def run_cnn(cube, rois, class_names, n_pca, patch_size, epochs, batch_size, net_size,
-            test_frac, split_mode, max_per_class, predict_scope,
-            progress=None, cancel=None):
-    """Whitened-PCA -> patches -> 2D CNN trained on labelled ROI pixels."""
+def read_class_names_file(path, ids):
+    """{class id: name} from a text/CSV file. Accepts 'id,name' / 'id name' lines or one name per line."""
+    lines = [ln.strip() for ln in Path(path).read_text(errors="replace").splitlines() if ln.strip()]
+    ids = sorted(int(i) for i in ids)
+    out = {}
+    pairs = []
+    for ln in lines:
+        m = re.match(r"^\s*(-?\d+)\s*[,;:\t =]\s*(.+?)\s*$", ln)
+        if m:
+            pairs.append((int(m.group(1)), m.group(2).strip().strip('"')))
+    if pairs and len(pairs) >= len(lines) - 1:               # allow one header line
+        return dict(pairs)
+    names = [ln.split(",")[0].strip().strip('"') for ln in lines]
+    for i, n in zip(ids, names):
+        out[i] = n
+    return out
+
+
+def connected_groups(mask_img, class_img_ids=None):
+    """Label connected components (8-neighbourhood) of a boolean image; returns int image, 0 = outside."""
+    from scipy import ndimage
+    lab, _ = ndimage.label(mask_img, structure=np.ones((3, 3), dtype=int))
+    return lab
+
+
+def build_seg_samples(rows, cols, valid_px, source, gt, rois, roi_class_names):
+    """Collect the labelled pixels used for training / validation / testing.
+
+    source: 'rois' | 'gt' | 'both'.  gt: dict(labels, names{id: str}, include{id: bool}, background).
+    In 'both' mode the label map supplies the classes and ROIs add / override labels by class name.
+    Returns dict(idx, y, group, in_roi, names, n_conflict, truth_img) where idx are flat pixel indices,
+    y class numbers 0..K-1, group a region id (ROI index or connected component), in_roi flags samples
+    that lie inside an ROI and truth_img is a (rows, cols) image of y+1 (0 = unlabelled).
+    """
+    names = []
+    cls = -np.ones((rows, cols), dtype=np.int32)
+    grp = np.zeros((rows, cols), dtype=np.int64)
+    in_roi = np.zeros((rows, cols), dtype=bool)
+    gid = 1
+    if source in ("gt", "both"):
+        if gt is None:
+            raise RuntimeError("Load a ground-truth file first.")
+        lab = gt["labels"]
+        bg = int(gt.get("background", 0))
+        for cid in sorted(int(c) for c in np.unique(lab)):
+            if cid == bg or not gt["include"].get(cid, True):
+                continue
+            m = lab == cid
+            nm = gt["names"].get(cid, f"Class {cid}")
+            if nm in names:
+                ci = names.index(nm)
+            else:
+                names.append(nm)
+                ci = len(names) - 1
+            cls[m] = ci
+            cc = connected_groups(m)
+            grp[m] = cc[m] + gid
+            gid += int(cc.max()) + 1
+    n_conflict = 0
+    if source in ("rois", "both"):
+        if not rois:
+            raise RuntimeError("ROIs for at least two classes are needed: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+        seen_cls = -np.ones((rows, cols), dtype=np.int32)
+        conflict = np.zeros((rows, cols), dtype=bool)
+        for ri, roi in enumerate(rois):
+            m = roi["mask"]
+            if m.shape != (rows, cols):
+                continue
+            nm = roi["class"]
+            if nm in names:
+                ci = names.index(nm)
+            else:
+                names.append(nm)
+                ci = len(names) - 1
+            conflict |= m & (seen_cls != -1) & (seen_cls != ci)
+            seen_cls[m] = ci
+            cls[m] = ci
+            grp[m] = gid + ri
+            in_roi |= m
+        gid += len(rois) + 1
+        n_conflict = int(conflict.sum())
+        cls[conflict] = -1
+        in_roi &= ~conflict
+    ok = (cls.ravel() >= 0) & valid_px
+    idx = np.flatnonzero(ok)
+    y_all = cls.ravel()[idx]
+    present = np.unique(y_all)
+    if len(present) < 2:
+        raise RuntimeError("Need labelled pixels from at least 2 classes.")
+    remap = -np.ones(len(names), dtype=np.int64)
+    remap[present] = np.arange(len(present))
+    used = [names[i] for i in present]
+    y = remap[y_all]
+    truth = np.zeros(rows * cols, dtype=np.int32)
+    truth[idx] = y + 1
+    return {"idx": idx, "y": y, "group": grp.ravel()[idx], "in_roi": in_roi.ravel()[idx],
+            "names": used, "n_conflict": n_conflict, "truth_img": truth.reshape(rows, cols)}
+
+
+def _safe_pixel_split(ids, ratio, rs):
+    """(kept, held) following sklearn's train_test_split(test_size=ratio) but never failing on tiny classes."""
+    n = len(ids)
+    if ratio <= 0 or n < 2:
+        return ids, ids[:0]
+    n_te = int(math.ceil(n * ratio))
+    if 1 <= n_te <= n - 1:
+        kept, held = train_test_split(ids, test_size=ratio, random_state=rs)
+        return kept, held
+    n_te = min(max(n_te, 1), n - 1)
+    perm = rs.permutation(n)
+    return ids[perm[n_te:]], ids[perm[:n_te]]
+
+
+def _group_split(ids, groups, ratio, rs):
+    """Hold out whole groups: (kept, held). Falls back to a pixel split when only one group exists."""
+    ug = np.unique(groups[ids])
+    if ratio <= 0 or len(ug) < 2:
+        return _safe_pixel_split(ids, ratio, rs) if ratio > 0 else (ids, ids[:0])
+    k = int(round(len(ug) * ratio))
+    k = min(max(k, 1), len(ug) - 1)
+    chosen = rs.choice(ug, size=k, replace=False)
+    held_mask = np.isin(groups[ids], chosen)
+    return ids[~held_mask], ids[held_mask]
+
+
+def make_seg_split(samples, rows, cols, mode, test_ratio, val_ratio, seed, max_per_class=0, block=32):
+    """Train / validation / test positions (indices into samples). Mirrors the notebook for mode 'pixels'."""
+    y, idx = samples["y"], samples["idx"]
+    K = len(samples["names"])
+    rs = np.random.RandomState(int(seed))
+    group = samples["group"]
+    if mode == "blocks":
+        r, c = idx // cols, idx % cols
+        nbx = int(math.ceil(cols / block))
+        group = (r // block) * nbx + (c // block)
+    tr_all, va_all, te_all = [], [], []
+    for cidx in range(K):
+        pos = np.flatnonzero(y == cidx)
+        if mode == "pixels":
+            rest, te = _safe_pixel_split(pos, test_ratio, rs)
+            tr, va = _safe_pixel_split(rest, val_ratio, rs)
+        elif mode in ("regions", "blocks"):
+            rest, te = _group_split(pos, group, test_ratio, rs)
+            tr, va = _group_split(rest, group, val_ratio, rs)
+        elif mode == "roi_train":
+            roi = samples["in_roi"][pos]
+            rest, te = pos[roi], pos[~roi]
+            tr, va = _group_split(rest, group, val_ratio, rs) if val_ratio > 0 else (rest, rest[:0])
+        else:
+            raise ValueError(f"Unknown split mode {mode}")
+        if max_per_class and len(tr) > max_per_class:
+            tr = rs.choice(tr, size=int(max_per_class), replace=False)
+        tr_all.append(np.sort(tr))
+        va_all.append(np.sort(va))
+        te_all.append(np.sort(te))
+    tr = np.concatenate(tr_all)
+    va = np.concatenate(va_all)
+    te = np.concatenate(te_all)
+    if len(tr) == 0:
+        raise RuntimeError("The training set is empty; change the split settings.")
+    if len(np.unique(y[tr])) < 2:
+        raise RuntimeError("The training set holds fewer than 2 classes; change the split settings.")
+    table = [(samples["names"][c], int(np.sum(y[tr] == c)), int(np.sum(y[va] == c)), int(np.sum(y[te] == c)))
+             for c in range(K)]
+    return {"tr": tr, "va": va, "te": te, "table": table}
+
+
+# ---------------------------------------------------------------- features
+def apply_linear_transform(cube, T, block_rows=64):
+    """(rows, cols, k) float32 features: (X[:, band_index] - mean) @ A, then (z - post_mean) / post_std.
+    Pixels that are entirely NaN give zeros. T['A'] = None means 'standardise the bands only'."""
+    rows, cols, B = cube.shape
+    bi = T["band_index"]
+    mean = T["mean"]
+    A = T.get("A")
+    k = len(bi) if A is None else A.shape[1]
+    out = np.zeros((rows, cols, k), dtype=np.float32)
+    for r0 in range(0, rows, block_rows):
+        blk = np.asarray(cube[r0:r0 + block_rows], dtype=np.float64)
+        valid = np.isfinite(blk).any(axis=2)
+        X = blk[:, :, bi]
+        X = np.where(np.isfinite(X), X, mean)
+        Z = X - mean
+        if A is not None:
+            Z = Z @ A
+        Z = (Z - T["post_mean"]) / T["post_std"]
+        Z[~valid] = 0.0
+        out[r0:r0 + block_rows] = Z.astype(np.float32)
+    return out
+
+
+def _post_stats(cube, T, valid_px, block_rows=64):
+    """Mean and std of the (pre-standardisation) transformed values over the valid pixels."""
+    rows, cols, B = cube.shape
+    k = len(T["band_index"]) if T.get("A") is None else T["A"].shape[1]
+    n = 0
+    s1 = np.zeros(k)
+    s2 = np.zeros(k)
+    T0 = dict(T, post_mean=np.zeros(k), post_std=np.ones(k))
+    for r0 in range(0, rows, block_rows):
+        Z = apply_linear_transform(cube[r0:r0 + block_rows], T0, block_rows).reshape(-1, k).astype(np.float64)
+        v = valid_px[r0 * cols:(r0 + block_rows) * cols]
+        Z = Z[v]
+        n += len(Z)
+        s1 += Z.sum(0)
+        s2 += (Z ** 2).sum(0)
+    m = s1 / max(n, 1)
+    sd = np.sqrt(np.maximum(s2 / max(n, 1) - m ** 2, 0.0))
+    return m, np.where(sd > 1e-12, sd, 1.0)
+
+
+def seg_feature_transform(cube, mode, k, dr=None, progress=None, cancel=None):
+    """Fit the input-feature transform and return (T, valid_px). T is a dict that can be re-applied to any
+    cube with the same bands (apply_linear_transform)."""
+    rows, cols, B = cube.shape
+    valid_px = ~np.all(np.isnan(cube.reshape(-1, B)), axis=1) if cube.size < 5e8 else \
+        np.concatenate([~np.all(np.isnan(cube[r:r + 64].reshape(-1, B)), axis=1) for r in range(0, rows, 64)])
+    nanbands = np.all(np.isnan(cube.reshape(-1, B)), axis=0) if cube.size < 5e8 else np.zeros(B, bool)
+    band_index = np.flatnonzero(~nanbands)
+    k = int(k)
+    if mode == "pca":
+        if k < 1 or k > len(band_index):
+            raise ValueError(f"The number of components must be between 1 and {len(band_index)}.")
+        X, vpx = prepare_features(cube.reshape(-1, B)[:, band_index])
+        Xv = X[valid_px]
+        rng = np.random.default_rng(0)
+        fit = Xv if len(Xv) <= 300000 else Xv[rng.choice(len(Xv), 300000, replace=False)]
+        pca = PCA(n_components=k, whiten=False, random_state=42).fit(fit)
+        del X, Xv
+        sd = np.sqrt(np.maximum(pca.explained_variance_, 1e-24))
+        T = {"kind": "pca", "band_index": band_index, "mean": pca.mean_.astype(np.float64),
+             "A": pca.components_.T.astype(np.float64), "post_mean": np.zeros(k), "post_std": sd}
+    elif mode == "mnf":
+        r = dimred_transform(cube, "MNF", k, "horizontal", progress=progress, cancel=cancel)
+        T = {"kind": "mnf", "band_index": r["band_index"], "mean": r["mean"], "A": r["coefficients"]}
+        T["post_mean"], T["post_std"] = _post_stats(cube, dict(T, post_mean=None), valid_px)
+    elif mode == "drtab":
+        if dr is None or dr.get("coeff") is None:
+            raise ValueError("Compute PCA in the Dimensionality Reduction tab first (with this cube).")
+        A = np.asarray(dr["coeff"], dtype=np.float64)
+        if k > A.shape[1]:
+            raise ValueError(f"The Dimensionality Reduction tab holds {A.shape[1]} components; "
+                             f"set the number of components to at most that.")
+        T = {"kind": "drtab", "band_index": np.asarray(dr["band_index"]), "mean": np.asarray(dr["mean"], float),
+             "A": A[:, :k]}
+        T["post_mean"], T["post_std"] = _post_stats(cube, dict(T, post_mean=None), valid_px)
+    elif mode == "full":
+        Xm = np.zeros(len(band_index))
+        n = 0
+        for r0 in range(0, rows, 64):
+            blk = np.asarray(cube[r0:r0 + 64], dtype=np.float64)[:, :, band_index].reshape(-1, len(band_index))
+            blk = blk[~np.all(np.isnan(blk), axis=1)]
+            Xm += np.nansum(blk, axis=0)
+            n += len(blk)
+        mean = Xm / max(n, 1)
+        T = {"kind": "full", "band_index": band_index, "mean": mean, "A": None}
+        T["post_mean"], T["post_std"] = _post_stats(cube, dict(T, post_mean=None), valid_px)
+    else:
+        raise ValueError(f"Unknown feature mode {mode}")
+    return T, valid_px
+
+
+class SegPatches:
+    """Patches around any pixel, taken on demand from the (rows, cols, k) feature image.
+    Patch size P: the pixel sits at index P//2 of the window (identical to the notebook for even P)."""
+
+    def __init__(self, feat, P):
+        self.cols = feat.shape[1]
+        self.P = int(P)
+        b = self.P // 2
+        a = self.P - 1 - b
+        padded = np.pad(feat, ((b, a), (b, a), (0, 0)), mode="constant")
+        self.windows = sliding_window_view(padded, (self.P, self.P), axis=(0, 1))   # (rows, cols, k, P, P)
+
+    def get(self, flat_ids):
+        r = flat_ids // self.cols
+        c = flat_ids % self.cols
+        return np.ascontiguousarray(self.windows[r, c].transpose(0, 2, 3, 1), dtype=np.float32)
+
+
+# ---------------------------------------------------------------- metrics, training, export
+def seg_metrics(y_true, y_pred, names):
+    """OA / AA / kappa (in %), per-class accuracy (%), confusion matrix and a text report."""
+    K = len(names)
+    labels = list(range(K))
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    diag = np.diag(cm).astype(float)
+    rs = cm.sum(axis=1).astype(float)
+    each = np.divide(diag, rs, out=np.zeros(K), where=rs > 0)
+    present = [i for i in labels if rs[i] > 0 or np.any(y_pred == i)]
+    rep = classification_report(y_true, y_pred, labels=present, target_names=[names[i] for i in present],
+                                digits=4, zero_division=0)
+    return {"oa": round(float(accuracy_score(y_true, y_pred)), 4) * 100.0,
+            "aa": round(float(each[rs > 0].mean()) if np.any(rs > 0) else 0.0, 4) * 100.0,
+            "kappa": round(float(cohen_kappa_score(y_true, y_pred, labels=labels)), 4) * 100.0,
+            "per_class": each * 100.0, "confusion": cm, "report": rep}
+
+
+def _free_ram_bytes():
+    """Available RAM in bytes, or None when it cannot be determined."""
+    try:
+        import psutil
+        return float(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                if ln.startswith("MemAvailable:"):
+                    return float(ln.split()[1]) * 1024.0
+    except Exception:
+        pass
+    return None
+
+
+SEG_MODEL_MIN_RAM_GB = {"SCSNet": 4.0, "PyFormer": 12.0}     # peak RAM at batch 56 and 8x8x15 patches (SCSNet measured 3.4 GB; PyFormer ran out of memory on 7 GB); scales with the batch size
+
+
+def seg_memory_check(n_params, name, batch=56):
+    """Refuse to train a network whose weights + gradients + Adam state clearly do not fit in RAM
+    (a crash from the operating system would take the whole application down)."""
+    free = _free_ram_bytes()
+    floor = SEG_MODEL_MIN_RAM_GB.get(name)
+    if floor is not None:
+        floor = max(0.5, floor * max(int(batch), 1) / 56.0)
+    if floor is not None and free is not None and floor * 2 ** 30 > free:
+        raise RuntimeError(f"needs roughly {floor:.1f} GB of free RAM at this batch size but only "
+                           f"{free / 2 ** 30:.1f} GB are free; skipped (lower the batch size or close other programs)")
+    need = float(n_params) * 32.0            # weights, gradients, 2 Adam moments and temporary copies
+    if free is not None and need > 0.8 * free:
+        raise RuntimeError(f"needs about {need / 2**30:.1f} GB of RAM for its {n_params:,} parameters but only "
+                           f"{free / 2**30:.1f} GB are free; skipped (use fewer components or a smaller patch, "
+                           f"or close other programs)")
+
+
+def seg_make_optimizer(keras, lr, decay):
+    if decay and decay > 0:
+        sched = keras.optimizers.schedules.InverseTimeDecay(lr, decay_steps=1, decay_rate=decay)
+        return keras.optimizers.Adam(learning_rate=sched)
+    return keras.optimizers.Adam(learning_rate=lr)
+
+
+def _seg_to_scalars(out):
+    out = np.atleast_1d(np.asarray(out, dtype=float))
+    return float(out[0]), float(out[1] if len(out) > 1 else 0.0)
+
+
+def run_segmentation(cube, cfg, model_names, progress=None, cancel=None):
+    """Train and evaluate the selected models (one after the other).
+
+    cfg keys: source, gt, rois, feature_mode, k, dr, WS, split_mode, test_ratio, val_ratio, seed,
+    max_per_class, block, epochs, batch, lr, decay, scope.
+    Returns dict(ctx, results, errors, cancelled)."""
     def say(msg):
         if progress is not None:
             progress(msg)
 
-    rows, cols, bands = cube.shape
-    rng = np.random.default_rng(0)
-    patch_size = int(patch_size) | 1               # force odd
-    margin = patch_size // 2
-
-    say("Preparing PCA features...")
-    X, valid_px = prepare_features(cube.reshape(-1, bands))
-    Xv = X[valid_px]
-    nc = int(max(1, min(n_pca, bands, Xv.shape[0] - 1)))
-    fit_n = min(Xv.shape[0], 200000)
-    fit_idx = rng.choice(Xv.shape[0], size=fit_n, replace=False) if fit_n < Xv.shape[0] \
-        else np.arange(Xv.shape[0])
-    pca = PCA(n_components=nc, whiten=True, random_state=42).fit(Xv[fit_idx])
-    feat = np.zeros((rows * cols, nc), dtype=np.float32)
-    feat[valid_px] = pca.transform(Xv).astype(np.float32)
-    del X, Xv
-    padded = np.pad(feat.reshape(rows, cols, nc),
-                    ((margin, margin), (margin, margin), (0, 0)), mode="constant")
-    windows = sliding_window_view(padded, (patch_size, patch_size), axis=(0, 1))
+    rows, cols, B = cube.shape
+    WS = int(cfg["WS"])
+    t0 = time.time()
+    say("Preparing the input features...")
+    T, valid_px = seg_feature_transform(cube, cfg["feature_mode"], cfg["k"], cfg.get("dr"),
+                                        progress=progress, cancel=cancel)
+    feat = apply_linear_transform(cube, T)
+    DL_time = time.time() - t0
+    k = feat.shape[2]
     _check_cancel(cancel)
+    samples = build_seg_samples(rows, cols, valid_px, cfg["source"], cfg.get("gt"), cfg.get("rois"), None)
+    split = make_seg_split(samples, rows, cols, cfg["split_mode"], cfg["test_ratio"], cfg["val_ratio"],
+                           cfg["seed"], cfg.get("max_per_class", 0), cfg.get("block", 32))
+    names = samples["names"]
+    K = len(names)
+    y, sidx = samples["y"], samples["idx"]
+    tr, va, te = split["tr"], split["va"], split["te"]
+    patches = SegPatches(feat, WS)
+    eye = np.eye(K, dtype=np.float32)
 
-    samp_idx, y, rid, used_names, n_conflict = _collect_samples(
-        valid_px, rois, class_names, rows, cols)
-    test_mask = split_train_test(y, rid, test_frac, split_mode, rng)
-    ids_all = np.arange(len(y))
-    train_ids = cap_per_class(ids_all[~test_mask], y, max_per_class, rng)
-    test_ids = cap_per_class(ids_all[test_mask], y, max_per_class, rng) \
-        if test_mask.any() else np.array([], dtype=int)
-    if len(np.unique(y[train_ids])) < 2:
-        raise RuntimeError("Training set contains fewer than 2 classes after splitting.")
+    def make_img(pos, vals=None):
+        img = np.zeros(rows * cols, dtype=np.int32)
+        img[sidx[pos]] = (y[pos] + 1) if vals is None else (np.asarray(vals) + 1)
+        return img.reshape(rows, cols)
 
-    say("Building the network...")
-    model = build_cnn((patch_size, patch_size, nc), len(used_names), net_size)
+    ctx = {"rows": rows, "cols": cols, "names": names, "k": k, "WS": WS, "DL_time": DL_time,
+           "truth": samples["truth_img"], "train_img": make_img(tr), "val_img": make_img(va), "test_img": make_img(te),
+           "table": split["table"], "n_conflict": samples["n_conflict"], "feature_transform": T,
+           "split_mode": cfg["split_mode"], "test_ratio": cfg["test_ratio"], "val_ratio": cfg["val_ratio"],
+           "n_samples": (len(tr), len(va), len(te)), "sample_idx": sidx, "sample_y": y, "tr": tr, "va": va, "te": te}
+    results, errors = [], []
+    cancelled = False
+    reg = None
+    try:
+        reg = build_seg_registry()
+    except Exception as e:
+        raise RuntimeError(f"TensorFlow could not be loaded:\n{e}")
+    tf, keras = seg_tf_ready()
+    import gc
+    rng = np.random.default_rng(int(cfg["seed"]))
+    epochs, bs = int(cfg["epochs"]), int(cfg["batch"])
+    pbs = int(min(256, max(bs, 16)))               # prediction batch: no larger than needed (memory)
+    M = len(model_names)
+    last_emit = [0.0]
 
-    def predict_ids(flat_ids):
-        out = np.empty(len(flat_ids), dtype=np.int32)
-        bs = 512
-        for b in range(0, len(flat_ids), bs):
+    def tick(msg, force=False):
+        now = time.time()
+        if force or now - last_emit[0] > 0.25:
+            last_emit[0] = now
+            say(msg)
+
+    for mi, name in enumerate(model_names, 1):
+        spec = reg[name]
+        tag = f"[{mi}/{M}] {name}"
+        try:
             _check_cancel(cancel)
-            xb = gather_patches(windows, flat_ids[b:b + bs], cols)
-            out[b:b + bs] = np.argmax(model.predict(xb, verbose=0), axis=1)
-        return out
+            miss = [m for m in spec["needs"] if importlib.util.find_spec(m) is None]
+            if miss:
+                raise RuntimeError(f"needs {', '.join(miss)} (pip install {' '.join(miss)})")
+            if spec["fixed_ws"] and WS != spec["fixed_ws"]:
+                raise RuntimeError(f"needs a patch size of {spec['fixed_ws']} (current {WS})")
+            keras.backend.clear_session()
+            tf.keras.utils.set_random_seed(42)
+            tick(f"{tag}: building the network...", True)
+            try:
+                model = spec["build"](WS, k, K)
+            except Exception as e:
+                if name == "AttentionGCN" and "KerasTensor" in str(e):
+                    raise RuntimeError("AttentionGCN needs the older Keras 2 (pip install tf-keras) "
+                                       "together with keras_cv_attention_models")
+                raise
+            seg_memory_check(model.count_params(), name, bs)
+            is3d = spec["input"] == "3d"
+            model.compile(loss="categorical_crossentropy", optimizer=seg_make_optimizer(keras, cfg["lr"], cfg["decay"]),
+                          metrics=["accuracy"])
 
-    log = []
-    n_tr = len(train_ids)
-    for ep in range(int(epochs)):
-        order = rng.permutation(train_ids)
-        tot_loss = tot_acc = 0.0
-        for b in range(0, n_tr, batch_size):
-            _check_cancel(cancel)
-            sel = order[b:b + batch_size]
-            xb = gather_patches(windows, samp_idx[sel], cols)
-            out = np.atleast_1d(np.asarray(model.train_on_batch(xb, y[sel]), dtype=float))
-            tot_loss += float(out[0]) * len(sel)
-            tot_acc += float(out[1] if len(out) > 1 else 0.0) * len(sel)
-            say(f"CNN epoch {ep + 1}/{epochs}: batch {b // batch_size + 1}/"
-                f"{math.ceil(n_tr / batch_size)}")
-        line = f"Epoch {ep + 1:>3}/{epochs}  loss {tot_loss / n_tr:.4f}  train acc {tot_acc / n_tr:.4f}"
-        if len(test_ids) > 0:
-            val = float(np.mean(predict_ids(samp_idx[test_ids]) == y[test_ids]))
-            line += f"  val acc {val:.4f}"
-        log.append(line)
-        say(line)
+            def feed(ids):
+                xb = patches.get(ids)
+                return xb[..., None] if is3d else xb
 
-    split_desc = ("hold-out whole ROIs" if split_mode == "rois" else "random pixels")
-    if len(test_ids) > 0:
-        y_pred = predict_ids(samp_idx[test_ids])
-        report = format_report(used_names, y[test_ids], y_pred, len(train_ids),
-                               len(test_ids), split_desc)
-    else:
-        report = f"No hold-out set (test fraction = 0). Trained on {len(train_ids)} patches."
-    report = _split_notes(report, n_conflict, split_mode, len(test_ids) > 0)
-    report += (f"\n\nNetwork: {net_size}, patch {patch_size}x{patch_size}, {nc} whitened PCA "
-               f"components, {epochs} epochs, batch {batch_size}\n\nTraining log:\n" + "\n".join(log))
+            hist = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+            t_start = time.time()
+            n_tr = len(tr)
+            for ep in range(epochs):
+                order = rng.permutation(n_tr)
+                tl = ta = 0.0
+                for b in range(0, n_tr, bs):
+                    _check_cancel(cancel)
+                    sel = tr[order[b:b + bs]]
+                    loss, acc = _seg_to_scalars(model.train_on_batch(feed(sidx[sel]), eye[y[sel]]))
+                    tl += loss * len(sel)
+                    ta += acc * len(sel)
+                    tick(f"{tag}: epoch {ep + 1}/{epochs}, batch {b // bs + 1}/{math.ceil(n_tr / bs)}")
+                hist["loss"].append(tl / n_tr)
+                hist["accuracy"].append(ta / n_tr)
+                if len(va):
+                    vl = vacc = 0.0
+                    for b in range(0, len(va), pbs):
+                        _check_cancel(cancel)
+                        sel = va[b:b + pbs]
+                        l_, a_ = _seg_to_scalars(model.test_on_batch(feed(sidx[sel]), eye[y[sel]]))
+                        vl += l_ * len(sel)
+                        vacc += a_ * len(sel)
+                    hist["val_loss"].append(vl / len(va))
+                    hist["val_accuracy"].append(vacc / len(va))
+                tick(f"{tag}: epoch {ep + 1}/{epochs}  loss {hist['loss'][-1]:.4f}  acc {hist['accuracy'][-1]:.4f}"
+                     + (f"  val acc {hist['val_accuracy'][-1]:.4f}" if len(va) else ""), True)
+            tr_time = time.time() - t_start
 
-    if predict_scope == "rois":
-        cls_img, _, _ = build_label_images(rois, class_names, rows, cols)
-        target = np.flatnonzero((cls_img.ravel() >= 0) & valid_px)
-    else:
-        target = np.flatnonzero(valid_px)
-    labels_flat = -np.ones(rows * cols, dtype=np.int32)
-    bs = 512
-    for b in range(0, len(target), bs):
+            def predict_pos(pos_ids, label):
+                out = np.empty(len(pos_ids), dtype=np.int32)
+                for b in range(0, len(pos_ids), pbs):
+                    _check_cancel(cancel)
+                    out[b:b + pbs] = np.argmax(model.predict_on_batch(feed(pos_ids[b:b + pbs])), axis=1)
+                    tick(f"{tag}: {label} {min(b + pbs, len(pos_ids))}/{len(pos_ids)}")
+                return out
+
+            t1 = time.time()
+            va_pre = predict_pos(sidx[va], "validating") if len(va) else np.array([], dtype=np.int32)
+            va_time = time.time() - t1
+            t1 = time.time()
+            te_pre = predict_pos(sidx[te], "testing") if len(te) else np.array([], dtype=np.int32)
+            te_time = time.time() - t1
+            t1 = time.time()
+            if cfg["scope"] == "image":
+                target = np.flatnonzero(valid_px)
+            else:
+                target = sidx
+            pred_t = predict_pos(target, "classifying")
+            full = -np.ones(rows * cols, dtype=np.int32)
+            full[target] = pred_t
+            hsi_time = time.time() - t1
+            all_pre = full[sidx]
+            res = {"name": name, "params": int(model.count_params()), "history": hist,
+                   "times": {"train": tr_time, "val": va_time, "test": te_time, "hsi": hsi_time, "dr": DL_time},
+                   "full": full.reshape(rows, cols), "va_pre": va_pre, "te_pre": te_pre,
+                   "val": seg_metrics(y[va], va_pre, names) if len(va) else None,
+                   "test": seg_metrics(y[te], te_pre, names) if len(te) else None,
+                   "hsi": seg_metrics(y, all_pre, names),
+                   "settings": {"WS": WS, "k": k, "epochs": epochs, "batch": bs, "lr": cfg["lr"], "decay": cfg["decay"]}}
+            res["saved_to"] = None
+            if cfg.get("save_dir"):
+                base = str(Path(cfg["save_dir"]) / f"{cfg.get('prefix', 'seg')}_{name}")
+                seg_save_model(base, model.get_weights(), res, ctx, B)
+                res["saved_to"] = base
+            results.append(res)
+            tick(f"{tag}: finished", True)
+        except TaskCancelled:
+            cancelled = True
+            break
+        except Exception as e:
+            traceback.print_exc()
+            errors.append((name, str(e)))
+        finally:
+            try:
+                keras.backend.clear_session()
+            except Exception:
+                pass
+            gc.collect()
+    return {"ctx": ctx, "results": results, "errors": errors, "cancelled": cancelled}
+
+
+def seg_predict_map(cube, saved, progress=None, cancel=None):
+    """Classify a cube with a saved model (see seg_save_model). Returns (labels (rows, cols) int, -1 invalid)."""
+    rows, cols, B = cube.shape
+    cfg = saved["config"]
+    T = saved["transform"]
+    if B != cfg["n_bands"]:
+        raise ValueError(f"This model was trained on {cfg['n_bands']} bands but the cube has {B}.")
+    reg = build_seg_registry()
+    tf, keras = seg_tf_ready()
+    spec = reg[cfg["model"]]
+    model = spec["build"](cfg["WS"], cfg["k"], cfg["n_classes"])
+    model.set_weights(saved["weights"])
+    feat = apply_linear_transform(cube, T)
+    valid_px = ~np.all(np.isnan(cube.reshape(-1, B)), axis=1)
+    patches = SegPatches(feat, cfg["WS"])
+    target = np.flatnonzero(valid_px)
+    out = -np.ones(rows * cols, dtype=np.int32)
+    is3d = spec["input"] == "3d"
+    for b in range(0, len(target), 256):
         _check_cancel(cancel)
-        say(f"Classifying with the CNN... {min(b + bs, len(target))}/{len(target)} pixels")
-        sel = target[b:b + bs]
-        xb = gather_patches(windows, sel, cols)
-        labels_flat[sel] = np.argmax(model.predict(xb, verbose=0), axis=1)
+        xb = patches.get(target[b:b + 256])
+        out[target[b:b + 256]] = np.argmax(model.predict_on_batch(xb[..., None] if is3d else xb), axis=1)
+        if progress is not None:
+            progress(f"Classifying... {min(b + 256, len(target))}/{len(target)} pixels")
+    return out.reshape(rows, cols)
 
-    return {
-        "labels": labels_flat.reshape(rows, cols),
-        "names": used_names,
-        "report": report,
-        "title": "2D CNN",
-    }
+
+def seg_save_model(path_base, weights, res, ctx, n_bands):
+    """Write <base>.npz (weights + feature transform) and <base>.json (settings, class names)."""
+    T = ctx["feature_transform"]
+    arrs = {"w_%d" % i: np.asarray(w) for i, w in enumerate(weights)}
+    arrs.update({"T_band_index": np.asarray(T["band_index"]), "T_mean": np.asarray(T["mean"]),
+                 "T_post_mean": np.asarray(T["post_mean"]), "T_post_std": np.asarray(T["post_std"])})
+    if T.get("A") is not None:
+        arrs["T_A"] = np.asarray(T["A"])
+    np.savez_compressed(path_base + ".npz", **arrs)
+    cfg = {"model": res["name"], "WS": ctx["WS"], "k": ctx["k"], "n_classes": len(ctx["names"]),
+           "class_names": ctx["names"], "n_bands": int(n_bands), "n_weights": len(weights),
+           "transform_kind": T["kind"], "settings": res["settings"],
+           "test_oa": None if res["test"] is None else res["test"]["oa"]}
+    with open(path_base + ".json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def seg_load_model(path_base):
+    with open(path_base + ".json") as f:
+        cfg = json.load(f)
+    z = np.load(path_base + ".npz")
+    T = {"kind": cfg["transform_kind"], "band_index": z["T_band_index"], "mean": z["T_mean"],
+         "A": z["T_A"] if "T_A" in z.files else None, "post_mean": z["T_post_mean"], "post_std": z["T_post_std"]}
+    weights = [z["w_%d" % i] for i in range(cfg["n_weights"])]
+    return {"config": cfg, "transform": T, "weights": weights}
+
+
+# ======================================================================
+# Classical classifiers (Random Forest, SVM RBF / poly) on the same workflow as the segmentation models:
+# labels from ROIs and / or a ground-truth file, the same splits and feature transforms, the same metrics.
+# ======================================================================
+CLASSICAL_MODEL_INFO = {   # name: (description, ticked by default)
+    "Random Forest": ("Ensemble of decision trees on the pixel spectrum (or a flattened patch). Robust, needs little "
+                      "tuning, gives feature importances.", True),
+    "SVM (RBF)": ("Support vector machine with a Gaussian (RBF) kernel. Strong on small training sets; training "
+                  "time grows quickly with the number of samples.", True),
+    "SVM (poly)": ("Support vector machine with a polynomial kernel (set the degree). Works best on a few PCA / MNF "
+                   "components.", True),
+}
+CLASSICAL_DEFAULTS = {"rf_trees": 200, "rf_depth": 0, "svm_c": 10.0, "svm_gamma": 0.0, "poly_degree": 3,
+                      "poly_c": 1.0, "poly_coef0": 0.0, "balanced": True}
+
+
+def make_classical_model(name, hp, seed=0):
+    hp = dict(CLASSICAL_DEFAULTS, **(hp or {}))
+    cw = "balanced" if hp["balanced"] else None
+    gamma = "scale" if not hp["svm_gamma"] else float(hp["svm_gamma"])
+    if name == "Random Forest":
+        return RandomForestClassifier(n_estimators=int(hp["rf_trees"]), max_depth=(int(hp["rf_depth"]) or None),
+                                      n_jobs=-1, random_state=int(seed), class_weight=cw)
+    if name == "SVM (RBF)":
+        return SVC(kernel="rbf", C=float(hp["svm_c"]), gamma=gamma, class_weight=cw, cache_size=1000)
+    if name == "SVM (poly)":
+        return SVC(kernel="poly", C=float(hp["poly_c"]), degree=int(hp["poly_degree"]), coef0=float(hp["poly_coef0"]),
+                   gamma=gamma, class_weight=cw, cache_size=1000)
+    raise ValueError(f"Unknown classifier {name}")
+
+
+def classical_settings_text(name, hp):
+    hp = dict(CLASSICAL_DEFAULTS, **(hp or {}))
+    g = "auto" if not hp["svm_gamma"] else f"{hp['svm_gamma']:g}"
+    if name == "Random Forest":
+        s = f"{int(hp['rf_trees'])} trees, depth {int(hp['rf_depth']) or 'unlimited'}"
+    elif name == "SVM (RBF)":
+        s = f"C={hp['svm_c']:g}, gamma={g}"
+    else:
+        s = f"degree {int(hp['poly_degree'])}, C={hp['poly_c']:g}, coef0={hp['poly_coef0']:g}, gamma={g}"
+    return s + (", balanced classes" if hp["balanced"] else "")
+
+
+def _classical_X(patches, ids):
+    return patches.get(ids).reshape(len(ids), -1)
+
+
+def classical_save_model(path_base, clf, res, ctx, n_bands):
+    """Write <base>.joblib (fitted estimator + feature transform) and <base>.json (settings, class names)."""
+    import joblib
+    joblib.dump({"model": clf, "transform": ctx["feature_transform"]}, path_base + ".joblib", compress=3)
+    cfg = {"family": "classical", "model": res["name"], "WS": ctx["WS"], "k": ctx["k"], "n_classes": len(ctx["names"]),
+           "class_names": ctx["names"], "n_bands": int(n_bands), "transform_kind": ctx["feature_transform"]["kind"],
+           "settings": res["settings"], "test_oa": None if res["test"] is None else res["test"]["oa"]}
+    with open(path_base + ".json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def classical_load_model(path_base):
+    import joblib
+    with open(path_base + ".json") as f:
+        cfg = json.load(f)
+    if cfg.get("family") != "classical":
+        raise ValueError("This is not a Random Forest / SVM model (use the Segmentation tab for deep models).")
+    obj = joblib.load(path_base + ".joblib")
+    return {"config": cfg, "model": obj["model"], "transform": obj["transform"]}
+
+
+def classical_predict_map(cube, saved, progress=None, cancel=None, chunk=20000):
+    """Classify a cube with a saved classical model. Returns labels (rows, cols), -1 for invalid pixels."""
+    rows, cols, B = cube.shape
+    cfg = saved["config"]
+    if B != cfg["n_bands"]:
+        raise ValueError(f"This model was trained on {cfg['n_bands']} bands but the cube has {B}.")
+    feat = apply_linear_transform(cube, saved["transform"])
+    valid_px = ~np.all(np.isnan(cube.reshape(-1, B)), axis=1)
+    patches = SegPatches(feat, cfg["WS"])
+    target = np.flatnonzero(valid_px)
+    out = -np.ones(rows * cols, dtype=np.int32)
+    for b in range(0, len(target), chunk):
+        _check_cancel(cancel)
+        sel = target[b:b + chunk]
+        out[sel] = saved["model"].predict(_classical_X(patches, sel))
+        if progress is not None:
+            progress(f"Classifying... {min(b + chunk, len(target))}/{len(target)} pixels")
+    return out.reshape(rows, cols)
+
+
+def run_classical(cube, cfg, model_names, progress=None, cancel=None):
+    """Train and evaluate Random Forest / SVM models one after the other, exactly like run_segmentation.
+
+    cfg keys: source, gt, rois, feature_mode, k, dr, WS (spatial window, 1 = pixel spectrum), split_mode,
+    test_ratio, val_ratio, seed, max_per_class, block, scope, hp, save_dir, prefix."""
+    def say(msg):
+        if progress is not None:
+            progress(msg)
+
+    rows, cols, B = cube.shape
+    P = int(cfg["WS"])
+    t0 = time.time()
+    say("Preparing the input features...")
+    T, valid_px = seg_feature_transform(cube, cfg["feature_mode"], cfg["k"], cfg.get("dr"),
+                                        progress=progress, cancel=cancel)
+    feat = apply_linear_transform(cube, T)
+    DL_time = time.time() - t0
+    k = feat.shape[2]
+    _check_cancel(cancel)
+    samples = build_seg_samples(rows, cols, valid_px, cfg["source"], cfg.get("gt"), cfg.get("rois"), None)
+    split = make_seg_split(samples, rows, cols, cfg["split_mode"], cfg["test_ratio"], cfg["val_ratio"],
+                           cfg["seed"], cfg.get("max_per_class", 0), cfg.get("block", 32))
+    names = samples["names"]
+    y, sidx = samples["y"], samples["idx"]
+    tr, va, te = split["tr"], split["va"], split["te"]
+    patches = SegPatches(feat, P)
+    F = P * P * k
+    free = _free_ram_bytes()
+    need = len(tr) * F * 4 * 3.0
+    if free is not None and need > 0.8 * free:
+        raise RuntimeError(f"The training matrix ({len(tr):,} samples x {F} features) needs about "
+                           f"{need / 2 ** 30:.1f} GB of RAM but only {free / 2 ** 30:.1f} GB are free. "
+                           "Use 'Max training samples / class', fewer components or a smaller spatial window.")
+
+    def make_img(pos):
+        img = np.zeros(rows * cols, dtype=np.int32)
+        img[sidx[pos]] = y[pos] + 1
+        return img.reshape(rows, cols)
+
+    ctx = {"rows": rows, "cols": cols, "names": names, "k": k, "WS": P, "DL_time": DL_time, "family": "classical",
+           "truth": samples["truth_img"], "train_img": make_img(tr), "val_img": make_img(va), "test_img": make_img(te),
+           "table": split["table"], "n_conflict": samples["n_conflict"], "feature_transform": T,
+           "split_mode": cfg["split_mode"], "test_ratio": cfg["test_ratio"], "val_ratio": cfg["val_ratio"],
+           "n_samples": (len(tr), len(va), len(te)), "sample_idx": sidx, "sample_y": y, "tr": tr, "va": va, "te": te}
+    results, errors = [], []
+    cancelled = False
+    import gc
+    Xtr = _classical_X(patches, sidx[tr])
+    ytr = y[tr]
+    chunk = 20000
+    M = len(model_names)
+    for mi, name in enumerate(model_names, 1):
+        tag = f"[{mi}/{M}] {name}"
+        try:
+            _check_cancel(cancel)
+            say(f"{tag}: training on {len(tr):,} samples x {F} features (cannot be interrupted)...")
+            clf = make_classical_model(name, cfg.get("hp"), cfg["seed"])
+            t_start = time.time()
+            clf.fit(Xtr, ytr)
+            tr_time = time.time() - t_start
+            _check_cancel(cancel)
+
+            def predict_ids(ids, label):
+                out = np.empty(len(ids), dtype=np.int32)
+                for b in range(0, len(ids), chunk):
+                    _check_cancel(cancel)
+                    out[b:b + chunk] = clf.predict(_classical_X(patches, ids[b:b + chunk]))
+                    say(f"{tag}: {label} {min(b + chunk, len(ids)):,}/{len(ids):,}")
+                return out
+
+            t1 = time.time()
+            va_pre = predict_ids(sidx[va], "validating") if len(va) else np.array([], dtype=np.int32)
+            va_time = time.time() - t1
+            t1 = time.time()
+            te_pre = predict_ids(sidx[te], "testing") if len(te) else np.array([], dtype=np.int32)
+            te_time = time.time() - t1
+            t1 = time.time()
+            target = np.flatnonzero(valid_px) if cfg["scope"] == "image" else sidx
+            pred_t = predict_ids(target, "classifying")
+            full = -np.ones(rows * cols, dtype=np.int32)
+            full[target] = pred_t
+            hsi_time = time.time() - t1
+            res = {"name": name, "family": "classical", "params": 0,
+                   "history": {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []},
+                   "times": {"train": tr_time, "val": va_time, "test": te_time, "hsi": hsi_time, "dr": DL_time},
+                   "full": full.reshape(rows, cols), "va_pre": va_pre, "te_pre": te_pre,
+                   "val": seg_metrics(y[va], va_pre, names) if len(va) else None,
+                   "test": seg_metrics(y[te], te_pre, names) if len(te) else None,
+                   "hsi": seg_metrics(y, full[sidx], names),
+                   "settings": {"WS": P, "k": k, "features": cfg["feature_mode"],
+                                "hyper-parameters": classical_settings_text(name, cfg.get("hp"))},
+                   "settings_text": classical_settings_text(name, cfg.get("hp"))}
+            if name == "Random Forest":
+                res["importance"] = clf.feature_importances_.reshape(P, P, k).sum(axis=(0, 1))
+            res["saved_to"] = None
+            if cfg.get("save_dir"):
+                base = str(Path(cfg["save_dir"]) / f"{cfg.get('prefix', 'clf')}_{name.replace(' ', '_')}")
+                classical_save_model(base, clf, res, ctx, B)
+                res["saved_to"] = base
+            results.append(res)
+            say(f"{tag}: finished")
+        except TaskCancelled:
+            cancelled = True
+            break
+        except Exception as e:
+            traceback.print_exc()
+            errors.append((name, str(e)))
+        finally:
+            gc.collect()
+    return {"ctx": ctx, "results": results, "errors": errors, "cancelled": cancelled}
+
+
+def run_classical_cv(cube, cfg, model_names, n_folds, progress=None, cancel=None):
+    """k-fold cross-validation (accuracy only) with the same labels, features and split logic.
+    Split 'pixels' = stratified folds, 'regions' / 'blocks' = whole areas held out per fold."""
+    def say(msg):
+        if progress is not None:
+            progress(msg)
+
+    rows, cols, B = cube.shape
+    P = int(cfg["WS"])
+    if cfg["split_mode"] == "roi_train":
+        raise RuntimeError("Cross-validation needs the split 'random pixels', 'regions' or 'blocks'.")
+    say("Preparing the input features...")
+    T, valid_px = seg_feature_transform(cube, cfg["feature_mode"], cfg["k"], cfg.get("dr"),
+                                        progress=progress, cancel=cancel)
+    feat = apply_linear_transform(cube, T)
+    samples = build_seg_samples(rows, cols, valid_px, cfg["source"], cfg.get("gt"), cfg.get("rois"), None)
+    names, y, sidx = samples["names"], samples["y"], samples["idx"]
+    patches = SegPatches(feat, P)
+    ids = np.arange(len(y))
+    mode = cfg["split_mode"]
+    seed = int(cfg["seed"])
+    if mode == "pixels":
+        k = min(n_folds, int(np.bincount(y).min()))
+        if k < 2:
+            raise RuntimeError("Each class needs at least 2 labelled pixels for cross-validation.")
+        splits = list(StratifiedKFold(n_splits=k, shuffle=True, random_state=seed).split(ids, y))
+        desc = f"{k}-fold stratified cross-validation, random pixels"
+    else:
+        group = samples["group"]
+        if mode == "blocks":
+            blk = int(cfg.get("block", 32))
+            r_, c_ = sidx // cols, sidx % cols
+            group = (r_ // blk) * int(math.ceil(cols / blk)) + (c_ // blk)
+        k = min(n_folds, min(len(np.unique(group[y == c])) for c in np.unique(y)))
+        if k < 2:
+            raise RuntimeError("Holding out whole areas needs at least 2 regions / blocks in every class. "
+                               "Use more ROIs, a smaller block size or random pixels.")
+        splitter = (StratifiedGroupKFold(n_splits=k, shuffle=True, random_state=seed)
+                    if StratifiedGroupKFold is not None else GroupKFold(n_splits=k))
+        splits = list(splitter.split(ids, y, group))
+        desc = f"{k}-fold cross-validation, whole {'regions' if mode == 'regions' else 'blocks'} held out"
+    rng = np.random.default_rng(seed)
+    cap = int(cfg.get("max_per_class", 0))
+    out_lines, summary = [], []
+    total = len(model_names) * k
+    done = 0
+    for name in model_names:
+        fold_acc, yt, yp = [], [], []
+        for f, (tr, te) in enumerate(splits):
+            _check_cancel(cancel)
+            done += 1
+            say(f"Cross-validation: {name}, fold {f + 1}/{k} ({done}/{total})...")
+            tr = cap_per_class(tr, y, cap, rng)
+            if len(np.unique(y[tr])) < 2 or len(te) == 0 or not set(y[te]) <= set(y[tr]):
+                fold_acc.append(float("nan"))
+                continue
+            clf = make_classical_model(name, cfg.get("hp"), seed)
+            clf.fit(_classical_X(patches, sidx[tr]), y[tr])
+            pred = np.concatenate([clf.predict(_classical_X(patches, sidx[te[b:b + 20000]]))
+                                   for b in range(0, len(te), 20000)])
+            fold_acc.append(float(accuracy_score(y[te], pred)))
+            yt.append(y[te])
+            yp.append(pred)
+        accs = np.array(fold_acc)
+        good = ~np.isnan(accs)
+        out_lines.append("=" * 70)
+        out_lines.append(f"{name}   ({classical_settings_text(name, cfg.get('hp'))})")
+        for f, a in enumerate(accs):
+            out_lines.append(f"  Fold {f + 1}: " + ("skipped (a test class had no training pixels)" if np.isnan(a)
+                                                     else f"{100.0 * a:.2f}%"))
+        if not good.any():
+            out_lines.append("  No fold could be evaluated.")
+            continue
+        m = seg_metrics(np.concatenate(yt), np.concatenate(yp), names)
+        out_lines.append(f"  Mean fold accuracy {100.0 * accs[good].mean():.2f}% (+/- {100.0 * accs[good].std():.2f}%)")
+        out_lines.append(f"  Pooled: OA {m['oa']:.2f}%  AA {m['aa']:.2f}%  kappa {m['kappa']:.2f}%")
+        out_lines.append("  Per-class accuracy (%): " + ", ".join(f"{n}: {v:.2f}" for n, v in zip(names, m["per_class"])))
+        out_lines.append("")
+        out_lines.append(m["report"])
+        out_lines.append("Confusion matrix (rows = true, columns = predicted):")
+        out_lines.append(np.array2string(m["confusion"], max_line_width=200))
+        out_lines.append("")
+        summary.append((name, 100.0 * accs[good].mean(), 100.0 * accs[good].std(), m["oa"], m["aa"], m["kappa"]))
+    head = [f"Cross-validation: {desc}", f"Features: {cfg['feature_mode']}, spatial window {P}x{P}, "
+            f"classes: {', '.join(names)}", ""]
+    if summary:
+        head.append(f"{'Model':<16}{'Mean acc':>10}{'Std':>8}{'OA':>8}{'AA':>8}{'Kappa':>8}")
+        for n, a, s, oa, aa, kp in summary:
+            head.append(f"{n:<16}{a:>10.2f}{s:>8.2f}{oa:>8.2f}{aa:>8.2f}{kp:>8.2f}")
+        head.append("")
+    if samples["n_conflict"]:
+        head.append(f"{samples['n_conflict']} pixels lie in ROIs of different classes and were excluded.\n")
+    if mode == "pixels":
+        head.append("Note: neighbouring pixels are highly correlated, so random-pixel folds over-estimate accuracy; "
+                    "'regions' or 'blocks' are stricter.\n")
+    return {"report": "\n".join(head + out_lines)}
+
+
+def clf_fig_compare(fig, results, ctx):
+    """Bar chart of OA / AA / kappa per model (test set, or validation / image when there is no test set) and the
+    Random Forest importance of each input component."""
+    labels = [r["name"] for r in results]
+    which = "test"
+    if all(r["test"] is None for r in results):
+        which = "val" if any(r["val"] is not None for r in results) else "hsi"
+    title = {"test": "Test set", "val": "Validation set", "hsi": "Complete image (labelled pixels)"}[which]
+    ax = fig.add_subplot(1, 2, 1)
+    x = np.arange(len(results))
+    w = 0.26
+    for j, (key, lab) in enumerate((("oa", "Overall"), ("aa", "Average"), ("kappa", "Kappa"))):
+        vals = [0.0 if r[which] is None else r[which][key] for r in results]
+        bars = ax.bar(x + (j - 1) * w, vals, w, label=lab)
+        for b_, v in zip(bars, vals):
+            ax.text(b_.get_x() + b_.get_width() / 2, v + 0.5, f"{v:.1f}", ha="center", va="bottom", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylim(0, 105)
+    ax.set_ylabel("%")
+    ax.set_title(title)
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax2 = fig.add_subplot(1, 2, 2)
+    rf = [r for r in results if r.get("importance") is not None]
+    if rf:
+        imp = rf[0]["importance"]
+        ax2.bar(np.arange(1, len(imp) + 1), imp * 100.0)
+        ax2.set_xlabel("Input component / band (after the feature transform)")
+        ax2.set_ylabel("Random Forest importance (%)")
+        ax2.set_title("Which inputs the forest used")
+    else:
+        ax2.bar(x, [r["times"]["train"] for r in results])
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels)
+        ax2.set_ylabel("Training time (s)")
+        ax2.set_title("Training time")
+    ax2.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+
+# ---- figures (take any matplotlib Figure so they work in dialogs and for PNG export)
+def seg_fig_split(fig, ctx, title_prefix=""):
+    cmap = "nipy_spectral"
+    panels = [("TrueMap", ctx["truth"], int((ctx["truth"] > 0).sum())), ("Train", ctx["train_img"], ctx["n_samples"][0]),
+              ("Validation", ctx["val_img"], ctx["n_samples"][1]), ("Test", ctx["test_img"], ctx["n_samples"][2])]
+    for i, (t, img, n) in enumerate(panels, 1):
+        ax = fig.add_subplot(1, 4, i)
+        ax.imshow(img, cmap=cmap, interpolation="nearest", vmin=0, vmax=max(1, len(ctx["names"])))
+        ax.set_title(f"{t}: {n}", fontsize=10, fontweight="bold")
+        ax.axis("off")
+    fig.tight_layout()
+
+
+def seg_fig_pred(fig, ctx, res):
+    cmap = "nipy_spectral"
+    rows, cols = ctx["rows"], ctx["cols"]
+    sidx, y = ctx["sample_idx"], ctx["sample_y"]
+    va, te = ctx["va"], ctx["te"]
+
+    def img(pos, pred):
+        a = np.zeros(rows * cols, dtype=np.int32)
+        a[sidx[pos]] = np.asarray(pred) + 1
+        return a.reshape(rows, cols)
+
+    full = np.where(ctx["truth"] > 0, res["full"] + 1, 0)         # as in the notebook: shown on labelled pixels
+    panels = [("Dis_Validation", img(va, res["va_pre"]), res["val"]), ("Dis_Test", img(te, res["te_pre"]), res["test"]),
+              ("Complete HSI", full, res["hsi"])]
+    for i, (t, a, m) in enumerate(panels, 1):
+        ax = fig.add_subplot(1, 3, i)
+        ax.imshow(a, cmap=cmap, interpolation="nearest", vmin=0, vmax=max(1, len(ctx["names"])))
+        ax.set_title(f"{t}: {m['kappa']:.2f}%" if m else f"{t}: n/a", fontsize=10, fontweight="bold")
+        ax.axis("off")
+    fig.suptitle(res["name"])
+    fig.tight_layout()
+
+
+def seg_fig_curves(fig, results):
+    axs = fig.subplots(1, 4)
+    keys = [("loss", "Training Loss", "-"), ("val_loss", "Validation Loss", "--"),
+            ("accuracy", "Training Accuracy", "-"), ("val_accuracy", "Validation Accuracy", "--")]
+    for ax, (key, title, ls) in zip(axs, keys):
+        for r in results:
+            if r["history"].get(key):
+                ax.plot(r["history"][key], label=r["name"], linestyle=ls)
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(True)
+    handles, labels = axs[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(9, len(labels)), frameon=False, fontsize=8)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+
+
+def seg_report_text(ctx, res):
+    names = ctx["names"]
+    t = res["times"]
+    if res.get("family") == "classical":
+        head = f"Model: {res['name']}    ({res.get('settings_text', '')})"
+        patch_txt = (f"Spatial window {ctx['WS']}x{ctx['WS']} (flattened)" if ctx["WS"] > 1 else "Pixel spectrum only")
+    else:
+        head = f"Model: {res['name']}    trainable parameters: {res['params']:,}"
+        patch_txt = f"Patch {ctx['WS']}x{ctx['WS']}"
+    lines = [head,
+             f"{patch_txt}, {ctx['k']} input components, settings: {res['settings']}",
+             f"Times (s): train {t['train']:.1f}  validate {t['val']:.2f}  test {t['test']:.2f}  "
+             f"classify {t['hsi']:.1f}  dimensionality reduction {t['dr']:.2f}", ""]
+    for label, key in (("VALIDATION", "val"), ("TEST", "test"), ("COMPLETE IMAGE (all labelled pixels)", "hsi")):
+        m = res[key]
+        lines.append("=" * 70)
+        lines.append(label)
+        if m is None:
+            lines.append("  (no samples)")
+            continue
+        lines.append(f"  Overall accuracy {m['oa']:.2f}%   Average accuracy {m['aa']:.2f}%   Kappa {m['kappa']:.2f}%")
+        lines.append("  Per-class accuracy (%): " + ", ".join(f"{n}: {v:.2f}" for n, v in zip(names, m["per_class"])))
+        lines.append("")
+        lines.append(m["report"])
+        lines.append("Confusion matrix (rows = true, columns = predicted):")
+        lines.append(np.array2string(m["confusion"], max_line_width=200))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def seg_write_csv(path, ctx, res):
+    """One CSV per model with the same entries as the notebook's CSVResults."""
+    t = res["times"]
+    v, e, h = res["val"], res["test"], res["hsi"]
+
+    def f(m, key):
+        return "n/a" if m is None else m[key]
+
+    rows_ = [
+        f"{t['train']} Tr_Time", f"{t['val']} Va_Time", f"{t['test']} Te_Time", f"{t['hsi']} HSI_Time",
+        f"{res['params']} Param",
+        f"{f(v, 'kappa')} Va Kappa (%)", f"{f(v, 'oa')} Va Overall (%)", f"{f(v, 'aa')} VA Average (%)",
+        f"{f(e, 'kappa')} Te Kappa (%)", f"{f(e, 'oa')} Te Overall (%)", f"{f(e, 'aa')} Te Average (%)",
+        f"{h['kappa']} HSI Kappa (%)", f"{h['oa']} HSI Overall (%)", f"{h['aa']} HSI Average (%)",
+        f"{None if v is None else v['per_class']} VA Per Class", f"{None if e is None else e['per_class']} Te Per Class",
+        f"{h['per_class']} HSI Per Class",
+        f"{None if v is None else v['report']} VA Classification", f"{None if v is None else v['confusion']} VA Confussion",
+        f"{None if e is None else e['report']} Te Classification", f"{None if e is None else e['confusion']} Te Confussion",
+        f"{h['report']} HSI Classification", f"{h['confusion']} HSI Confussion",
+    ]
+    with open(path, "w") as fh:
+        fh.write("\n".join(rows_) + "\n")
+
+
+def seg_export_all(folder, prefix, ctx, results, dpi=300):
+    """Samples table, split maps, per-model CSV + predicted maps, curves and a summary table."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    written = []
+    with open(folder / f"{prefix}_Samples.csv", "w") as f:
+        f.write("Class,Training,Validation,Test\n")
+        for n, a, b, c in ctx["table"]:
+            f.write(f"{n},{a},{b},{c}\n")
+    written.append(f"{prefix}_Samples.csv")
+
+    def save(fig, name):
+        FigureCanvasAgg(fig)
+        fig.savefig(folder / name, dpi=dpi, bbox_inches="tight", pad_inches=0)
+        written.append(name)
+
+    fig = Figure(figsize=(8, 8))
+    seg_fig_split(fig, ctx)
+    save(fig, f"{prefix}_Train_Test_Mask.png")
+    for r in results:
+        seg_write_csv(str(folder / f"{prefix}_Classification_Report_{r['name']}.csv"), ctx, r)
+        written.append(f"{prefix}_Classification_Report_{r['name']}.csv")
+        (folder / f"{prefix}_Report_{r['name']}.txt").write_text(seg_report_text(ctx, r))
+        written.append(f"{prefix}_Report_{r['name']}.txt")
+        fig = Figure(figsize=(8, 8))
+        seg_fig_pred(fig, ctx, r)
+        save(fig, f"{prefix}_Predicted_GTs_{r['name']}.png")
+    if results and results[0].get("family") == "classical":
+        fig = Figure(figsize=(14, 5))
+        clf_fig_compare(fig, results, ctx)
+        save(fig, f"{prefix}_model_comparison.png")
+    elif results:
+        fig = Figure(figsize=(20, 6))
+        seg_fig_curves(fig, results)
+        save(fig, f"{prefix}_acc_loss_curve_all_models.png")
+    if results:
+        with open(folder / f"{prefix}_summary.csv", "w") as f:
+            f.write("Model,Parameters,Train_s,Test_s,Classify_s,Val_OA,Val_AA,Val_Kappa,Test_OA,Test_AA,Test_Kappa,"
+                    "Image_OA,Image_AA,Image_Kappa\n")
+            for r in results:
+                def g(m, k):
+                    return "" if m is None else f"{m[k]:.2f}"
+                f.write(f"{r['name']},{r['params']},{r['times']['train']:.1f},{r['times']['test']:.2f},"
+                        f"{r['times']['hsi']:.1f},{g(r['val'], 'oa')},{g(r['val'], 'aa')},{g(r['val'], 'kappa')},"
+                        f"{g(r['test'], 'oa')},{g(r['test'], 'aa')},{g(r['test'], 'kappa')},"
+                        f"{g(r['hsi'], 'oa')},{g(r['hsi'], 'aa')},{g(r['hsi'], 'kappa')}\n")
+        written.append(f"{prefix}_summary.csv")
+    return written
 
 
 class WorkerSignals(QtCore.QObject):
@@ -3380,6 +5311,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(icon_path))
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {APP_SUBTITLE} | {APP_CREDIT}")
+        for _icon in (Path(__file__).with_name("ds3.ico"), Path(__file__).with_name("assets") / "ds3.ico"):
+            if _icon.exists():                                  # optional: icon file next to the script
+                self.setWindowIcon(QtGui.QIcon(str(_icon)))
+                break
         self.resize(1340, 760)
         self.setAcceptDrops(True)
         self.setMinimumSize(1100, 640)
@@ -3434,6 +5369,8 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.pca_explained_ratio = None
         self.pca_valid_mask = None
         self.pca_n_components = 0
+        self.pca_coeff = None
+        self.dr_result = None
 
         self.asd_library = []            # imported ASD field spectra (dicts from read_asd)
 
@@ -3959,10 +5896,16 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         comp_layout = QtWidgets.QHBoxLayout()
         comp_layout.addWidget(QtWidgets.QLabel("Compute first N PCs:"))
         self.spin_pca_n = QtWidgets.QSpinBox()
-        self.spin_pca_n.setMinimum(3)
-        self.spin_pca_n.setMaximum(20)
-        self.spin_pca_n.setValue(6)
+        self.spin_pca_n.setMinimum(1)
+        self.spin_pca_n.setMaximum(999)
+        self.spin_pca_n.setValue(10)
         comp_layout.addWidget(self.spin_pca_n)
+        comp_layout.addWidget(QtWidgets.QLabel("Method:"))
+        self.combo_pca_method = QtWidgets.QComboBox()
+        self.combo_pca_method.addItems(["SVD", "Eig"])
+        self.combo_pca_method.setToolTip("SVD: singular value decomposition of the centred data (default).\n"
+                                         "Eig: eigenvalue decomposition of the band covariance matrix.")
+        comp_layout.addWidget(self.combo_pca_method)
         pca_layout.addLayout(comp_layout)
         self.btn_compute_pca = QtWidgets.QPushButton("Compute PCA")
         self.btn_compute_pca.clicked.connect(self.on_compute_pca)
@@ -3983,11 +5926,84 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.btn_show_scree = QtWidgets.QPushButton("Show Scree Plot")
         self.btn_show_scree.clicked.connect(self.on_show_scree)
         pca_btns.addWidget(self.btn_show_scree, 1, 2)
+        self.btn_pca_input = QtWidgets.QPushButton("Show first 10 input bands")
+        self.btn_pca_input.clicked.connect(self.on_dr_show_input)
+        pca_btns.addWidget(self.btn_pca_input, 2, 0)
+        self.btn_pca_all = QtWidgets.QPushButton("Show all PCs [0,1]")
+        self.btn_pca_all.clicked.connect(self.on_pca_show_all)
+        pca_btns.addWidget(self.btn_pca_all, 2, 1)
+        self.btn_pca_coef = QtWidgets.QPushButton("PC coefficients plot")
+        self.btn_pca_coef.clicked.connect(self.on_pca_coefficients)
+        pca_btns.addWidget(self.btn_pca_coef, 2, 2)
+        self.btn_pca_save = QtWidgets.QPushButton("Save coefficients CSV...")
+        self.btn_pca_save.clicked.connect(self.on_pca_save_coefficients)
+        pca_btns.addWidget(self.btn_pca_save, 3, 0, 1, 2)
+        self.btn_pca_apply = QtWidgets.QPushButton("Replace cube with PCs")
+        self.btn_pca_apply.setToolTip("The active cube becomes the PC bands (reversible with Revert to original cube).")
+        self.btn_pca_apply.clicked.connect(self.on_pca_apply)
+        pca_btns.addWidget(self.btn_pca_apply, 3, 2)
         pca_layout.addLayout(pca_btns)
         self.pca_label = QtWidgets.QLabel("PCA: not computed")
         pca_layout.addWidget(self.pca_label)
-        tab4_layout.addWidget(pca_group)
-        self.tabs.addTab(tab4, "PCA")
+        tab4_layout.addWidget(pca_group, 1)
+        # ---- MNF (second column) ----
+        mnf_group = QtWidgets.QGroupBox("MNF (Maximum Noise Fraction)")
+        mnf_layout = QtWidgets.QVBoxLayout(mnf_group)
+        mnf_layout.setContentsMargins(8, 14, 8, 8)
+        mnf_layout.setSpacing(5)
+        form = QtWidgets.QGridLayout()
+        form.addWidget(QtWidgets.QLabel("Number of components:"), 0, 0)
+        self.spin_mnf_n = QtWidgets.QSpinBox()
+        self.spin_mnf_n.setRange(1, 999)
+        self.spin_mnf_n.setValue(10)
+        form.addWidget(self.spin_mnf_n, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Noise estimate:"), 1, 0)
+        self.combo_dr_noise = QtWidgets.QComboBox()
+        self.combo_dr_noise.addItems(list(MNF_NOISE_LAGS))
+        self.combo_dr_noise.setToolTip(
+            "Noise covariance = half the covariance of differences between neighbouring pixels "
+            "(horizontal neighbour, vertical neighbour, or both pooled). Green et al. 1988.")
+        form.addWidget(self.combo_dr_noise, 1, 1)
+        mnf_layout.addLayout(form)
+        self.btn_compute_mnf = QtWidgets.QPushButton("Compute MNF")
+        self.btn_compute_mnf.clicked.connect(self.on_compute_mnf)
+        mnf_layout.addWidget(self.btn_compute_mnf)
+        mb = QtWidgets.QGridLayout()
+        self.btn_dr_input = QtWidgets.QPushButton("Show first 10 input bands")
+        self.btn_dr_input.clicked.connect(self.on_dr_show_input)
+        mb.addWidget(self.btn_dr_input, 0, 0)
+        self.btn_dr_all = QtWidgets.QPushButton("Show all components [0,1]")
+        self.btn_dr_all.clicked.connect(self.on_dr_show_all)
+        mb.addWidget(self.btn_dr_all, 0, 1)
+        self.btn_mnf_rgb = QtWidgets.QPushButton("Show MNF RGB (1/2/3)")
+        self.btn_mnf_rgb.clicked.connect(self.on_show_mnf_rgb)
+        mb.addWidget(self.btn_mnf_rgb, 1, 0)
+        self.btn_mnf_plot = QtWidgets.QPushButton("Show noise-fraction plot")
+        self.btn_mnf_plot.clicked.connect(self.on_show_mnf_plot)
+        mb.addWidget(self.btn_mnf_plot, 1, 1)
+        self.btn_dr_coef = QtWidgets.QPushButton("Show / save coefficients")
+        self.btn_dr_coef.clicked.connect(self.on_dr_coefficients)
+        mb.addWidget(self.btn_dr_coef, 2, 0)
+        self.btn_dr_apply = QtWidgets.QPushButton("Replace cube with components")
+        self.btn_dr_apply.setToolTip("outputDataCube: the active cube becomes the MNF components "
+                                     "(reversible with Revert to original cube).")
+        self.btn_dr_apply.clicked.connect(self.on_dr_apply)
+        mb.addWidget(self.btn_dr_apply, 2, 1)
+        self.btn_dr_one = QtWidgets.QPushButton("Show MNF component #")
+        self.btn_dr_one.clicked.connect(lambda: self.on_show_mnf_pc(self.spin_dr_view.value() - 1))
+        mb.addWidget(self.btn_dr_one, 3, 0)
+        self.spin_dr_view = QtWidgets.QSpinBox()
+        self.spin_dr_view.setRange(1, 999)
+        mb.addWidget(self.spin_dr_view, 3, 1)
+        mnf_layout.addLayout(mb)
+        self.mnf_label = QtWidgets.QLabel("MNF: not computed")
+        self.mnf_label.setWordWrap(True)
+        mnf_layout.addWidget(self.mnf_label)
+        mnf_layout.addStretch(1)
+        for _g in (pca_group, mnf_group):
+            _g.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        tab4_layout.addWidget(mnf_group, 1)
+        self.tabs.addTab(tab4, "Dimensionality Reduction")
 
         # ---- Classification tab ----
         tab6 = QtWidgets.QWidget()
@@ -4015,119 +6031,467 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.btn_sam_angle.clicked.connect(self.on_show_sam_angle)
         sam_layout.addWidget(self.btn_sam_angle, 3, 0, 1, 2)
         sam_layout.setRowStretch(4, 1)
-        tab6_layout.addWidget(sam_group, 1)
 
-        sup_group = QtWidgets.QGroupBox("Supervised classification (labelled ROIs)")
-        sup_layout = QtWidgets.QGridLayout(sup_group)
-        sup_layout.addWidget(QtWidgets.QLabel("Classifier:"), 0, 0)
-        self.combo_clf = QtWidgets.QComboBox()
-        if SKLEARN_AVAILABLE:
-            self.combo_clf.addItems(list(CLASSIFIERS.keys()))
-        sup_layout.addWidget(self.combo_clf, 0, 1)
-        sup_layout.addWidget(QtWidgets.QLabel("Features:"), 1, 0)
-        self.combo_features = QtWidgets.QComboBox()
-        self.combo_features.addItems(["Full spectra", "PCA components (compute in PCA tab)"])
-        sup_layout.addWidget(self.combo_features, 1, 1)
-        sup_layout.addWidget(QtWidgets.QLabel("Validation split:"), 2, 0)
-        self.combo_split = QtWidgets.QComboBox()
-        self.combo_split.addItems(["Hold out whole ROIs", "Random pixels"])
-        sup_layout.addWidget(self.combo_split, 2, 1)
-        sup_layout.addWidget(QtWidgets.QLabel("Test fraction (%):"), 3, 0)
-        self.spin_test = QtWidgets.QSpinBox()
-        self.spin_test.setRange(0, 50)
-        self.spin_test.setValue(30)
-        sup_layout.addWidget(self.spin_test, 3, 1)
-        sup_layout.addWidget(QtWidgets.QLabel("Max pixels per class:"), 4, 0)
-        self.spin_max_pc = QtWidgets.QSpinBox()
-        self.spin_max_pc.setRange(100, 200000)
-        self.spin_max_pc.setSingleStep(500)
-        self.spin_max_pc.setValue(5000)
-        sup_layout.addWidget(self.spin_max_pc, 4, 1)
-        self.btn_train = QtWidgets.QPushButton("Train and classify image")
-        self.btn_train.clicked.connect(self.on_train_classifier)
-        sup_layout.addWidget(self.btn_train, 5, 0)
-        self.btn_report = QtWidgets.QPushButton("Show accuracy report")
-        self.btn_report.clicked.connect(self.on_show_report)
-        sup_layout.addWidget(self.btn_report, 5, 1)
-        sup_layout.addWidget(QtWidgets.QLabel("Cross-validation folds:"), 6, 0)
-        self.spin_cv_k = QtWidgets.QSpinBox()
-        self.spin_cv_k.setRange(2, 10)
-        self.spin_cv_k.setValue(5)
-        sup_layout.addWidget(self.spin_cv_k, 6, 1)
-        self.btn_cv = QtWidgets.QPushButton("Run k-fold cross-validation (accuracy only)")
-        self.btn_cv.clicked.connect(self.on_crossval)
-        sup_layout.addWidget(self.btn_cv, 7, 0, 1, 2)
-        if not SKLEARN_AVAILABLE:
-            sup_layout.addWidget(QtWidgets.QLabel(
-                "(scikit-learn not found - install it to enable this.)"
-            ), 8, 0, 1, 2)
-        tab6_layout.addWidget(sup_group, 1)
+        # Supervised classification: Random Forest / SVM with the same workflow as the Segmentation tab
+        self.clf_ctx = None
+        self.clf_results = []
+        self.clf_save_dir = None
+        right = QtWidgets.QVBoxLayout()
+        top6 = QtWidgets.QHBoxLayout()
+
+        c1 = QtWidgets.QGroupBox("1. Training labels")
+        lc1 = QtWidgets.QGridLayout(c1)
+        lc1.addWidget(QtWidgets.QLabel("Label source:"), 0, 0)
+        self.clf_source = QtWidgets.QComboBox()
+        self.clf_source.addItems(["ROIs drawn in this app", "Ground-truth file",
+                                  "Ground-truth file + ROIs (ROIs add / override classes)"])
+        self.clf_source.setToolTip("The same label sources as the Segmentation tab. The ground-truth file, its class "
+                                   "table and the 'unlabelled' value are shared with that tab.")
+        lc1.addWidget(self.clf_source, 0, 1)
+        self.btn_clf_gt = QtWidgets.QPushButton("Load ground-truth file...")
+        self.btn_clf_gt.clicked.connect(self.on_seg_load_gt)
+        lc1.addWidget(self.btn_clf_gt, 1, 0, 1, 2)
+        self.btn_clf_gt_edit = QtWidgets.QPushButton("Edit class names / unlabelled value...")
+        self.btn_clf_gt_edit.setToolTip("Opens the class table of the Segmentation tab (shared).")
+        self.btn_clf_gt_edit.clicked.connect(lambda: self.tabs.setCurrentWidget(self._seg_tab_wrap))
+        lc1.addWidget(self.btn_clf_gt_edit, 2, 0, 1, 2)
+        self.btn_clf_showgt = QtWidgets.QPushButton("Show ground-truth map")
+        self.btn_clf_showgt.clicked.connect(self.on_seg_show_gt)
+        lc1.addWidget(self.btn_clf_showgt, 3, 0, 1, 2)
+        self.clf_gt_label = QtWidgets.QLabel("No ground-truth file loaded.")
+        self.clf_gt_label.setWordWrap(True)
+        lc1.addWidget(self.clf_gt_label, 4, 0, 1, 2)
+        self.clf_roi_label = QtWidgets.QLabel("")
+        self.clf_roi_label.setWordWrap(True)
+        lc1.addWidget(self.clf_roi_label, 5, 0, 1, 2)
+        lc1.setRowStretch(6, 1)
+
+        mid6 = QtWidgets.QVBoxLayout()
+        c2 = QtWidgets.QGroupBox("2. Samples and split")
+        lc2 = QtWidgets.QGridLayout(c2)
+        lc2.addWidget(QtWidgets.QLabel("Split:"), 0, 0)
+        self.clf_split = QtWidgets.QComboBox()
+        for key, label in SEG_SPLIT_MODES:
+            self.clf_split.addItem(label, key)
+        self.clf_split.setCurrentIndex(1)
+        self.clf_split.setToolTip("Random pixels lets neighbouring pixels fall in both train and test (flatters accuracy).\n"
+                                  "Regions / blocks keep whole areas apart. 'ROIs = training' trains on the ROI pixels "
+                                  "and tests on the rest of the ground truth.")
+        lc2.addWidget(self.clf_split, 0, 1)
+        lc2.addWidget(QtWidgets.QLabel("Test samples (%):"), 1, 0)
+        self.clf_test = QtWidgets.QSpinBox()
+        self.clf_test.setRange(0, 95)
+        self.clf_test.setValue(30)
+        lc2.addWidget(self.clf_test, 1, 1)
+        lc2.addWidget(QtWidgets.QLabel("Validation (% of the rest):"), 2, 0)
+        self.clf_val = QtWidgets.QSpinBox()
+        self.clf_val.setRange(0, 95)
+        self.clf_val.setValue(0)
+        self.clf_val.setToolTip("Optional second hold-out set; 0 = none (random forests and SVMs need no validation set).")
+        lc2.addWidget(self.clf_val, 2, 1)
+        lc2.addWidget(QtWidgets.QLabel("Random seed:"), 3, 0)
+        self.clf_seed = QtWidgets.QSpinBox()
+        self.clf_seed.setRange(0, 99999)
+        self.clf_seed.setValue(42)
+        lc2.addWidget(self.clf_seed, 3, 1)
+        lc2.addWidget(QtWidgets.QLabel("Max training samples / class (0 = all):"), 4, 0)
+        self.clf_maxpc = QtWidgets.QSpinBox()
+        self.clf_maxpc.setRange(0, 1000000)
+        self.clf_maxpc.setSingleStep(500)
+        self.clf_maxpc.setValue(5000)
+        self.clf_maxpc.setToolTip("SVM training time grows roughly with the square of the sample count.")
+        lc2.addWidget(self.clf_maxpc, 4, 1)
+        lc2.addWidget(QtWidgets.QLabel("Block size (px, blocks mode):"), 5, 0)
+        self.clf_block = QtWidgets.QSpinBox()
+        self.clf_block.setRange(4, 2000)
+        self.clf_block.setValue(32)
+        lc2.addWidget(self.clf_block, 5, 1)
+        self.btn_clf_preview = QtWidgets.QPushButton("Preview split (maps + counts)")
+        self.btn_clf_preview.clicked.connect(lambda: self.on_seg_preview_split(True))
+        lc2.addWidget(self.btn_clf_preview, 6, 0, 1, 2)
+        mid6.addWidget(c2)
+        c3 = QtWidgets.QGroupBox("3. Model input")
+        lc3 = QtWidgets.QGridLayout(c3)
+        lc3.addWidget(QtWidgets.QLabel("Features:"), 0, 0)
+        self.clf_feat = QtWidgets.QComboBox()
+        for key, label in SEG_FEATURE_MODES:
+            self.clf_feat.addItem(label, key)
+        self.clf_feat.setCurrentIndex([k_ for k_, _ in SEG_FEATURE_MODES].index("full"))
+        lc3.addWidget(self.clf_feat, 0, 1)
+        lc3.addWidget(QtWidgets.QLabel("Components:"), 1, 0)
+        self.clf_k = QtWidgets.QSpinBox()
+        self.clf_k.setRange(1, 999)
+        self.clf_k.setValue(30)
+        self.clf_k.setToolTip("Number of PCA / MNF components (ignored for the full spectrum).")
+        lc3.addWidget(self.clf_k, 1, 1)
+        lc3.addWidget(QtWidgets.QLabel("Spatial window (px):"), 2, 0)
+        self.clf_ws = QtWidgets.QSpinBox()
+        self.clf_ws.setRange(1, 41)
+        self.clf_ws.setValue(1)
+        self.clf_ws.setToolTip("1 = classify each pixel from its own spectrum. Larger values flatten the window around "
+                               "the pixel into one feature vector (spectral-spatial); try 3 to 8 with PCA / MNF.")
+        lc3.addWidget(self.clf_ws, 2, 1)
+        mid6.addWidget(c3)
+        mid6.addStretch(1)
+
+        c4 = QtWidgets.QGroupBox("4. Models and training")
+        lc4 = QtWidgets.QGridLayout(c4)
+        self.clf_model_list = QtWidgets.QListWidget()
+        self.clf_model_list.setMaximumHeight(80)
+        for name, (desc, default) in CLASSICAL_MODEL_INFO.items():
+            it = QtWidgets.QListWidgetItem(name)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if default else QtCore.Qt.Unchecked)
+            it.setToolTip(desc)
+            self.clf_model_list.addItem(it)
+        lc4.addWidget(self.clf_model_list, 0, 0, 1, 4)
+        ball = QtWidgets.QPushButton("All")
+        ball.clicked.connect(lambda: self._clf_check_models(True))
+        lc4.addWidget(ball, 1, 0, 1, 2)
+        bnone = QtWidgets.QPushButton("None")
+        bnone.clicked.connect(lambda: self._clf_check_models(False))
+        lc4.addWidget(bnone, 1, 2, 1, 2)
+
+        def _spin(lo, hi, val, dec=0, step=1.0, tip=None):
+            w_ = QtWidgets.QDoubleSpinBox() if dec else QtWidgets.QSpinBox()
+            if dec:
+                w_.setDecimals(dec)
+            w_.setRange(lo, hi)
+            w_.setSingleStep(step if dec else int(step))
+            w_.setValue(val)
+            if tip:
+                w_.setToolTip(tip)
+            return w_
+        D = CLASSICAL_DEFAULTS
+        lc4.addWidget(QtWidgets.QLabel("Forest trees:"), 2, 0)
+        self.clf_rf_trees = _spin(1, 5000, D["rf_trees"])
+        lc4.addWidget(self.clf_rf_trees, 2, 1)
+        lc4.addWidget(QtWidgets.QLabel("Max depth:"), 2, 2)
+        self.clf_rf_depth = _spin(0, 200, D["rf_depth"], tip="0 = unlimited depth")
+        lc4.addWidget(self.clf_rf_depth, 2, 3)
+        lc4.addWidget(QtWidgets.QLabel("RBF  C:"), 3, 0)
+        self.clf_svm_c = _spin(1e-3, 1e6, D["svm_c"], 3, 1.0)
+        lc4.addWidget(self.clf_svm_c, 3, 1)
+        lc4.addWidget(QtWidgets.QLabel("Gamma (0=auto):"), 3, 2)
+        self.clf_svm_gamma = _spin(0.0, 1e3, D["svm_gamma"], 6, 0.001,
+                                   "0 uses scikit-learn's 'scale' (1 / (features x variance)). Used by both SVMs.")
+        lc4.addWidget(self.clf_svm_gamma, 3, 3)
+        lc4.addWidget(QtWidgets.QLabel("Poly degree:"), 4, 0)
+        self.clf_poly_degree = _spin(1, 10, D["poly_degree"])
+        lc4.addWidget(self.clf_poly_degree, 4, 1)
+        lc4.addWidget(QtWidgets.QLabel("C:"), 4, 2)
+        self.clf_poly_c = _spin(1e-3, 1e6, D["poly_c"], 3, 1.0)
+        lc4.addWidget(self.clf_poly_c, 4, 3)
+        lc4.addWidget(QtWidgets.QLabel("coef0:"), 5, 0)
+        self.clf_poly_coef0 = _spin(-100.0, 100.0, D["poly_coef0"], 3, 0.5)
+        lc4.addWidget(self.clf_poly_coef0, 5, 1)
+        self.clf_balanced = QtWidgets.QCheckBox("Balance classes")
+        self.clf_balanced.setChecked(D["balanced"])
+        self.clf_balanced.setToolTip("Weights classes inversely to their number of training samples.")
+        lc4.addWidget(self.clf_balanced, 5, 2, 1, 2)
+        lc4.addWidget(QtWidgets.QLabel("Classify:"), 6, 0)
+        self.clf_scope = QtWidgets.QComboBox()
+        self.clf_scope.addItems(["Whole image", "Labelled pixels only (faster)"])
+        lc4.addWidget(self.clf_scope, 6, 1, 1, 3)
+        self.btn_clf_savedir = QtWidgets.QPushButton("Save trained models to folder...")
+        self.btn_clf_savedir.clicked.connect(self.on_clf_choose_save_dir)
+        lc4.addWidget(self.btn_clf_savedir, 7, 0, 1, 3)
+        b_off = QtWidgets.QPushButton("Off")
+        b_off.setToolTip("Do not save trained models")
+        b_off.clicked.connect(lambda: self._clf_set_save_dir(None))
+        lc4.addWidget(b_off, 7, 3)
+        self.btn_clf_train = QtWidgets.QPushButton("Train selected models and classify")
+        self.btn_clf_train.clicked.connect(self.on_clf_train)
+        lc4.addWidget(self.btn_clf_train, 8, 0, 1, 4)
+        lc4.addWidget(QtWidgets.QLabel("Cross-validation folds:"), 9, 0, 1, 2)
+        self.clf_cv_k = _spin(2, 10, 5)
+        lc4.addWidget(self.clf_cv_k, 9, 2, 1, 2)
+        self.btn_clf_cv = QtWidgets.QPushButton("Run k-fold cross-validation (accuracy only)")
+        self.btn_clf_cv.clicked.connect(self.on_clf_crossval)
+        lc4.addWidget(self.btn_clf_cv, 10, 0, 1, 4)
+        note = ("Training runs in the background; 'Stop task' cancels between models and prediction steps "
+                "(a single model fit cannot be interrupted)." if SKLEARN_AVAILABLE else
+                "scikit-learn was not found - install it to enable this:  pip install scikit-learn")
+        nl = QtWidgets.QLabel(note)
+        nl.setWordWrap(True)
+        lc4.addWidget(nl, 11, 0, 1, 4)
+        lc4.setRowStretch(12, 1)
+
+        for g_ in (c1, c2, c3, c4):
+            g_.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        top6.addWidget(c1, 1)
+        top6.addLayout(mid6, 1)
+        top6.addWidget(c4, 1)
+        right.addLayout(top6)
+
+        c5 = QtWidgets.QGroupBox("Results")
+        lc5 = QtWidgets.QVBoxLayout(c5)
+        self.clf_table = QtWidgets.QTableWidget(0, 11)
+        self.clf_table.setHorizontalHeaderLabels(["Model", "Hyper-parameters", "Train (s)", "Val OA", "Val kappa",
+                                                  "Test OA", "Test AA", "Test kappa", "Image OA", "Image AA",
+                                                  "Image kappa"])
+        self.clf_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.clf_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.clf_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.clf_table.setMinimumHeight(110)
+        self.clf_table.horizontalHeader().setStretchLastSection(True)
+        lc5.addWidget(self.clf_table)
+        rb6 = QtWidgets.QGridLayout()
+        specs6 = [("Show map on image", self.on_clf_show_map), ("Report (val / test / image)", self.on_clf_show_report),
+                  ("Predicted maps (notebook figure)", self.on_clf_show_pred_maps),
+                  ("Compare models / importance", self.on_clf_show_compare), ("Split maps", self.on_clf_show_split),
+                  ("Export all results...", self.on_clf_export),
+                  ("Classify with a saved model...", self.on_clf_load_model)]
+        for i_, (txt, fn) in enumerate(specs6):
+            b_ = QtWidgets.QPushButton(txt)
+            b_.clicked.connect(fn)
+            rb6.addWidget(b_, i_ // 4, i_ % 4)
+        lc5.addLayout(rb6)
+        self.clf_err_label = QtWidgets.QLabel("")
+        self.clf_err_label.setWordWrap(True)
+        lc5.addWidget(self.clf_err_label)
+        right.addWidget(c5)
+        right.addStretch(1)
+        tab6_layout.addLayout(right, 1)
         self.tabs.addTab(self._scroll_wrap(tab6), "Classification")
 
-        # ---- 2D CNN tab ----
-        tab8 = QtWidgets.QWidget()
-        tab8_layout = QtWidgets.QHBoxLayout(tab8)
-        cnn_group = QtWidgets.QGroupBox("2D CNN on PCA patches (trained on labelled ROIs)")
-        cnn_layout = QtWidgets.QGridLayout(cnn_group)
-        cnn_layout.addWidget(QtWidgets.QLabel("PCA components (whitened):"), 0, 0)
-        self.spin_cnn_pca = QtWidgets.QSpinBox()
-        self.spin_cnn_pca.setRange(3, 100)
-        self.spin_cnn_pca.setValue(30)
-        cnn_layout.addWidget(self.spin_cnn_pca, 0, 1)
-        cnn_layout.addWidget(QtWidgets.QLabel("Patch size (odd):"), 1, 0)
-        self.spin_cnn_patch = QtWidgets.QSpinBox()
-        self.spin_cnn_patch.setRange(9, 31)
-        self.spin_cnn_patch.setSingleStep(2)
-        self.spin_cnn_patch.setValue(15)
-        cnn_layout.addWidget(self.spin_cnn_patch, 1, 1)
-        cnn_layout.addWidget(QtWidgets.QLabel("Epochs:"), 2, 0)
-        self.spin_cnn_epochs = QtWidgets.QSpinBox()
-        self.spin_cnn_epochs.setRange(1, 500)
-        self.spin_cnn_epochs.setValue(20)
-        cnn_layout.addWidget(self.spin_cnn_epochs, 2, 1)
-        cnn_layout.addWidget(QtWidgets.QLabel("Batch size:"), 3, 0)
-        self.spin_cnn_batch = QtWidgets.QSpinBox()
-        self.spin_cnn_batch.setRange(8, 1024)
-        self.spin_cnn_batch.setValue(64)
-        cnn_layout.addWidget(self.spin_cnn_batch, 3, 1)
-        cnn_layout.addWidget(QtWidgets.QLabel("Network:"), 4, 0)
-        self.combo_cnn_net = QtWidgets.QComboBox()
-        self.combo_cnn_net.addItems(["Reference (64-128-256-512)", "Compact (32-64-128, faster)"])
-        cnn_layout.addWidget(self.combo_cnn_net, 4, 1)
+        # ---- Spectral Matching tab (SAM) ----
+        tab_sm = QtWidgets.QWidget()
+        tab_sm_layout = QtWidgets.QHBoxLayout(tab_sm)
+        sam_group.setMaximumWidth(520)
+        tab_sm_layout.addWidget(sam_group, 0)
+        tab_sm_layout.addStretch(1)
+        self.tabs.addTab(self._scroll_wrap(tab_sm), "Spectral Matching")
 
-        cnn_layout.addWidget(QtWidgets.QLabel("Validation split:"), 0, 2)
-        self.combo_cnn_split = QtWidgets.QComboBox()
-        self.combo_cnn_split.addItems(["Hold out whole ROIs", "Random pixels"])
-        cnn_layout.addWidget(self.combo_cnn_split, 0, 3)
-        cnn_layout.addWidget(QtWidgets.QLabel("Test fraction (%):"), 1, 2)
-        self.spin_cnn_test = QtWidgets.QSpinBox()
-        self.spin_cnn_test.setRange(0, 50)
-        self.spin_cnn_test.setValue(30)
-        cnn_layout.addWidget(self.spin_cnn_test, 1, 3)
-        cnn_layout.addWidget(QtWidgets.QLabel("Max patches per class:"), 2, 2)
-        self.spin_cnn_maxpc = QtWidgets.QSpinBox()
-        self.spin_cnn_maxpc.setRange(100, 200000)
-        self.spin_cnn_maxpc.setSingleStep(500)
-        self.spin_cnn_maxpc.setValue(3000)
-        cnn_layout.addWidget(self.spin_cnn_maxpc, 2, 3)
-        cnn_layout.addWidget(QtWidgets.QLabel("Classify:"), 3, 2)
-        self.combo_cnn_scope = QtWidgets.QComboBox()
-        self.combo_cnn_scope.addItems(["Whole image (slow on large images)", "Labelled ROI pixels only"])
-        cnn_layout.addWidget(self.combo_cnn_scope, 3, 3)
-        self.btn_cnn = QtWidgets.QPushButton("Train 2D CNN and classify")
-        self.btn_cnn.clicked.connect(self.on_train_cnn)
-        cnn_layout.addWidget(self.btn_cnn, 4, 2)
-        self.btn_cnn_report = QtWidgets.QPushButton("Show report / training log")
-        self.btn_cnn_report.clicked.connect(self.on_show_report)
-        cnn_layout.addWidget(self.btn_cnn_report, 4, 3)
-        note = ("Needs TensorFlow (pip install tensorflow)." if not TF_AVAILABLE else
-                "Training runs in the background; use 'Stop task' (status bar) to cancel.")
-        cnn_note = QtWidgets.QLabel(note)
-        cnn_note.setWordWrap(True)
-        cnn_layout.addWidget(cnn_note, 5, 0, 1, 4)
-        cnn_layout.setRowStretch(6, 1)
-        tab8_layout.addWidget(cnn_group)
-        self.tabs.addTab(self._scroll_wrap(tab8), "2D CNN")
+        # ---- Segmentation tab (deep models of the Survey_2024 notebook; replaces the 2D CNN tab) ----
+        tab8 = QtWidgets.QWidget()
+        tab8_v = QtWidgets.QVBoxLayout(tab8)
+        tab8_v.setContentsMargins(8, 6, 8, 6)
+        top = QtWidgets.QHBoxLayout()
+        self.seg_gt = None                 # {path, labels, names{id: str}, include{id: bool}, background}
+        self.seg_ctx = None
+        self.seg_results = []
+        self.seg_save_dir = None
+        self._seg_table_busy = False
+
+        # -- 1. ground truth / labels
+        g1 = QtWidgets.QGroupBox("1. Ground truth / training labels")
+        l1 = QtWidgets.QGridLayout(g1)
+        l1.addWidget(QtWidgets.QLabel("Label source:"), 0, 0)
+        self.seg_source = QtWidgets.QComboBox()
+        self.seg_source.addItems(["ROIs drawn in this app", "Ground-truth file",
+                                  "Ground-truth file + ROIs (ROIs add / override classes)"])
+        self.seg_source.setToolTip("ROIs: drawn in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation. Ground-truth file: a label map with one class id "
+                                   "per pixel (.mat, .npy, .tif, .png, ENVI, HDF5, CSV ...).\n"
+                                   "Combined: classes come from the file, ROIs add or override labels by class name.")
+        l1.addWidget(self.seg_source, 0, 1, 1, 2)
+        self.btn_seg_gt = QtWidgets.QPushButton("Load ground-truth file...")
+        self.btn_seg_gt.clicked.connect(self.on_seg_load_gt)
+        l1.addWidget(self.btn_seg_gt, 1, 0, 1, 2)
+        self.btn_seg_names = QtWidgets.QPushButton("Names file...")
+        self.btn_seg_names.setToolTip("Text/CSV with 'id,name' lines (or one name per line).")
+        self.btn_seg_names.clicked.connect(self.on_seg_load_names)
+        l1.addWidget(self.btn_seg_names, 1, 2)
+        l1.addWidget(QtWidgets.QLabel("Unlabelled:"), 2, 0)
+        self.seg_bg = QtWidgets.QSpinBox()
+        self.seg_bg.setRange(-32768, 65535)
+        self.seg_bg.setValue(0)
+        self.seg_bg.setToolTip("Pixels with this value in the ground-truth file are not used as samples.")
+        self.seg_bg.valueChanged.connect(lambda *_: self._seg_fill_class_table())
+        l1.addWidget(self.seg_bg, 2, 1)
+        self.seg_gt_label = QtWidgets.QLabel("No ground-truth file loaded.")
+        self.seg_gt_label.setWordWrap(True)
+        l1.addWidget(self.seg_gt_label, 3, 0, 1, 3)
+        self.seg_class_table = QtWidgets.QTableWidget(0, 4)
+        self.seg_class_table.setHorizontalHeaderLabels(["Use", "ID", "Name (editable)", "Pixels"])
+        self.seg_class_table.verticalHeader().setVisible(False)
+        self.seg_class_table.setMinimumHeight(150)
+        self.seg_class_table.horizontalHeader().setStretchLastSection(True)
+        self.seg_class_table.itemChanged.connect(self._seg_table_changed)
+        l1.addWidget(self.seg_class_table, 4, 0, 1, 3)
+        self.btn_seg_showgt = QtWidgets.QPushButton("Show ground-truth map")
+        self.btn_seg_showgt.clicked.connect(self.on_seg_show_gt)
+        l1.addWidget(self.btn_seg_showgt, 5, 0, 1, 1)
+        self.btn_seg_gt2roi = QtWidgets.QPushButton("Import classes as ROIs")
+        self.btn_seg_gt2roi.setToolTip("Adds one ROI per class so SAM, ROI statistics and the other tabs can use the ground truth.")
+        self.btn_seg_gt2roi.clicked.connect(self.on_seg_gt_to_rois)
+        l1.addWidget(self.btn_seg_gt2roi, 5, 1, 1, 2)
+        self.seg_roi_label = QtWidgets.QLabel("")
+        self.seg_roi_label.setWordWrap(True)
+        l1.addWidget(self.seg_roi_label, 6, 0, 1, 3)
+        l1.setRowStretch(7, 1)
+
+        # -- 2 + 3. samples, split, features
+        mid = QtWidgets.QVBoxLayout()
+        g2 = QtWidgets.QGroupBox("2. Samples and split")
+        l2 = QtWidgets.QGridLayout(g2)
+        l2.addWidget(QtWidgets.QLabel("Split:"), 0, 0)
+        self.seg_split = QtWidgets.QComboBox()
+        for key, label in SEG_SPLIT_MODES:
+            self.seg_split.addItem(label, key)
+        self.seg_split.setToolTip(
+            "Random pixels reproduces the notebook (neighbouring pixels can land in train and test, which flatters accuracy).\n"
+            "Regions / blocks keep whole areas apart; 'ROIs = training' trains on ROI pixels and tests on the rest of the ground truth.")
+        l2.addWidget(self.seg_split, 0, 1)
+        l2.addWidget(QtWidgets.QLabel("Test samples (%):"), 1, 0)
+        self.seg_test = QtWidgets.QSpinBox()
+        self.seg_test.setRange(0, 95)
+        self.seg_test.setValue(50)
+        l2.addWidget(self.seg_test, 1, 1)
+        l2.addWidget(QtWidgets.QLabel("Validation (% of the rest):"), 2, 0)
+        self.seg_val = QtWidgets.QSpinBox()
+        self.seg_val.setRange(0, 95)
+        self.seg_val.setValue(50)
+        l2.addWidget(self.seg_val, 2, 1)
+        l2.addWidget(QtWidgets.QLabel("Random seed:"), 3, 0)
+        self.seg_seed = QtWidgets.QSpinBox()
+        self.seg_seed.setRange(0, 99999)
+        self.seg_seed.setValue(42)
+        l2.addWidget(self.seg_seed, 3, 1)
+        l2.addWidget(QtWidgets.QLabel("Max training samples / class (0 = all):"), 4, 0)
+        self.seg_maxpc = QtWidgets.QSpinBox()
+        self.seg_maxpc.setRange(0, 1000000)
+        self.seg_maxpc.setSingleStep(500)
+        l2.addWidget(self.seg_maxpc, 4, 1)
+        l2.addWidget(QtWidgets.QLabel("Block size (px, blocks mode):"), 5, 0)
+        self.seg_block = QtWidgets.QSpinBox()
+        self.seg_block.setRange(4, 2000)
+        self.seg_block.setValue(32)
+        l2.addWidget(self.seg_block, 5, 1)
+        self.btn_seg_preview = QtWidgets.QPushButton("Preview split (maps + counts)")
+        self.btn_seg_preview.clicked.connect(self.on_seg_preview_split)
+        l2.addWidget(self.btn_seg_preview, 6, 0, 1, 2)
+        mid.addWidget(g2)
+        g3 = QtWidgets.QGroupBox("3. Model input")
+        l3 = QtWidgets.QGridLayout(g3)
+        l3.addWidget(QtWidgets.QLabel("Features:"), 0, 0)
+        self.seg_feat = QtWidgets.QComboBox()
+        for key, label in SEG_FEATURE_MODES:
+            self.seg_feat.addItem(label, key)
+        l3.addWidget(self.seg_feat, 0, 1)
+        l3.addWidget(QtWidgets.QLabel("Components:"), 1, 0)
+        self.seg_k = QtWidgets.QSpinBox()
+        self.seg_k.setRange(1, 999)
+        self.seg_k.setValue(15)
+        self.seg_k.setToolTip("Number of PCA / MNF components fed to the networks (ignored for the full spectrum).")
+        l3.addWidget(self.seg_k, 1, 1)
+        l3.addWidget(QtWidgets.QLabel("Patch size (px):"), 2, 0)
+        self.seg_ws = QtWidgets.QSpinBox()
+        self.seg_ws.setRange(3, 41)
+        self.seg_ws.setValue(8)
+        self.seg_ws.setToolTip("Spatial window around each pixel. The notebook uses 8 (AttentionGCN needs exactly 8).")
+        l3.addWidget(self.seg_ws, 2, 1)
+        mid.addWidget(g3)
+        mid.addStretch(1)
+
+        # -- 4. models and training
+        g4 = QtWidgets.QGroupBox("4. Models and training")
+        l4 = QtWidgets.QGridLayout(g4)
+        self.seg_model_list = QtWidgets.QListWidget()
+        self.seg_model_list.setMinimumHeight(190)
+        self._seg_model_info = {}
+        try:
+            reg_desc = SEG_MODEL_INFO
+        except NameError:
+            reg_desc = {}
+        for name, (desc, default) in SEG_MODEL_INFO.items():
+            it = QtWidgets.QListWidgetItem(name)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if default else QtCore.Qt.Unchecked)
+            it.setToolTip(desc)
+            self.seg_model_list.addItem(it)
+        l4.addWidget(self.seg_model_list, 0, 0, 1, 4)
+        for col, (txt, fn) in enumerate((("All", lambda: self._seg_check_models("all")),
+                                         ("None", lambda: self._seg_check_models("none")),
+                                         ("Notebook", lambda: self._seg_check_models("notebook")),
+                                         ("Fast ones", lambda: self._seg_check_models("fast")))):
+            b_ = QtWidgets.QPushButton(txt)
+            b_.clicked.connect(fn)
+            l4.addWidget(b_, 1, col)
+        l4.addWidget(QtWidgets.QLabel("Epochs:"), 2, 0)
+        self.seg_epochs = QtWidgets.QSpinBox()
+        self.seg_epochs.setRange(1, 2000)
+        self.seg_epochs.setValue(100)
+        l4.addWidget(self.seg_epochs, 2, 1)
+        l4.addWidget(QtWidgets.QLabel("Batch size:"), 2, 2)
+        self.seg_batch = QtWidgets.QSpinBox()
+        self.seg_batch.setRange(1, 4096)
+        self.seg_batch.setValue(56)
+        l4.addWidget(self.seg_batch, 2, 3)
+        l4.addWidget(QtWidgets.QLabel("Learning rate:"), 3, 0)
+        self.seg_lr = QtWidgets.QDoubleSpinBox()
+        self.seg_lr.setDecimals(6)
+        self.seg_lr.setRange(1e-6, 1.0)
+        self.seg_lr.setSingleStep(1e-4)
+        self.seg_lr.setValue(1e-4)
+        l4.addWidget(self.seg_lr, 3, 1)
+        l4.addWidget(QtWidgets.QLabel("LR decay:"), 3, 2)
+        self.seg_decay = QtWidgets.QDoubleSpinBox()
+        self.seg_decay.setDecimals(8)
+        self.seg_decay.setRange(0.0, 1.0)
+        self.seg_decay.setSingleStep(1e-6)
+        self.seg_decay.setValue(1e-6)
+        l4.addWidget(self.seg_decay, 3, 3)
+        l4.addWidget(QtWidgets.QLabel("Classify:"), 4, 0)
+        self.seg_scope = QtWidgets.QComboBox()
+        self.seg_scope.addItems(["Whole image", "Labelled pixels only (faster)"])
+        l4.addWidget(self.seg_scope, 4, 1, 1, 3)
+        self.btn_seg_savedir = QtWidgets.QPushButton("Save trained models to folder...")
+        self.btn_seg_savedir.clicked.connect(self.on_seg_choose_save_dir)
+        l4.addWidget(self.btn_seg_savedir, 5, 0, 1, 3)
+        self.btn_seg_nosave = QtWidgets.QPushButton("Off")
+        self.btn_seg_nosave.setToolTip("Do not save trained models")
+        self.btn_seg_nosave.clicked.connect(lambda: self._seg_set_save_dir(None))
+        l4.addWidget(self.btn_seg_nosave, 5, 3)
+        self.btn_seg_train = QtWidgets.QPushButton("Train selected models")
+        self.btn_seg_train.clicked.connect(self.on_seg_train)
+        l4.addWidget(self.btn_seg_train, 6, 0, 1, 4)
+        tf_note = ("TensorFlow was not found. Install it to train models:  pip install tensorflow  "
+                   "(plus  pip install tf-keras keras_cv_attention_models  for AttentionGCN)."
+                   if not TF_AVAILABLE else
+                   "Training runs in the background; 'Stop task' in the status bar cancels after the current batch.")
+        self.seg_tf_label = QtWidgets.QLabel(tf_note)
+        self.seg_tf_label.setWordWrap(True)
+        l4.addWidget(self.seg_tf_label, 7, 0, 1, 4)
+        l4.setRowStretch(8, 1)
+
+        for g_ in (g1, g4):
+            g_.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        top.addWidget(g1, 1)
+        top.addLayout(mid, 1)
+        top.addWidget(g4, 1)
+        tab8_v.addLayout(top)
+
+        # -- results
+        g5 = QtWidgets.QGroupBox("Results")
+        l5 = QtWidgets.QVBoxLayout(g5)
+        self.seg_table = QtWidgets.QTableWidget(0, 11)
+        self.seg_table.setHorizontalHeaderLabels(["Model", "Parameters", "Train (s)", "Val OA", "Val kappa", "Test OA",
+                                                  "Test AA", "Test kappa", "Image OA", "Image AA", "Image kappa"])
+        self.seg_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.seg_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.seg_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.seg_table.setMinimumHeight(130)
+        self.seg_table.horizontalHeader().setStretchLastSection(True)
+        l5.addWidget(self.seg_table)
+        rb = QtWidgets.QGridLayout()
+        specs = [("Show map on image", self.on_seg_show_map), ("Report (val / test / image)", self.on_seg_show_report),
+                 ("Predicted maps (notebook figure)", self.on_seg_show_pred_maps),
+                 ("Accuracy & loss curves", self.on_seg_show_curves), ("Split maps", self.on_seg_show_split),
+                 ("Export all results...", self.on_seg_export), ("Classify with a saved model...", self.on_seg_load_model)]
+        for i_, (txt, fn) in enumerate(specs):
+            b_ = QtWidgets.QPushButton(txt)
+            b_.clicked.connect(fn)
+            rb.addWidget(b_, i_ // 4, i_ % 4)
+        l5.addLayout(rb)
+        self.seg_err_label = QtWidgets.QLabel("")
+        self.seg_err_label.setWordWrap(True)
+        l5.addWidget(self.seg_err_label)
+        tab8_v.addWidget(g5)
+        tab8_v.addStretch(1)
+        self._seg_tab_wrap = self._scroll_wrap(tab8)
+        self.tabs.addTab(self._seg_tab_wrap, "Segmentation")
+        self.tabs.currentChanged.connect(lambda *_: self._clf_sync_labels())
 
         # ---- Band Management: three compact side-by-side columns ----
         band_tab = QtWidgets.QWidget()
@@ -4420,7 +6784,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.btn_el_plot_refs.setEnabled(False)
         self.btn_el_plot_refs.clicked.connect(self.on_el_plot_references)
         lay.addWidget(self.btn_el_plot_refs)
-        self.el_status_label = info_label("Load ROIs of the reference targets (Tools ▸ Get ROIs from Data Aggregation), then add their field spectra.")
+        self.el_status_label = info_label("Draw ROIs on the reference targets in Data Aggregation, Tools ▸ Get ROIs from Data Aggregation, then add their field spectra.")
         lay.addWidget(self.el_status_label)
         lay.addStretch(1)
 
@@ -4776,8 +7140,9 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.image_canvas.mpl_connect("button_press_event", self.on_image_click)
         self.image_canvas.after_clear = self._on_canvas_cleared
 
-        self._busy_buttons = [self.btn_train, self.btn_cv, self.btn_cnn, self.btn_sam, self.btn_nmf,
-                              self.btn_ngmeet]
+        self._busy_buttons = [self.btn_clf_train, self.btn_clf_cv, self.btn_clf_gt, self.btn_clf_preview,
+                              self.btn_seg_train, self.btn_seg_gt, self.btn_seg_preview,
+                              self.btn_sam, self.btn_nmf, self.btn_ngmeet]
         self.btn_stop = QtWidgets.QPushButton("Stop task")
         self.btn_stop.setVisible(False)
         self.btn_stop.clicked.connect(self.on_stop_task)
@@ -4874,7 +7239,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             "NumPy, FITS and GDAL rasters), spectra plotting, RGB composites, "
             "rectangle and polygon ROIs, anomaly maps, band math, k-means, "
             "linear and NMF unmixing, PCA, Spectral Angle Mapper, random forest / SVM "
-            "classification with cross-validation, a 2D CNN, and signal-to-noise analysis. "
+            "classification with cross-validation, deep segmentation models trained on ROIs or a ground-truth map, and signal-to-noise analysis. "
             "Data correction: radiometric calibration, atmospheric correction (empirical line, dark pixel "
             "subtraction, flat field, IARR) and NGmeet denoising, with a processing history and "
             "revert to the original cube."
@@ -6220,12 +8585,12 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         if choice == 1:
             if self.pending_sel is None or self.pending_sel["mask"].shape != shape:
                 QtWidgets.QMessageBox.information(self, "No selection",
-                                                  "Load ROIs first (draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation).")
+                                                  "No ROIs yet: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
                 return None
             return [("Current selection", self.pending_sel["mask"])]
         rois = [r for r in self.rois if r["mask"].shape == shape]
         if not rois:
-            QtWidgets.QMessageBox.information(self, "No saved ROIs", "Load at least one ROI first (draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation).")
+            QtWidgets.QMessageBox.information(self, "No saved ROIs", "No ROIs yet: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
             return None
         if choice == 2:
             return [(f"{r['name']} ({r['class']})", r["mask"]) for r in rois]
@@ -6557,7 +8922,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.pca_explained_ratio = None
         self.pca_valid_mask = None
         self.pca_n_components = 0
+        self.pca_coeff = None
+        self.dr_result = None
         self.pca_label.setText("PCA: not computed")
+        self.mnf_label.setText("MNF: not computed")
 
         self._update_band_management_range()
         self._band_removal_plot_data = None
@@ -6574,6 +8942,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self._prep_refresh_info()
 
         name = Path(path).name
+        self.cube_name = Path(path).stem
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {name} | {APP_CREDIT}")
         ds = f", dataset '{result['dataset']}'" if result.get("dataset") else ""
         if self.wavelengths is not None and len(self.wavelengths):
@@ -6978,7 +9347,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.pca_explained_ratio = None
         self.pca_valid_mask = None
         self.pca_n_components = 0
+        self.pca_coeff = None
+        self.dr_result = None
         self.pca_label.setText("PCA: not computed")
+        self.mnf_label.setText("MNF: not computed")
         self.nmf_abundance = None
         self.nmf_endmembers = None
         self.nmf_band_range = None
@@ -7022,7 +9394,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.pca_explained_ratio = None
         self.pca_valid_mask = None
         self.pca_n_components = 0
+        self.pca_coeff = None
+        self.dr_result = None
         self.pca_label.setText("PCA: not computed")
+        self.mnf_label.setText("MNF: not computed")
         self.nmf_abundance = None
         self.nmf_endmembers = None
         self.nmf_band_range = None
@@ -7302,7 +9677,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
 
     @staticmethod
     def _outline_artist(kind, rect, vertices, color, lw, ls="-"):
-        if kind == "rect":
+        if kind in ("rect", "mask"):
             ymin, ymax, xmin, xmax = rect
             return patches.Rectangle(
                 (xmin - 0.5, ymin - 0.5), (xmax - xmin + 1), (ymax - ymin + 1),
@@ -7751,6 +10126,8 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             item = {"name": roi["name"], "class": roi["class"], "kind": roi["kind"]}
             if roi["kind"] == "rect":
                 item["rect"] = [int(v) for v in roi["rect"]]
+            elif roi["kind"] == "mask":
+                item["mask_indices"] = np.flatnonzero(roi["mask"].ravel()).tolist()
             else:
                 item["vertices"] = [[float(x), float(y)] for x, y in roi["vertices"]]
             data["rois"].append(item)
@@ -7803,6 +10180,15 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
                         continue
                     mask = rect_mask(ymin, ymax, xmin, xmax, rows, cols)
                     roi = {"rect": (ymin, ymax, xmin, xmax)}
+                elif item["kind"] == "mask":
+                    ids = np.asarray(item["mask_indices"], dtype=np.int64)
+                    ids = ids[(ids >= 0) & (ids < rows * cols)]
+                    mask = np.zeros(rows * cols, dtype=bool)
+                    mask[ids] = True
+                    mask = mask.reshape(rows, cols)
+                    roi = {}
+                    if mask.any():
+                        roi["rect"] = self._bbox_of(mask)
                 else:
                     verts = [(float(x), float(y)) for x, y in item["vertices"]]
                     mask = polygon_mask(verts, rows, cols)
@@ -8057,7 +10443,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
 
             else:
                 if self.pca_scores is None or self.pca_n_components < 3:
-                    raise RuntimeError("Compute PCA first; need at least 3 PCs for PCA clustering.")
+                    raise RuntimeError("Compute PCA first (Dimensionality Reduction tab); need at least 3 PCs for PCA clustering.")
 
                 rows, cols, _ = self.pca_scores.shape
                 pca_flat = self.pca_scores[:, :, :3].reshape(-1, 3).astype(float)
@@ -8160,7 +10546,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
-    def compute_pca(self, n_components):
+    def compute_pca(self, n_components, method="SVD"):
         if self.cube is None:
             raise RuntimeError("No cube loaded")
 
@@ -8191,14 +10577,26 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         if max_comp < 1:
             raise RuntimeError("Not enough valid data for PCA.")
 
-        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-        scores_valid = Xc @ Vt[:max_comp].T
-
-        denom = np.sum(S**2)
-        if denom > 0:
-            explained_ratio = (S[:max_comp]**2) / denom
+        if str(method).lower() == "eig":
+            cov = (Xc.T @ Xc) / max(Xc.shape[0] - 1, 1)
+            w, V = np.linalg.eigh((cov + cov.T) / 2.0)
+            order = np.argsort(w)[::-1]
+            w, V = np.maximum(w[order], 0.0), V[:, order]
+            comps = V[:, :max_comp]
+            denom = np.sum(w)
+            explained_ratio = (w[:max_comp] / denom) if denom > 0 else np.zeros(max_comp, dtype=float)
         else:
-            explained_ratio = np.zeros(max_comp, dtype=float)
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            comps = Vt[:max_comp].T
+            denom = np.sum(S**2)
+            if denom > 0:
+                explained_ratio = (S[:max_comp]**2) / denom
+            else:
+                explained_ratio = np.zeros(max_comp, dtype=float)
+        # deterministic sign (largest coefficient positive) so SVD and Eig agree
+        sg = np.sign(comps[np.argmax(np.abs(comps), axis=0), np.arange(comps.shape[1])])
+        comps = comps * np.where(sg == 0, 1.0, sg)
+        scores_valid = Xc @ comps
 
         scores_full = np.zeros((data.shape[0], max_comp), dtype=float)
         scores_full[valid_px, :] = scores_valid
@@ -8208,6 +10606,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.pca_explained_ratio = explained_ratio
         self.pca_valid_mask = valid_px
         self.pca_n_components = max_comp
+        self.pca_coeff = comps                       # (bands used, components)
+        self.pca_mean = mean_vec.ravel()
+        self.pca_band_index = np.flatnonzero(valid_band_mask)
+        self.pca_method = "Eig" if str(method).lower() == "eig" else "SVD"
 
     def on_compute_pca(self):
         if self.cube is None:
@@ -8218,9 +10620,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.info_label.setText(f"Computing first {n_components} principal components...")
-            self.compute_pca(n_components)
-            self.pca_label.setText(f"PCA: computed {self.pca_n_components} components")
+            self.info_label.setText(f"Computing first {n_components} principal components ({self.combo_pca_method.currentText()})...")
+            self.compute_pca(n_components, self.combo_pca_method.currentText())
+            self.spin_pca_n.setValue(self.pca_n_components)
+            self.pca_label.setText(f"PCA ({self.pca_method}): computed {self.pca_n_components} components")
 
             if self.pca_explained_ratio is not None and self.pca_explained_ratio.size >= 3:
                 var3 = 100.0 * np.sum(self.pca_explained_ratio[:3])
@@ -8302,6 +10705,277 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             "Showing scree plot: each bar is the percent variance explained by that principal component."
         )
 
+    def on_compute_mnf(self):
+        """Compute MNF components (background job); PCA state is left untouched."""
+        if self._busy:
+            return
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        k = int(self.spin_mnf_n.value())
+        lag = self.combo_dr_noise.currentText()
+        nb = self.cube.shape[2]
+        if k >= nb:
+            QtWidgets.QMessageBox.warning(
+                self, "Too many components",
+                f"For dimensionality reduction with MNF the number of components must be less than the "
+                f"number of spectral bands ({nb}).")
+            return
+        cube = self.cube
+
+        def job(progress, cancel):
+            return dimred_transform(cube, "MNF", k, lag, progress=progress, cancel=cancel)
+
+        def done(res):
+            self.dr_result = res
+            self.spin_dr_view.setMaximum(res["scores"].shape[2])
+            nf = res["noise_fraction"]
+            msg = f"MNF: {len(nf)} components, noise fraction {nf[0]:.3f} (1) to {nf[-1]:.3f} ({len(nf)})."
+            self.mnf_label.setText(msg)
+            self.info_label.setText(msg)
+            self.on_dr_show_all()
+        self._start_job(job, done, f"Computing {k} MNF components...")
+
+    def _mnf_ready(self):
+        if self.dr_result is None:
+            QtWidgets.QMessageBox.information(self, "MNF not ready", "Compute MNF first.")
+            return False
+        return True
+
+    def on_show_mnf_pc(self, i):
+        if not self._mnf_ready():
+            return
+        sc = self.dr_result["scores"]
+        if i < 0 or i >= sc.shape[2]:
+            QtWidgets.QMessageBox.information(self, "Not available", f"Only {sc.shape[2]} MNF components were computed.")
+            return
+        self.image_canvas.show_image(rescale01(sc[:, :, i]))
+        self.band_label.setText(f"MNF{i + 1}")
+        self.info_label.setText(f"Showing MNF component {i + 1} (noise fraction "
+                                f"{self.dr_result['noise_fraction'][i]:.3f}, rescaled to [0, 1]).")
+        self._draw_roi_patch()
+
+    def on_show_mnf_rgb(self):
+        if not self._mnf_ready():
+            return
+        sc = self.dr_result["scores"]
+        if sc.shape[2] < 3:
+            QtWidgets.QMessageBox.information(self, "Not enough components", "Need at least 3 MNF components.")
+            return
+        self.image_canvas.show_image(np.dstack([rescale01(sc[:, :, i]) for i in range(3)]))
+        self.band_label.setText("MNF RGB (MNF1 / MNF2 / MNF3)")
+        self.info_label.setText("Showing MNF RGB composite of the first three components.")
+        self._draw_roi_patch()
+
+    def on_show_mnf_plot(self):
+        if not self._mnf_ready():
+            return
+        y = self.dr_result["noise_fraction"]
+        self.plot_canvas.show_barplot(np.arange(1, len(y) + 1), y, title="MNF noise fraction",
+                                      xlabel="MNF component", ylabel="Noise fraction (0 = clean, 1 = noise)")
+        self.info_label.setText("Noise fraction of each MNF component; low = high image quality, ordered best first.")
+
+    def on_dr_show_input(self):
+        """Display the first 10 spectral bands of the input data cube."""
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        cube = self.cube
+        n = min(10, cube.shape[2])
+        wl = self.wavelengths
+
+        def build(fig):
+            cols = 5
+            rws = int(np.ceil(n / cols))
+            for i in range(n):
+                ax = fig.add_subplot(rws, cols, i + 1)
+                ax.imshow(self.robust_normalize(cube[:, :, i]), cmap="gray", vmin=0, vmax=1)
+                lab = f"Band {i + 1}" + (f" ({wl[i]:.0f} nm)" if wl is not None and len(wl) > i else "")
+                ax.set_title(lab, fontsize=8)
+                ax.axis("off")
+            fig.suptitle(f"First {n} spectral bands of the input data cube")
+        self._show_figure_dialog("Input data cube - first bands", build, size=(11, 3.2 * int(np.ceil(n / 5)) + 0.6))
+
+    def on_dr_show_all(self):
+        """Montage of every computed component, each rescaled to [0, 1]."""
+        if self.dr_result is None:
+            QtWidgets.QMessageBox.information(self, "MNF not ready", "Compute MNF first.")
+            return
+        sc = self.dr_result["scores"]
+        method, pre = "MNF", "MNF"
+        k = sc.shape[2]
+        extra = (self.dr_result["noise_fraction"])
+
+        def build(fig):
+            cols = min(5, k)
+            rws = int(np.ceil(k / cols))
+            for i in range(k):
+                ax = fig.add_subplot(rws, cols, i + 1)
+                ax.imshow(rescale01(sc[:, :, i]), cmap="gray", vmin=0, vmax=1)
+                ax.set_title(f"{pre}{i + 1}  " + (f"NF {extra[i]:.3f}" if method == "MNF" else f"{extra[i]:.1f}%"),
+                             fontsize=8)
+                ax.axis("off")
+            order = ("decreasing image quality (increasing noise fraction)" if method == "MNF"
+                     else "decreasing variance")
+            fig.suptitle(f"{method} components rescaled to [0, 1] - ordered by {order}")
+        cols = min(5, k)
+        self._show_figure_dialog(f"{method} components", build,
+                                 size=(2.4 * cols + 1, 2.5 * int(np.ceil(k / cols)) + 0.8))
+
+    def on_dr_coefficients(self):
+        """Show the transformation coefficients and optionally save them as CSV."""
+        r = self.dr_result
+        if r is None:
+            QtWidgets.QMessageBox.information(self, "Not ready", "Compute the components first.")
+            return
+        method, pre = "MNF", "MNF"
+        A = r["coefficients"]
+        bidx = r["band_index"]
+        k = A.shape[1]
+        head = ["band"] + [f"{pre}{i + 1}" for i in range(k)]
+        rows_txt = [",".join(head)]
+        for i, b in enumerate(bidx):
+            rows_txt.append(",".join([str(int(b) + 1)] + [f"{v:.6g}" for v in A[i]]))
+        rows_txt.append(",".join(["mean"] + [""] * k))
+        csv = "\n".join(rows_txt)
+        mean_line = "mean_spectrum," + ",".join(f"{v:.6g}" for v in r["mean"])
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"{method} transformation coefficients (bands x components)")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel(
+            f"Y = (Z - mean) x A  -  A is {A.shape[0]} bands x {k} components. Columns are the "
+            f"{method} vectors (unit length); the mean spectrum is saved in the CSV."))
+        box = QtWidgets.QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        box.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        box.setPlainText("\n".join(rows_txt[:-1]))
+        lay.addWidget(box)
+        bl = QtWidgets.QHBoxLayout()
+        bsave = QtWidgets.QPushButton("Save CSV...")
+        bclose = QtWidgets.QPushButton("Close")
+        bl.addStretch(1)
+        bl.addWidget(bsave)
+        bl.addWidget(bclose)
+        lay.addLayout(bl)
+        bclose.clicked.connect(dlg.accept)
+
+        def save():
+            fn, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, "Save coefficients", f"{method.lower()}_coefficients.csv",
+                                                          "CSV (*.csv)")
+            if fn:
+                with open(fn, "w") as f:
+                    f.write("\n".join(rows_txt[:-1]) + "\n" + mean_line + "\n")
+        bsave.clicked.connect(save)
+        dlg.resize(760, 520)
+        dlg.exec_()
+
+    def on_dr_apply(self):
+        """outputDataCube: replace the active cube by the computed components."""
+        r = self.dr_result
+        if r is None or self.cube is None:
+            QtWidgets.QMessageBox.information(self, "Not ready", "Compute the components first.")
+            return
+        if r["scores"].shape[:2] != self.cube.shape[:2]:
+            QtWidgets.QMessageBox.warning(self, "Out of date",
+                                          "The components no longer match the active cube; recompute them.")
+            return
+        method, pre = "MNF", "MNF"
+        k = r["scores"].shape[2]
+        self._commit_cube(r["scores"].astype(np.float32), None,
+                          f"{method} dimensionality reduction ({k} components)",
+                          {"method": method, "components": k,
+                           **({"noise_estimate": r["noise_lag"]} if method == "MNF" else {})})
+        self.info_label.setText(f"The active cube is now the {k} {method} components (output data cube).")
+
+    def _pca_ready(self):
+        if self.pca_scores is None or getattr(self, "pca_coeff", None) is None:
+            QtWidgets.QMessageBox.information(self, "PCA not ready", "Compute PCA first.")
+            return False
+        return True
+
+    def on_pca_show_all(self):
+        """Montage of all principal component bands, each rescaled to [0, 1]."""
+        if not self._pca_ready():
+            return
+        sc = self.pca_scores
+        k = sc.shape[2]
+        var = 100.0 * np.asarray(self.pca_explained_ratio)
+
+        def build(fig):
+            cols = min(5, k)
+            rws = int(np.ceil(k / cols))
+            for i in range(k):
+                ax = fig.add_subplot(rws, cols, i + 1)
+                ax.imshow(rescale01(sc[:, :, i]), cmap="gray", vmin=0, vmax=1)
+                ax.set_title(f"PC{i + 1}  {var[i]:.2f}%", fontsize=8)
+                ax.axis("off")
+            fig.suptitle("Principal Component Bands of Data Cube (rescaled to [0, 1])")
+        cols = min(5, k)
+        self._show_figure_dialog("Principal component bands", build,
+                                 size=(2.4 * cols + 1, 2.5 * int(np.ceil(k / cols)) + 0.8))
+
+    def on_pca_coefficients(self):
+        """Plot PC coefficients against wavelength and print the retained variance of each PC."""
+        if not self._pca_ready():
+            return
+        A = self.pca_coeff
+        k = A.shape[1]
+        var = 100.0 * np.asarray(self.pca_explained_ratio)
+        idx = self.pca_band_index
+        if self.wavelengths is not None and len(self.wavelengths) == self.cube.shape[2]:
+            x, xl = np.asarray(self.wavelengths)[idx], "Wavelength"
+        else:
+            x, xl = idx + 1, "Band number"
+        method = getattr(self, "pca_method", "SVD")
+
+        def build(fig):
+            ax = fig.add_subplot(111)
+            for i in range(k):
+                ax.plot(x, A[:, i], label=f"PC{i + 1}")
+            ax.legend(loc="lower right", fontsize=8, ncol=2 if k > 6 else 1)
+            ax.set_xlabel(xl)
+            ax.set_ylabel("PC Coefficients")
+            ax.set_title(f"PCA coefficients ({method}) - retained variance {var.sum():.2f}%")
+            shown = min(k, 10)
+            txt = "Retained variance\n" + "\n".join(f"PC{i + 1}: {var[i]:.4f}" for i in range(shown))
+            if k > shown:
+                txt += f"\n... ({k - shown} more)"
+            ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", fontsize=8)
+        self._show_figure_dialog("PCA coefficients", build, size=(9, 6))
+        self.info_label.setText(f"PCA ({method}): {k} PCs retain {var.sum():.2f}% of the variance.")
+
+    def on_pca_save_coefficients(self):
+        if not self._pca_ready():
+            return
+        A = self.pca_coeff
+        k = A.shape[1]
+        var = 100.0 * np.asarray(self.pca_explained_ratio)
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PCA coefficients", "pca_coefficients.csv", "CSV (*.csv)")
+        if not fn:
+            return
+        wl = self.wavelengths
+        with open(fn, "w") as f:
+            f.write("band,wavelength," + ",".join(f"PC{i + 1}" for i in range(k)) + ",mean\n")
+            for r, b in enumerate(self.pca_band_index):
+                w_ = f"{wl[b]:.4f}" if wl is not None and len(wl) > b else ""
+                f.write(f"{int(b) + 1},{w_}," + ",".join(f"{v:.8g}" for v in A[r]) + f",{self.pca_mean[r]:.8g}\n")
+            f.write("retained_variance_percent,," + ",".join(f"{v:.6g}" for v in var) + ",\n")
+        self.info_label.setText(f"Saved PCA coefficients to {fn}")
+
+    def on_pca_apply(self):
+        """Replace the active cube by the PC bands."""
+        if not self._pca_ready() or self.cube is None:
+            return
+        if self.pca_scores.shape[:2] != self.cube.shape[:2]:
+            QtWidgets.QMessageBox.warning(self, "Out of date", "The PCs no longer match the active cube; recompute PCA.")
+            return
+        k = self.pca_scores.shape[2]
+        method = getattr(self, "pca_method", "SVD")
+        self._commit_cube(self.pca_scores.astype(np.float32), None, f"PCA {method} dimensionality reduction ({k} PCs)",
+                          {"method": method, "components": k})
+        self.info_label.setText(f"The active cube is now the {k} principal-component bands.")
+
     # ------------------------------------------------------------------
     # Classification (SAM + supervised)
     # ------------------------------------------------------------------
@@ -8351,7 +11025,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             if use_rois:
                 names = self._class_list()
                 if not names:
-                    raise RuntimeError("Load labelled ROIs first (draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation).")
+                    raise RuntimeError("No labelled ROIs: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
                 refs = []
                 for name in names:
                     union = np.zeros((rows, cols), dtype=bool)
@@ -8470,114 +11144,646 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             return
         QtWidgets.QMessageBox.critical(self, "Error", f"Task failed:\n{msg}")
 
-    def _supervised_precheck(self, need_tf=False):
-        """Common checks. Returns the class list, or None after telling the user why not."""
+    # ------------------------------------------------------------------
+    # Classification tab: Random Forest / SVM (same workflow as the Segmentation tab)
+    # ------------------------------------------------------------------
+    def _clf_sync_labels(self):
+        if not hasattr(self, "clf_gt_label"):
+            return
+        self.clf_gt_label.setText(self.seg_gt_label.text())
+        self.clf_roi_label.setText(f"ROIs available: {len(self.rois)} in {len(self._class_list())} classes.")
+
+    def _clf_check_models(self, on):
+        for i in range(self.clf_model_list.count()):
+            self.clf_model_list.item(i).setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+
+    def _clf_selected_models(self):
+        return [self.clf_model_list.item(i).text() for i in range(self.clf_model_list.count())
+                if self.clf_model_list.item(i).checkState() == QtCore.Qt.Checked]
+
+    def _clf_hp(self):
+        return {"rf_trees": int(self.clf_rf_trees.value()), "rf_depth": int(self.clf_rf_depth.value()),
+                "svm_c": float(self.clf_svm_c.value()), "svm_gamma": float(self.clf_svm_gamma.value()),
+                "poly_degree": int(self.clf_poly_degree.value()), "poly_c": float(self.clf_poly_c.value()),
+                "poly_coef0": float(self.clf_poly_coef0.value()), "balanced": self.clf_balanced.isChecked()}
+
+    def _clf_set_save_dir(self, d):
+        self.clf_save_dir = d
+        self.btn_clf_savedir.setText("Save trained models to folder..." if not d else f"Saving to: {d}")
+
+    def on_clf_choose_save_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the trained models")
+        if d:
+            self._clf_set_save_dir(d)
+
+    def _clf_precheck(self):
         if self._busy:
             return None
-        if self.cube is None:
-            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
-            return None
         if not SKLEARN_AVAILABLE:
-            QtWidgets.QMessageBox.warning(self, "Missing dependency", "Install scikit-learn first.")
+            QtWidgets.QMessageBox.warning(self, "Missing dependency", "Install scikit-learn first:\n  pip install scikit-learn")
             return None
-        if need_tf and not TF_AVAILABLE:
-            QtWidgets.QMessageBox.warning(
-                self, "TensorFlow not found",
-                "The 2D CNN needs TensorFlow.\nInstall it with:  pip install tensorflow"
-            )
+        models = self._clf_selected_models()
+        if not models:
+            QtWidgets.QMessageBox.information(self, "Models", "Tick at least one model.")
             return None
-        names = self._class_list()
-        if len(names) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "Not enough classes",
-                "Add ROIs for at least 2 different classes first."
-            )
+        cfg = self._seg_collect(True)
+        if cfg is None:
             return None
-        return names
+        cfg["hp"] = self._clf_hp()
+        return models, cfg
 
-    def _supervised_args(self):
-        """(feature_source, pca_scores, pca_valid) from the Classification tab, or None."""
-        use_pca = self.combo_features.currentIndex() == 1
-        if use_pca and self.pca_scores is None:
-            QtWidgets.QMessageBox.information(self, "PCA not ready", "Compute PCA first (PCA tab).")
-            return None
-        return ("pca" if use_pca else "spectra"), self.pca_scores, self.pca_valid_mask
-
-    def on_train_classifier(self):
-        class_names = self._supervised_precheck()
-        if class_names is None:
+    def on_clf_train(self):
+        chk = self._clf_precheck()
+        if chk is None:
             return
-        feat = self._supervised_args()
-        if feat is None:
-            return
-        source, pca_scores, pca_valid = feat
-
-        clf_name = self.combo_clf.currentText()
-        test_frac = self.spin_test.value() / 100.0
-        split_mode = "rois" if self.combo_split.currentIndex() == 0 else "pixels"
-        max_pc = int(self.spin_max_pc.value())
-        cube, rois = self.cube, list(self.rois)
+        models, cfg = chk
+        cfg["save_dir"] = self.clf_save_dir
+        cfg["prefix"] = f"{getattr(self, 'cube_name', None) or 'scene'}_clf_{cfg['test_ratio']}_{cfg['k']}_{cfg['WS']}"
+        cube = self.cube
+        self._clf_cfg = cfg
 
         def job(progress, cancel):
-            return run_supervised(
-                cube, rois, class_names, source, pca_scores, pca_valid,
-                clf_name, test_frac, split_mode, max_pc, progress=progress, cancel=cancel,
-            )
+            return run_classical(cube, cfg, models, progress=progress, cancel=cancel)
 
-        self._start_job(job, self._finish_supervised, f"Starting {clf_name}...")
+        self._start_job(job, self._finish_classical, f"Starting training ({len(models)} models)...")
 
-    def on_crossval(self):
-        class_names = self._supervised_precheck()
-        if class_names is None:
+    def on_clf_crossval(self):
+        chk = self._clf_precheck()
+        if chk is None:
             return
-        feat = self._supervised_args()
-        if feat is None:
+        models, cfg = chk
+        if cfg["split_mode"] == "roi_train":
+            QtWidgets.QMessageBox.information(self, "Cross-validation", "Choose 'random pixels', 'regions' or 'blocks' "
+                                                                       "as the split for cross-validation.")
             return
-        source, pca_scores, pca_valid = feat
-
-        clf_name = self.combo_clf.currentText()
-        k = int(self.spin_cv_k.value())
-        split_mode = "rois" if self.combo_split.currentIndex() == 0 else "pixels"
-        max_pc = int(self.spin_max_pc.value())
-        cube, rois = self.cube, list(self.rois)
+        k = int(self.clf_cv_k.value())
+        cube = self.cube
 
         def job(progress, cancel):
-            return run_crossval(
-                cube, rois, class_names, source, pca_scores, pca_valid,
-                clf_name, k, split_mode, max_pc, progress=progress, cancel=cancel,
-            )
+            return run_classical_cv(cube, cfg, models, k, progress=progress, cancel=cancel)
 
         self._start_job(job, self._finish_report_only, f"Starting {k}-fold cross-validation...")
 
-    def on_train_cnn(self):
-        class_names = self._supervised_precheck(need_tf=True)
-        if class_names is None:
+    def _finish_classical(self, out):
+        self.clf_ctx = out["ctx"]
+        self.clf_ctx["prefix"] = self._clf_cfg["prefix"]
+        self.clf_results = out["results"]
+        t = self.clf_table
+        t.setRowCount(0)
+
+        def f(m, key):
+            return "-" if m is None else f"{m[key]:.2f}"
+        for r in out["results"]:
+            row = t.rowCount()
+            t.insertRow(row)
+            vals = [r["name"], r["settings_text"], f"{r['times']['train']:.1f}", f(r["val"], "oa"), f(r["val"], "kappa"),
+                    f(r["test"], "oa"), f(r["test"], "aa"), f(r["test"], "kappa"), f(r["hsi"], "oa"), f(r["hsi"], "aa"),
+                    f(r["hsi"], "kappa")]
+            for c, v in enumerate(vals):
+                t.setItem(row, c, QtWidgets.QTableWidgetItem(v))
+        t.resizeColumnsToContents()
+        if out["results"]:
+            t.selectRow(0)
+        msg = ""
+        if out["errors"]:
+            msg = "Not run: " + "; ".join(f"{n}: {e}" for n, e in out["errors"])
+        if out["cancelled"]:
+            msg = ("Cancelled; finished models are listed. " + msg).strip()
+        self.clf_err_label.setText(msg)
+        self.info_label.setText(f"Classification finished: {len(out['results'])} models trained"
+                                + (f", {len(out['errors'])} failed" if out["errors"] else "") + ".")
+        if out["results"]:
+            self.on_clf_show_map()
+        elif out["errors"]:
+            QtWidgets.QMessageBox.warning(self, "No model could be trained", msg)
+
+    def _clf_selected_result(self):
+        if not self.clf_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return None
+        rows_ = self.clf_table.selectionModel().selectedRows()
+        i = rows_[0].row() if rows_ else 0
+        return self.clf_results[min(i, len(self.clf_results) - 1)]
+
+    def on_clf_show_map(self):
+        r = self._clf_selected_result()
+        if r is None:
             return
-        n_pca = int(self.spin_cnn_pca.value())
-        patch = int(self.spin_cnn_patch.value()) | 1
-        epochs = int(self.spin_cnn_epochs.value())
-        batch = int(self.spin_cnn_batch.value())
-        net = "reference" if self.combo_cnn_net.currentIndex() == 0 else "compact"
-        test_frac = self.spin_cnn_test.value() / 100.0
-        split_mode = "rois" if self.combo_cnn_split.currentIndex() == 0 else "pixels"
-        max_pc = int(self.spin_cnn_maxpc.value())
-        scope = "image" if self.combo_cnn_scope.currentIndex() == 0 else "rois"
-        cube, rois = self.cube, list(self.rois)
+        self.class_labels = r["full"]
+        self.class_names_result = self.clf_ctx["names"]
+        self._show_classification(r["full"], self.clf_ctx["names"], r["name"])
+
+    def on_clf_show_report(self):
+        r = self._clf_selected_result()
+        if r is None:
+            return
+        self.last_report = seg_report_text(self.clf_ctx, r)
+        self.on_show_report()
+
+    def on_clf_show_pred_maps(self):
+        r = self._clf_selected_result()
+        if r is None:
+            return
+        ctx = self.clf_ctx
+        self._show_figure_dialog(f"{r['name']}: predicted maps", lambda fig: seg_fig_pred(fig, ctx, r), size=(12, 4.5))
+
+    def on_clf_show_compare(self):
+        if not self.clf_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return
+        res, ctx = list(self.clf_results), self.clf_ctx
+        self._show_figure_dialog("Model comparison", lambda fig: clf_fig_compare(fig, res, ctx), size=(13, 5))
+
+    def on_clf_show_split(self):
+        if self.clf_ctx is None:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first (or use 'Preview split').")
+            return
+        ctx = self.clf_ctx
+        self._show_figure_dialog("Train / validation / test samples", lambda fig: seg_fig_split(fig, ctx), size=(12, 4))
+
+    def on_clf_export(self):
+        if not self.clf_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the results")
+        if not d:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            written = seg_export_all(d, self.clf_ctx.get("prefix", "classification"), self.clf_ctx, self.clf_results)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export", f"Export failed:\n{e}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.info_label.setText(f"Exported {len(written)} files to {d}")
+
+    def on_clf_load_model(self):
+        if not self._seg_check_cube() or self._busy:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Saved Random Forest / SVM model (.json)", "",
+                                                        "Saved model (*.json)")
+        if not path:
+            return
+        try:
+            saved = classical_load_model(path[:-5])
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Saved model", f"Could not read the model files:\n{e}\n\n"
+                                                                "(Only open models you trained yourself.)")
+            return
+        cfg = saved["config"]
+        if self.cube.shape[2] != cfg["n_bands"]:
+            QtWidgets.QMessageBox.warning(self, "Saved model", f"The model needs {cfg['n_bands']} bands; the cube has "
+                                                               f"{self.cube.shape[2]}.")
+            return
+        cube = self.cube
 
         def job(progress, cancel):
-            return run_cnn(
-                cube, rois, class_names, n_pca, patch, epochs, batch, net,
-                test_frac, split_mode, max_pc, scope, progress=progress, cancel=cancel,
-            )
+            return classical_predict_map(cube, saved, progress=progress, cancel=cancel)
 
-        self._start_job(job, self._finish_supervised, "Starting 2D CNN (the first step loads TensorFlow)...")
+        def done(lab):
+            self._show_classification(lab, cfg["class_names"], f"{cfg['model']} (saved)")
+        self._start_job(job, done, f"Classifying with the saved {cfg['model']}...")
 
-    def _finish_supervised(self, res):
-        self.class_labels = res["labels"]
-        self.class_names_result = res["names"]
-        self.last_report = res["report"]
-        self._show_classification(res["labels"], res["names"], res["title"])
+    # ------------------------------------------------------------------
+    # Segmentation tab
+    # ------------------------------------------------------------------
+    def _seg_check_models(self, what):
+        fast = {"CNN2D", "CNN3D", "HybCNN", "IN2D", "SSMamba", "MHSAMamba"}
+        for i in range(self.seg_model_list.count()):
+            it = self.seg_model_list.item(i)
+            n = it.text()
+            if what == "all":
+                on = True
+            elif what == "none":
+                on = False
+            elif what == "notebook":
+                on = n != "PyFormer"
+            else:
+                on = n in fast
+            it.setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+
+    def _seg_selected_models(self):
+        return [self.seg_model_list.item(i).text() for i in range(self.seg_model_list.count())
+                if self.seg_model_list.item(i).checkState() == QtCore.Qt.Checked]
+
+    def _seg_set_save_dir(self, d):
+        self.seg_save_dir = d
+        self.btn_seg_savedir.setText("Save trained models to folder..." if not d else f"Saving to: {d}")
+
+    def on_seg_choose_save_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the trained models")
+        if d:
+            self._seg_set_save_dir(d)
+
+    def _seg_check_cube(self):
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return False
+        return True
+
+    def on_seg_load_gt(self):
+        if not self._seg_check_cube():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Ground-truth / label map", "",
+            "Label maps (*.mat *.npy *.npz *.tif *.tiff *.png *.bmp *.jpg *.h5 *.hdf5 *.hdr *.img *.csv *.txt);;All files (*)")
+        if not path:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            res = read_label_map(path, choose=self._choose_dataset_dialog)
+            rows, cols, _ = self.cube.shape
+            lab, note = conform_label_map(res["labels"], rows, cols)
+        except HSILoadCancelled:
+            return
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ground truth", f"Could not use this file:\n{e}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        bg = int(self.seg_bg.value())
+        ids = [int(i) for i in np.unique(lab)]
+        names = {}
+        if res.get("names"):
+            for i in ids:
+                if 0 <= i < len(res["names"]):
+                    names[i] = res["names"][i]
+        for i in ids:
+            names.setdefault(i, f"Class {i}")
+        self.seg_gt = {"path": path, "labels": lab, "names": names, "include": {i: True for i in ids},
+                       "background": bg, "note": " ".join(x for x in (res.get("note"), note) if x)}
+        for cb_ in (self.seg_source, self.clf_source):      # both tabs share the ground truth
+            if cb_.currentIndex() == 0:
+                cb_.setCurrentIndex(1)
+        self._seg_fill_class_table()
+        self.info_label.setText(f"Ground truth loaded: {Path(path).name}")
+
+    def on_seg_load_names(self):
+        if self.seg_gt is None:
+            QtWidgets.QMessageBox.information(self, "Class names", "Load a ground-truth file first.")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Class names", "", "Text / CSV (*.txt *.csv *.tsv);;All files (*)")
+        if not path:
+            return
+        try:
+            ids = [i for i in self.seg_gt["include"] if i != int(self.seg_bg.value())]
+            m = read_class_names_file(path, ids)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Class names", f"Could not read the file:\n{e}")
+            return
+        for i, n in m.items():
+            if i in self.seg_gt["names"]:
+                self.seg_gt["names"][i] = n
+        self._seg_fill_class_table()
+
+    def _seg_fill_class_table(self):
+        g = self.seg_gt
+        t = self.seg_class_table
+        self._seg_table_busy = True
+        t.setRowCount(0)
+        if g is None:
+            self._seg_table_busy = False
+            return
+        g["background"] = int(self.seg_bg.value())
+        lab = g["labels"]
+        ids, counts = np.unique(lab, return_counts=True)
+        n_cls = 0
+        for i, c in zip(ids, counts):
+            i = int(i)
+            r = t.rowCount()
+            t.insertRow(r)
+            use = QtWidgets.QTableWidgetItem()
+            is_bg = i == g["background"]
+            use.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+            use.setCheckState(QtCore.Qt.Unchecked if (is_bg or not g["include"].get(i, True)) else QtCore.Qt.Checked)
+            if is_bg:
+                use.setFlags(QtCore.Qt.ItemIsEnabled)
+            t.setItem(r, 0, use)
+            idit = QtWidgets.QTableWidgetItem(str(i))
+            idit.setFlags(QtCore.Qt.ItemIsEnabled)
+            t.setItem(r, 1, idit)
+            nm = QtWidgets.QTableWidgetItem("(unlabelled)" if is_bg else g["names"].get(i, f"Class {i}"))
+            if is_bg:
+                nm.setFlags(QtCore.Qt.ItemIsEnabled)
+            t.setItem(r, 2, nm)
+            px = QtWidgets.QTableWidgetItem(str(int(c)))
+            px.setFlags(QtCore.Qt.ItemIsEnabled)
+            t.setItem(r, 3, px)
+            if not is_bg:
+                n_cls += 1
+        t.resizeColumnsToContents()
+        self._seg_table_busy = False
+        rows, cols = lab.shape
+        self.seg_gt_label.setText(
+            f"{Path(g['path']).name}: {rows} x {cols}, {n_cls} classes, "
+            f"{int((lab != g['background']).sum())} labelled pixels. {g.get('note', '')}")
+        self._clf_sync_labels()
+
+    def _seg_table_changed(self, item):
+        if self._seg_table_busy or self.seg_gt is None:
+            return
+        r = item.row()
+        cid = int(self.seg_class_table.item(r, 1).text())
+        if item.column() == 0:
+            self.seg_gt["include"][cid] = item.checkState() == QtCore.Qt.Checked
+        elif item.column() == 2:
+            self.seg_gt["names"][cid] = item.text().strip() or f"Class {cid}"
+
+    def on_seg_show_gt(self):
+        if self.seg_gt is None:
+            QtWidgets.QMessageBox.information(self, "Ground truth", "Load a ground-truth file first.")
+            return
+        g = self.seg_gt
+        ids = [i for i in sorted(g["include"]) if i != g["background"] and g["include"][i]]
+        if not ids:
+            QtWidgets.QMessageBox.information(self, "Ground truth", "No class is selected.")
+            return
+        img = -np.ones(g["labels"].shape, dtype=np.int32)
+        for k, i in enumerate(ids):
+            img[g["labels"] == i] = k
+        self._show_classification(img, [g["names"].get(i, f"Class {i}") for i in ids], "Ground truth")
+
+    def on_seg_gt_to_rois(self):
+        if self.seg_gt is None or not self._seg_check_cube():
+            QtWidgets.QMessageBox.information(self, "Ground truth", "Load a ground-truth file first.")
+            return
+        g = self.seg_gt
+        ids = [i for i in sorted(g["include"]) if i != g["background"] and g["include"][i]]
+        if not ids:
+            return
+        if self.rois:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Import classes as ROIs",
+                f"Add {len(ids)} ROIs (one per class) to the {len(self.rois)} existing ROIs?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.Yes)
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
+        for i in ids:
+            mask = g["labels"] == i
+            self.roi_counter += 1
+            self.rois.append({"name": f"GT {g['names'].get(i, i)}", "class": g["names"].get(i, f"Class {i}"),
+                              "kind": "mask", "mask": mask, "bbox": self._bbox_of(mask), "rect": self._bbox_of(mask)})
+        self._refresh_roi_list()
+        self._refresh_class_combo()
+        self._draw_roi_patch()
+        self.info_label.setText(f"Added {len(ids)} ground-truth classes as ROIs.")
+
+    def _seg_roi_info(self):
+        n = len(self.rois)
+        self.seg_roi_label.setText(f"ROIs available: {n} in {len(self._class_list())} classes.")
+
+    def _seg_collect(self, clf=False):
+        """Common settings of the Segmentation (clf=False) or Classification (clf=True) tab; returns the cfg dict,
+        or None after telling the user why not."""
+        if not self._seg_check_cube():
+            return None
+        w = (lambda n: getattr(self, ("clf_" if clf else "seg_") + n))
+        src = ("rois", "gt", "both")[w("source").currentIndex()]
+        if src in ("gt", "both") and self.seg_gt is None:
+            QtWidgets.QMessageBox.information(self, "Ground truth", "Load a ground-truth file first (or choose ROIs as the label source).")
+            return None
+        if src in ("rois", "both"):
+            rows, cols, _ = self.cube.shape
+            good = [r for r in self.rois if r["mask"].shape == (rows, cols)]
+            if len(good) < len(self.rois):
+                QtWidgets.QMessageBox.warning(self, "ROIs", "Some ROIs belong to a differently sized image and are ignored.")
+            if src == "rois" and len({r["class"] for r in good}) < 2:
+                QtWidgets.QMessageBox.information(self, "ROIs", "ROIs for at least 2 classes are needed: draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation.")
+                return None
+        if self.seg_gt is not None and self.seg_gt["labels"].shape != self.cube.shape[:2]:
+            QtWidgets.QMessageBox.warning(
+                self, "Ground truth",
+                "The loaded ground truth belongs to an image of a different size and was removed. "
+                "Load the ground-truth file again.")
+            self.seg_gt = None
+            self._seg_fill_class_table()
+            self.seg_gt_label.setText("No ground-truth file loaded.")
+            self._clf_sync_labels()
+            for cb_ in (self.seg_source, self.clf_source):
+                if cb_.currentIndex() != 0:
+                    cb_.setCurrentIndex(0)
+            return None
+        dr = None
+        if self.pca_coeff is not None and self.pca_mean is not None:
+            dr = {"coeff": self.pca_coeff, "mean": self.pca_mean, "band_index": self.pca_band_index}
+        gt = None
+        if self.seg_gt is not None:
+            gt = dict(self.seg_gt)
+            gt["background"] = int(self.seg_bg.value())
+        mode = w("split").currentData()
+        if mode == "roi_train" and src != "both":
+            QtWidgets.QMessageBox.information(
+                self, "Split", "'ROIs = training, rest of ground truth = test' needs the label source "
+                               "'Ground-truth file + ROIs'.")
+            return None
+        cfg = {"source": src, "gt": gt, "rois": [r for r in self.rois], "feature_mode": w("feat").currentData(),
+               "k": int(w("k").value()), "dr": dr, "WS": int(w("ws").value()), "split_mode": mode,
+               "test_ratio": w("test").value() / 100.0, "val_ratio": w("val").value() / 100.0,
+               "seed": int(w("seed").value()), "max_per_class": int(w("maxpc").value()),
+               "block": int(w("block").value()), "scope": "image" if w("scope").currentIndex() == 0 else "labelled"}
+        if not clf:
+            cfg.update({"epochs": int(self.seg_epochs.value()), "batch": int(self.seg_batch.value()),
+                        "lr": float(self.seg_lr.value()), "decay": float(self.seg_decay.value())})
+        return cfg
+
+    def on_seg_preview_split(self, clf=False):
+        cfg = self._seg_collect(bool(clf))
+        if cfg is None:
+            return
+        rows, cols, B = self.cube.shape
+        try:
+            valid = np.concatenate([~np.all(np.isnan(self.cube[r:r + 64].reshape(-1, B)), axis=1)
+                                    for r in range(0, rows, 64)])
+            samples = build_seg_samples(rows, cols, valid, cfg["source"], cfg["gt"], cfg["rois"], None)
+            split = make_seg_split(samples, rows, cols, cfg["split_mode"], cfg["test_ratio"], cfg["val_ratio"],
+                                   cfg["seed"], cfg["max_per_class"], cfg["block"])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Split", str(e))
+            return
+        sidx, y = samples["idx"], samples["y"]
+
+        def img(pos):
+            a = np.zeros(rows * cols, dtype=np.int32)
+            a[sidx[pos]] = y[pos] + 1
+            return a.reshape(rows, cols)
+
+        ctx = {"names": samples["names"], "truth": samples["truth_img"], "train_img": img(split["tr"]),
+               "val_img": img(split["va"]), "test_img": img(split["te"]),
+               "n_samples": (len(split["tr"]), len(split["va"]), len(split["te"]))}
+        self._show_figure_dialog("Train / validation / test samples", lambda fig: seg_fig_split(fig, ctx), size=(12, 4))
+        lines = [f"{'Class':<28}{'Train':>8}{'Valid':>8}{'Test':>8}"]
+        for n, a_, b_, c_ in split["table"]:
+            lines.append(f"{n[:27]:<28}{a_:>8}{b_:>8}{c_:>8}")
+        lines.append(f"{'Total':<28}{ctx['n_samples'][0]:>8}{ctx['n_samples'][1]:>8}{ctx['n_samples'][2]:>8}")
+        if samples["n_conflict"]:
+            lines.append(f"\n{samples['n_conflict']} pixels lie in ROIs of different classes and are excluded.")
+        if cfg["split_mode"] == "pixels":
+            lines.append("\nNote: a random pixel split lets neighbouring pixels fall in both train and test, which "
+                         "tends to over-estimate accuracy. 'Regions' or 'blocks' are stricter.")
+        self.last_report = "\n".join(lines)
         self.on_show_report()
+
+    def on_seg_train(self):
+        if self._busy:
+            return
+        if not TF_AVAILABLE:
+            QtWidgets.QMessageBox.warning(self, "TensorFlow not found",
+                                          "Training needs TensorFlow:\n  pip install tensorflow")
+            return
+        models = self._seg_selected_models()
+        if not models:
+            QtWidgets.QMessageBox.information(self, "Models", "Tick at least one model.")
+            return
+        cfg = self._seg_collect()
+        if cfg is None:
+            return
+        if "AttentionGCN" in models and cfg["WS"] != 8:
+            ans = QtWidgets.QMessageBox.question(
+                self, "AttentionGCN", "AttentionGCN only works with a patch size of 8. Skip it for this run?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.Yes)
+            if ans == QtWidgets.QMessageBox.Yes:
+                models = [m for m in models if m != "AttentionGCN"]
+        if not models:
+            return
+        cfg["save_dir"] = self.seg_save_dir
+        cfg["prefix"] = f"{getattr(self, 'cube_name', None) or 'scene'}_" \
+                        f"{cfg['test_ratio']}_{cfg['k']}_{cfg['WS']}"
+        cube = self.cube
+
+        def job(progress, cancel):
+            return run_segmentation(cube, cfg, models, progress=progress, cancel=cancel)
+
+        self._seg_cfg = cfg
+        self._start_job(job, self._finish_segmentation, f"Starting segmentation training ({len(models)} models)...")
+
+    def _finish_segmentation(self, out):
+        self.seg_ctx = out["ctx"]
+        self.seg_ctx["prefix"] = self._seg_cfg["prefix"]
+        self.seg_results = out["results"]
+        t = self.seg_table
+        t.setRowCount(0)
+        for r in out["results"]:
+            row = t.rowCount()
+            t.insertRow(row)
+
+            def f(m, key):
+                return "-" if m is None else f"{m[key]:.2f}"
+            vals = [r["name"], f"{r['params']:,}", f"{r['times']['train']:.1f}", f(r["val"], "oa"), f(r["val"], "kappa"),
+                    f(r["test"], "oa"), f(r["test"], "aa"), f(r["test"], "kappa"), f(r["hsi"], "oa"), f(r["hsi"], "aa"),
+                    f(r["hsi"], "kappa")]
+            for c, v in enumerate(vals):
+                t.setItem(row, c, QtWidgets.QTableWidgetItem(v))
+        t.resizeColumnsToContents()
+        if out["results"]:
+            t.selectRow(0)
+        msg = ""
+        if out["errors"]:
+            msg = "Not run: " + "; ".join(f"{n}: {e}" for n, e in out["errors"])
+        if out["cancelled"]:
+            msg = ("Cancelled; finished models are listed. " + msg).strip()
+        self.seg_err_label.setText(msg)
+        self.info_label.setText(f"Segmentation finished: {len(out['results'])} models trained"
+                                + (f", {len(out['errors'])} skipped" if out["errors"] else "") + ".")
+        if out["results"]:
+            self.on_seg_show_map()
+        elif out["errors"]:
+            QtWidgets.QMessageBox.warning(self, "No model could be trained", msg)
+
+    def _seg_selected_result(self):
+        if not self.seg_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return None
+        rows_ = self.seg_table.selectionModel().selectedRows()
+        i = rows_[0].row() if rows_ else 0
+        return self.seg_results[min(i, len(self.seg_results) - 1)]
+
+    def on_seg_show_map(self):
+        r = self._seg_selected_result()
+        if r is None:
+            return
+        self._show_classification(r["full"], self.seg_ctx["names"], r["name"])
+
+    def on_seg_show_report(self):
+        r = self._seg_selected_result()
+        if r is None:
+            return
+        self.last_report = seg_report_text(self.seg_ctx, r)
+        self.on_show_report()
+
+    def on_seg_show_pred_maps(self):
+        r = self._seg_selected_result()
+        if r is None:
+            return
+        self._show_figure_dialog(f"{r['name']}: predicted maps", lambda fig: seg_fig_pred(fig, self.seg_ctx, r), size=(12, 4.5))
+
+    def on_seg_show_curves(self):
+        if not self.seg_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return
+        res = list(self.seg_results)
+        self._show_figure_dialog("Accuracy and loss curves", lambda fig: seg_fig_curves(fig, res), size=(16, 5.5))
+
+    def on_seg_show_split(self):
+        if self.seg_ctx is None:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first (or use 'Preview split').")
+            return
+        ctx = self.seg_ctx
+        self._show_figure_dialog("Train / validation / test samples", lambda fig: seg_fig_split(fig, ctx), size=(12, 4))
+
+    def on_seg_export(self):
+        if not self.seg_results:
+            QtWidgets.QMessageBox.information(self, "Results", "Train a model first.")
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the results")
+        if not d:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            written = seg_export_all(d, self.seg_ctx.get("prefix", "segmentation"), self.seg_ctx, self.seg_results)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export", f"Export failed:\n{e}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.info_label.setText(f"Exported {len(written)} files to {d}")
+
+    def on_seg_load_model(self):
+        if not self._seg_check_cube() or self._busy:
+            return
+        if not TF_AVAILABLE:
+            QtWidgets.QMessageBox.warning(self, "TensorFlow not found", "Needs TensorFlow:\n  pip install tensorflow")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Saved model (.json)", "", "Saved model (*.json)")
+        if not path:
+            return
+        base = path[:-5]
+        try:
+            with open(path) as fh_:
+                if json.load(fh_).get("family") == "classical":
+                    QtWidgets.QMessageBox.information(self, "Saved model", "This is a Random Forest / SVM model. "
+                                                      "Load it with 'Classify with a saved model...' in the Classification tab.")
+                    return
+        except Exception:
+            pass
+        try:
+            saved = seg_load_model(base)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Saved model", f"Could not read the model files:\n{e}")
+            return
+        cfg = saved["config"]
+        if self.cube.shape[2] != cfg["n_bands"]:
+            QtWidgets.QMessageBox.warning(self, "Saved model", f"The model needs {cfg['n_bands']} bands; the cube has "
+                                                               f"{self.cube.shape[2]}.")
+            return
+        cube = self.cube
+
+        def job(progress, cancel):
+            return seg_predict_map(cube, saved, progress=progress, cancel=cancel)
+
+        def done(lab):
+            self._show_classification(lab, cfg["class_names"], f"{cfg['model']} (saved)")
+        self._start_job(job, done, f"Classifying with the saved {cfg['model']}...")
 
     def _finish_report_only(self, res):
         self.last_report = res["report"]
@@ -8652,7 +11858,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         if not self.rois:
             QtWidgets.QMessageBox.information(
                 self, "No ROIs",
-                "Load an ROI for each reference target first "
+                "Draw an ROI on each reference target and add it to the ROI list first "
                 "(draw them in Data Aggregation, then Tools ▸ Get ROIs from Data Aggregation)."
             )
             return

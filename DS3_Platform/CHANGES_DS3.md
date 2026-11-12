@@ -1,5 +1,18 @@
 # DS3 — what changed (main branch → DS3 interface)
 
+## v2.3
+* "Viewer" renamed **Viewer and Analysis** (sidebar, home card, page title, View menu Ctrl+3, Tools menu, help).
+* `viewer/HyperVista_v1_0.py` replaced by the team's modified viewer (`modified_code_for_viewer_and_analysis.py`,
+  12,838 lines): new **Dimensionality Reduction** tab (PCA + MNF, coefficients, apply), new **Classification** tab
+  (several classical models, cross-validation, prediction maps, reports, export, save / load models), **Spectral
+  Matching** tab (SAM), **Segmentation** tab (deep models from the survey notebook, ground-truth label files,
+  split preview, training curves, export, save / load models) replacing 2D CNN.
+* Its **ROI Analysis** tab is still left out: ROIs come from Data Aggregation (Tools ▸ Get ROIs from Data
+  Aggregation); the ROI messages in the viewer file point there (9 texts changed, no code changed).
+* Spectral menu: Transforms ▸ PCA / MNF → Dimensionality Reduction; Mapping ▸ SAM (ROI classes) → Spectral
+  Matching; Classification ▸ Supervised Classification, Deep Learning Segmentation, Spectral Matching.
+* requirements: joblib, psutil (optional); TensorFlow only for Segmentation.
+
 ## v2.2
 * **Data Aggregation:** the Georeferencing tab is removed (files that carry georeferencing, such as EnMAP,
   still show on the map with *Map* under the scene view). Tools ▸ Georeference removed.
@@ -45,7 +58,7 @@ window**, with the DS3 look and menus, and share one library database connection
 | `ds3/style.py`, `ds3/widgets.py` | new | DS3 colours (light ENVI style), Qt style sheet, matplotlib theme, cards, chips, icons |
 | `hvva/library/repository.py` | **changed** | `list_libraries` also returns `spectrum_count` (Home "Spectra" counter, library cards) |
 | `hvva/**` (rest), `database/`, `plugins/`, `assets/` | unchanged | HyperVista Library v3.4 |
-| `viewer/HyperVista_v1_0.py` | 5 message texts changed (v2.2) | copied from main `Viewer/` |
+| `viewer/HyperVista_v1_0.py` | replaced (v2.3) | the team's modified viewer & analysis tool; ROI messages point to Data Aggregation |
 | `data/libraries/` | new | default folder of main libraries (material + soil spectra) |
 | `requirements.txt` | new | library + viewer requirements merged |
 | `tests/test_ds3_gui.py` | new | end-to-end test of the DS3 window |
