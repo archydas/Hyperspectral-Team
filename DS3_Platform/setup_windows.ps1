@@ -5,4 +5,4 @@ if (-not (Test-Path ".venv")) { py -3.12 -m venv .venv }
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -r requirements_web.txt
-.\.venv\Scripts\python.exe -c "import PyQt5.QtWebEngineWidgets, fastapi, uvicorn, psycopg; print('DS3 setup OK')"
+.\.venv\Scripts\python.exe -c "import PyQt5.QtWidgets, fastapi, uvicorn, psycopg; print('DS3 setup OK')"

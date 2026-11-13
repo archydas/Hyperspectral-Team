@@ -1,26 +1,27 @@
-"""DS3 web modules inside the Qt window.
+"""DS3 Library (main) and Image modules inside the Qt window - native PyQt5 pages.
 
-The Image module (and the web Library) of the DS3 Library app (FastAPI + HTML/JS, folder ``material_library/``) are
-shown here as pages of the PyQt5 DS3 window: one separate process runs the API server on 127.0.0.1, and each page is
-a QWebEngineView on ``/app/?embed=image`` or ``/app/?embed=library``.
+The data side is unchanged: the FastAPI backend of the DS3 Library app (folder ``material_library/backend``) runs as a
+separate process on 127.0.0.1 and owns the database, the image readers and the analysis code. The pages themselves are
+now drawn with Qt widgets (``ds3/native``): no QtWebEngine, no HTML / JavaScript.
 
-* Database: the connection of the Qt Library panel is reused (``libpanel.cfg['db_url']``), so the Qt modules and the
-  web modules use the same PostgreSQL / SQLite database.  Without a connection the web modules use the SQLite file in
+* Database: the connection of the Qt Library panel is reused (``libpanel.cfg['db_url']``), so the Qt modules and these
+  modules use the same PostgreSQL / SQLite database.  Without a connection they use the SQLite file in
   ``material_library/data``.  Override with the environment variable DS3_WEB_DB.
-* File dialogs: the web page asks for ``window.pywebview.api.pick_files``; a small QWebChannel shim answers it with the
-  Qt file dialog, so image files are opened in place (no upload copy).
+* Files are opened in place (the backend runs on this computer), file / folder choosers are Qt dialogs.
+
+The class names (WebBackend, WebPage) are kept so that shell.py / home.py / app.py need no change.
 """
 from __future__ import annotations
 
-import os
 import atexit
+import os
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
 
-from PyQt5 import QtCore, QtWebChannel, QtWebEngineWidgets, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 W = QtWidgets
 Qt = QtCore.Qt
@@ -93,6 +94,22 @@ class WebBackend:
             self.error = f"{type(e).__name__}: {e}"
         return None
 
+    def start_async(self, db_url, callback):
+        """Start the server in the background; callback(base or None) runs in the GUI thread."""
+        if self.base or self.error:
+            return callback(self.base)
+        self._waiting = getattr(self, "_waiting", [])
+        self._waiting.append(callback)
+        if len(self._waiting) > 1:
+            return                                              # already starting
+
+        def done(base):
+            cbs, self._waiting = self._waiting, []
+            for cb in cbs:
+                cb(base)
+        from .native.api import run_bg
+        run_bg(self.start, db_url, done=done, failed=lambda m: (setattr(self, "error", m), done(None)))
+
     def stop(self):
         p = getattr(self, "proc", None)
         if p is not None and p.poll() is None:
@@ -114,100 +131,23 @@ def _hide_password(u):
     return u
 
 
-class _Bridge(QtCore.QObject):
-    """Qt side of window.pywebview.api (file / folder pick)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.last_dir = ""
-
-    @QtCore.pyqtSlot(bool, result="QVariantList")
-    def pick(self, folder):
-        parent = QtWidgets.QApplication.activeWindow()
-        if folder:
-            d = W.QFileDialog.getExistingDirectory(parent, "Choose a folder", self.last_dir)
-            res = [d] if d else []
-        else:
-            res, _ = W.QFileDialog.getOpenFileNames(parent, "Open image / spectra file(s)", self.last_dir,
-                                                    "All files (*.*)")
-        if res:
-            self.last_dir = os.path.dirname(res[0]) if not folder else res[0]
-        return list(res)
-
-
-_SHIM = r"""
-(function(){
-  function init(){
-    new QWebChannel(qt.webChannelTransport, function(ch){
-      var b = ch.objects.ds3bridge;
-      window.pywebview = { api: { pick_files: function(folder){
-        return new Promise(function(res){ b.pick(!!folder, function(r){ res(r || []); }); });
-      } } };
-    });
-  }
-  if (typeof QWebChannel !== 'undefined') init();
-})();
-"""
-
-
-_PROFILE = None
-
-
-class _LogPage(QtWebEngineWidgets.QWebEnginePage):
-    """A web page that prints its JavaScript warnings / errors in the terminal (lines starting 'js:')."""
-
-    def javaScriptConsoleMessage(self, level, msg, line, src):
-        if level >= 1:                                        # 1 = warning, 2 = error
-            print(f"js: {msg}  [{str(src).rsplit('/', 1)[-1]}:{line}]", flush=True)
-
-
-def _profile():
-    """One off-the-record profile for all web pages: nothing is cached on disk (no 'Unable to move the cache' errors,
-    no stale css / js)."""
-    global _PROFILE
-    if _PROFILE is None:
-        _PROFILE = QtWebEngineWidgets.QWebEngineProfile(QtWidgets.QApplication.instance())
-    return _PROFILE
-
-
 class WebPage(W.QWidget):
-    """A DS3 page that shows one module of the web app (``embed`` = 'image' or 'library')."""
+    """A DS3 page with one native module: ``embed`` = 'library' (Library (main)) or 'image' (Image)."""
 
     def __init__(self, shell, embed, title):
         super().__init__()
         self.shell = shell
         self.embed = embed
+        self.title = title
         self.setObjectName("ds3Page")
-        self.view = QtWebEngineWidgets.QWebEngineView(self)
-        self.view.setPage(_LogPage(_profile(), self.view))
+        self.native = None
+        self._starting = False
         self.info = W.QLabel("")
         self.info.setWordWrap(True)
         self.info.setAlignment(Qt.AlignCenter)
-        lay = W.QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.info)
-        lay.addWidget(self.view, 1)
-        self.info.setVisible(False)
-        self._loaded = False
-        self._channel = QtWebChannel.QWebChannel(self.view.page())
-        self._bridge = _Bridge(self)
-        self._channel.registerObject("ds3bridge", self._bridge)
-        self.view.page().setWebChannel(self._channel)
-        self._install_shim()
-        self.view.loadFinished.connect(self._after_load)
-
-    def _install_shim(self):
-        f = QtCore.QFile(":/qtwebchannel/qwebchannel.js")
-        js = ""
-        if f.open(QtCore.QIODevice.ReadOnly):
-            js = bytes(f.readAll()).decode("utf-8")
-            f.close()
-        sc = QtWebEngineWidgets.QWebEngineScript()
-        sc.setName("ds3-pywebview-shim")
-        sc.setInjectionPoint(QtWebEngineWidgets.QWebEngineScript.DocumentReady)
-        sc.setWorldId(QtWebEngineWidgets.QWebEngineScript.MainWorld)
-        sc.setSourceCode(js + "\n" + _SHIM)
-        self.view.page().scripts().insert(sc)
+        self.lay = W.QVBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.addWidget(self.info, 1)
 
     def _db_url(self):
         """The database of the Qt Library panel (same URL), so every module uses one database."""
@@ -223,44 +163,56 @@ class WebPage(W.QWidget):
         return url
 
     def ensure(self):
-        """Start the API (first time only) and load the page."""
-        if self._loaded:
+        """Start the backend (first time only, in the background) and build the page."""
+        if self.native is not None or self._starting:
             return
-        db = self._db_url()
-        be = WebBackend.get()
-        QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            base = be.start(db)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-        if not base:
-            self.info.setText("The DS3 web module could not start:\n" + (be.error or "unknown error"))
-            self.info.setVisible(True)
-            self.view.setVisible(False)
-            return
-        self._loaded = True
-        print("[DS3 web] database of the web modules:", be.db_shown, flush=True)
-        self.shell.flash("Library / Image database: " + str(be.db_shown))
-        self.view.setUrl(QtCore.QUrl(f"{base}/app/?embed={self.embed}"))
+        self._starting = True
+        self.info.setText(f"Starting the DS3 data server for {self.title}…")
+        self.info.setVisible(True)
+        WebBackend.get().start_async(self._db_url(), self._started)
 
-    def _after_load(self, ok):
-        """Open the requested module (the page's own start-up may have left it on its home screen)."""
-        if not ok:
+    def _started(self, base):
+        self._starting = False
+        be = WebBackend.get()
+        if not base:
+            self.info.setText("The DS3 Library / Image server could not start:\n" + (be.error or "unknown error") +
+                              "\n\nCheck that the database is running (e.g. the PostgreSQL Docker container) and that the "
+                              "packages of requirements_web.txt are installed, then restart DS3.")
             return
-        target = "image" if self.embed == "image" else "library-list"
-        self.view.page().runJavaScript(
-            "try{document.body.classList.add('embed');if(typeof state!=='undefined'&&state.view!=='%s'){setView('%s');}}"
-            "catch(e){console.warn(e)}" % (target, target))
+        if self.native is not None:
+            return
+        from .native.api import Api
+        from .native.common import Store
+        api = Api(base)
+        store = Store.get(api)
+        try:
+            if self.embed == "image":
+                from .native.image_main import ImageMainPage
+                self.native = ImageMainPage(self.shell, api, store)
+            else:
+                from .native.library_main import LibraryMainPage
+                self.native = LibraryMainPage(self.shell, api, store)
+        except Exception as e:                                   # noqa: BLE001 - shown on the page
+            import traceback
+            traceback.print_exc()
+            self.info.setText(f"The {self.title} page could not be built: {type(e).__name__}: {e}")
+            return
+        self.info.setVisible(False)
+        self.lay.addWidget(self.native, 1)
+        print("[DS3] database of the Library (main) / Image modules:", be.db_shown, flush=True)
+        try:
+            self.shell.flash("Library / Image database: " + str(be.db_shown))
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.refresh_data()
 
     def refresh_data(self):
-        """Called whenever this page is shown: reload the list of libraries (another module may have saved one)."""
-        if not self._loaded:
+        """Called whenever this page is shown: reload libraries (another module may have saved one) and images."""
+        if self.native is None:
             return
-        self.view.page().runJavaScript(
-            "(function(){try{if(typeof loadLibraries!=='function'||typeof state==='undefined'){return;}"
-            "Promise.resolve(loadLibraries()).then(function(){renderMenubar();"
-            "if(state.view==='library-list'){render();}}).catch(function(e){console.warn(e)})}catch(e){console.warn(e)}})()")
+        self.native.store.refresh()
+        if self.embed == "image":
+            self.native.refresh()
 
     def reload(self):
-        if self._loaded:
-            self.view.reload()
+        self.refresh_data()

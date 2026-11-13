@@ -87,13 +87,8 @@ def patch_shell(s):
 
 
 def patch_app(a):
-    if "QtWebEngineWidgets" in a:
-        return a
-    old = "    from PyQt5 import QtCore, QtWidgets\n"
-    if a.count(old) != 1:
-        raise SystemExit("ds3/app.py differs from the expected version")
-    return a.replace(old, "    try:\n        from PyQt5 import QtWebEngineWidgets  # noqa: F401  (Qt rule: before the QApplication is created)\n"
-                          "    except Exception:                                    # DS3 web modules are optional\n        pass\n" + old)
+    """The Library (main) / Image pages are native PyQt5 now: app.py needs no QtWebEngine import (nothing to patch)."""
+    return a
 
 
 def patch_home(h):

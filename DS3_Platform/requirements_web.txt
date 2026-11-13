@@ -1,6 +1,6 @@
-# Extra packages for the DS3 web modules (Library, Image). Install after requirements.txt:
+# Extra packages for the DS3 Library (main) and Image modules (native PyQt5 pages + their FastAPI data server).
+# Install after requirements.txt:
 #     pip install -r requirements_web.txt
-PyQtWebEngine>=5.15       # shows the web pages inside the Qt window
 fastapi>=0.110
 uvicorn[standard]>=0.30
 sqlalchemy>=2.0
