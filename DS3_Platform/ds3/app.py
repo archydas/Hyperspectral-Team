@@ -15,6 +15,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    try:
+        from PyQt5 import QtWebEngineWidgets  # noqa: F401  (Qt rule: before the QApplication is created)
+    except Exception:                                    # DS3 web modules are optional
+        pass
     from PyQt5 import QtCore, QtWidgets
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)

@@ -1,0 +1,8 @@
+# Replace the names with the GitHub user names of the owners. A pull request that changes these files asks the owner for a review.
+/material_library/ @ARJU_GITHUB_NAME
+/ds3lib/ingest/ @ARJU_GITHUB_NAME
+/ds3/library_page.py @ARCHY_GITHUB_NAME
+/hvva/ @ARCHY_GITHUB_NAME
+/ds3/analysis_page.py @ARCHY_GITHUB_NAME
+/ds3/image_page.py @THIRD_TEAMMATE_GITHUB_NAME
+/viewer/ @THIRD_TEAMMATE_GITHUB_NAME

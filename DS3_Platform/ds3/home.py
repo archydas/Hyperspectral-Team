@@ -8,6 +8,12 @@ from .widgets import CardGrid, ModuleCard, StatCard, label, page_header, scroll_
 W = QtWidgets
 
 
+try:                                           # the DS3 web modules (Library, Image)
+    from . import web_pages as _wp  # noqa: F401
+    _WEB_HOME = True
+except Exception:
+    _WEB_HOME = False
+
 class HomePage(W.QWidget):
     def __init__(self, shell):
         super().__init__()
@@ -29,15 +35,19 @@ class HomePage(W.QWidget):
         lay.addWidget(stats)
         mods = CardGrid(min_width=300, max_cols=3, spacing=14)
         mods.set_cards([
-            ModuleCard("library", "Library", "Browse and search your spectral libraries; import any spectra format; "
+            ModuleCard("library", "Library (main)" if _WEB_HOME else "Library", "Browse and search your spectral libraries; import any spectra format; "
                        "build, view, resample, compare and export them.", "Open Library",
-                       lambda: shell.show_module("library")),
+                       lambda: shell.show_module("weblib" if _WEB_HOME else "library")),
             ModuleCard("analysis", "Data Aggregation", "Aggregate scenes into class signatures on a common grid, "
                        "mosaic and stack; export CSV, JSON or ENVI .sli.", "Open Data Aggregation",
                        lambda: shell.show_module("analysis")),
             ModuleCard("image", "Viewer and Analysis", "Open a hyperspectral image, preprocess, reduce (PCA / MNF), "
                        "classify, segment, unmix and compare with a library.", "Open Viewer and Analysis", lambda: shell.show_module("image")),
-        ])
+        ] + ([ModuleCard("library", "Library 2", "The Qt spectral library: import, filter by purity and category, rename "
+                         "and move libraries, resample and export.", "Open Library 2", lambda: shell.show_module("library"))]
+              if _WEB_HOME else []) + ([ModuleCard("image", "Image", "Open a hyperspectral image, collect pixel spectra, draw ROIs, build pixel and "
+                             "object libraries, georeference and aggregate.", "Open Image", lambda: shell.show_module("webimage"))]
+              if _WEB_HOME else []))
         lay.addWidget(mods)
         self.lbl_hint = label("", "small", wrap=True)
         lay.addWidget(self.lbl_hint)

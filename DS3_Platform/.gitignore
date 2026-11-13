@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.db
+.venv/
+material_library/data/uploads/
+material_library/data/patches/
+data/*.db
+*.bak

@@ -1,3 +1,5 @@
+> **Teams:** see [MODULES.md](MODULES.md) for which files belong to which module.
+
 # DS3 — Deep Spectral Signature System (desktop, v2.4)
 
 One PyQt5 program with the **DS3 interface** (the look of the `DS3_demo` web prototype) and **three modules** (sidebar order: Library · Data Aggregation · Viewer and Analysis)

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DS3 — Deep Spectral Signature System</title>
+<script src="js/compat.js"></script>
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/geotiff/geotiff.js"></script>
+<script src="vendor/fflate/index.js"></script>
+<link rel="stylesheet" href="css/app.css">
+<script>/* embedded in the DS3 Qt window: hide own sidebar + status bar at once (no flash, independent of cached css) */
+if(/[?&]embed=/.test(location.search)){var st=document.createElement("style");st.textContent=".sidebar{display:none!important}";document.head.appendChild(st);}</script>
+</head>
+<body>
+
+<div class="shell">
+  <div class="menubar" id="menubar"></div>
+  <input type="file" id="fileOpenInput" multiple style="display:none" onchange="openFromInput(this)">
+  <input type="file" id="fileSpecInput" multiple style="display:none" onchange="specFromInput(this)">
+
+  <div class="body-row">
+    <!-- sidebar -->
+    <aside class="sidebar" style="display:flex; flex-direction:column;">
+      <div class="logo" onclick="setView('dashboard')">
+        <span class="mark"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-8.49a6 6 0 0 0 0 8.49m11.31-11.31a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg></span>
+        <span class="name">DS3</span>
+      </div>
+
+      <p class="sec-label">Main modules</p>
+      <button class="nav-item" data-nav="library-list" onclick="setView('library-list')">
+        <span class="chip emerald"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+        Library
+      </button>
+      <button class="nav-item" data-nav="image" onclick="setView('image')">
+        <span class="chip blue"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>
+        Image
+      </button>
+      <button class="nav-item" data-nav="analysis" onclick="setView('analysis')">
+        <span class="chip violet"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg></span>
+        Analysis
+      </button>
+
+      <div class="status-dot" id="sideStatus"><span class="d"></span> Connecting…</div>
+    </aside>
+
+    <!-- main -->
+    <main id="main"></main>
+  </div>
+
+  <div class="statusbar" id="statusbar">Connecting to the database…</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+
+<!-- application code: plain scripts, loaded in this order (see js/ folder) -->
+<script src="js/core.js"></script>
+<script src="js/views-library.js"></script>
+<script src="js/image-legacy.js"></script>
+<script src="js/image-readers.js"></script>
+<script src="js/georef-legacy.js"></script>
+<script src="js/roi-labeling.js"></script>
+<script src="js/library-store-cnn.js"></script>
+<script src="js/render-master.js"></script>
+<script src="js/database.js"></script>
+<script src="js/image-module.js"></script>
+<script src="js/library-viewer.js"></script>
+<script src="js/builder-aggregation.js"></script>
+<script src="js/ui-shell.js"></script>
+<script src="js/analysis-windows.js"></script>
+<script src="js/compare.js"></script>
+<script src="js/image-page.js"></script>
+<script src="js/image-spectra.js"></script>
+<script src="js/object-samples.js"></script>
+<script src="js/georef.js"></script>
+<script src="js/builder-raw.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

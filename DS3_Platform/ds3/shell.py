@@ -13,6 +13,13 @@ from .home import HomePage
 from .image_page import BandsListDialog, ImagePage
 from .library_page import LibraryPage
 from .style import C
+# --- DS3 web modules ---
+try:
+    from .web_pages import WebBackend, WebPage
+    HAVE_WEB = True
+except Exception as _e:                      # PyQtWebEngine missing: the DS3 window works without the web modules
+    print('DS3 web modules not available:', _e)
+    HAVE_WEB = False
 from .widgets import Chip, icon_pixmap, label
 
 W = QtWidgets
@@ -66,6 +73,8 @@ class DS3Window(W.QMainWindow):
         self.library = LibraryPage(self, self.libpanel)
         self.home = HomePage(self)
         self.image = ImagePage(self)
+        self.webimage = WebPage(self, 'image', 'Image') if HAVE_WEB else None
+        self.weblib = WebPage(self, 'library', 'Library') if HAVE_WEB else None
         self._hook_libpanel()
 
         central = W.QWidget()
@@ -75,8 +84,9 @@ class DS3Window(W.QMainWindow):
         row.setSpacing(0)
         row.addWidget(self._build_sidebar())
         self.stack = W.QStackedWidget()
-        for p in (self.home, self.library, self.image, self.analysis):
-            self.stack.addWidget(p)
+        for p in (self.home, self.library, self.image, self.analysis, self.webimage, self.weblib):
+            if p is not None:
+                self.stack.addWidget(p)
         row.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self._build_menus()
@@ -136,12 +146,17 @@ class DS3Window(W.QMainWindow):
         self.nav = {}
         grp = self.nav_grp = W.QButtonGroup(self)
         grp.setExclusive(True)
-        for key, text in (("library", "Library"), ("analysis", "Data Aggregation"), ("image", "Viewer and Analysis")):
+        _base = {"weblib": "library", "webimage": "image"}
+        if HAVE_WEB:
+            _mods = [("weblib", "Library (main)"), ("library", "Library 2"), ("webimage", "Image"), ("analysis", "Data Aggregation"), ("image", "Viewer and Analysis")]
+        else:
+            _mods = [("library", "Library"), ("analysis", "Data Aggregation"), ("image", "Viewer and Analysis")]
+        for key, text in _mods:
             b = W.QPushButton("  " + text)
             style.prop(b, ds3="nav")
             b.setCheckable(True)
-            col, fill, border, _ = style.MODULE[key]
-            pm = self._tile(key, col, fill, border)
+            col, fill, border, _ = style.MODULE[_base.get(key, key)]
+            pm = self._tile(_base.get(key, key), col, fill, border)
             b.setIcon(QtGui.QIcon(pm))
             b.setIconSize(QtCore.QSize(26, 26))
             b.clicked.connect(lambda _=False, k=key: self.show_module(k))
@@ -170,10 +185,16 @@ class DS3Window(W.QMainWindow):
 
     def current_module(self):
         w = self.stack.currentWidget()
-        return {self.home: "home", self.library: "library", self.image: "image", self.analysis: "analysis"}.get(w)
+        return {self.home: "home", self.library: "library", self.image: "image", self.analysis: "analysis",
+                self.webimage: "webimage", self.weblib: "weblib"}.get(w)
 
     def show_module(self, key, keep_view=False):
-        if key == "image":
+        if key in ("webimage", "weblib"):
+            page = self.webimage if key == "webimage" else self.weblib
+            self.stack.setCurrentWidget(page)
+            QtCore.QTimer.singleShot(0, page.ensure)
+            QtCore.QTimer.singleShot(50, page.refresh_data)         # libraries saved elsewhere show up at once
+        elif key == "image":
             self.stack.setCurrentWidget(self.image)
             QtCore.QTimer.singleShot(0, self.image.ensure)
         else:
@@ -181,6 +202,8 @@ class DS3Window(W.QMainWindow):
             self.stack.setCurrentWidget(page)
             if key == "library" and not keep_view:
                 self.library.show_cards()
+            if key in ("library", "analysis", "home") and self.libpanel.client is not None and HAVE_WEB:
+                QtCore.QTimer.singleShot(50, self.libpanel.load_libraries)   # libraries saved by Library (main) / Image
             if key == "home":
                 self.refresh_counts()
         for k, b in self.nav.items():
@@ -306,7 +329,10 @@ class DS3Window(W.QMainWindow):
         # View
         m = mb.addMenu("View")
         self._act(m, "Home (3 modules)", lambda: self.show_module("home"))
-        self._act(m, "Library", lambda: self.show_module("library"), "Ctrl+1")
+        self._act(m, "Library (main)" if HAVE_WEB else "Library", lambda: self.show_module("weblib" if HAVE_WEB else "library"), "Ctrl+1")
+        if HAVE_WEB:
+            self._act(m, "Image", lambda: self.show_module("webimage"), "Ctrl+4")
+            self._act(m, "Library 2", lambda: self.show_module("library"), "Ctrl+5")
         self._act(m, "Data Aggregation", lambda: self.show_module("analysis"), "Ctrl+2")
         self._act(m, "Viewer and Analysis", lambda: self.show_module("image"), "Ctrl+3")
         m.addSeparator()
@@ -592,6 +618,11 @@ class DS3Window(W.QMainWindow):
             "<br><br><b>Kapih Team</b>"))
 
     def closeEvent(self, ev):
+        try:
+            if HAVE_WEB:
+                WebBackend.get().stop()
+        except Exception:                                                        # noqa: BLE001
+            pass
         try:
             self.libpanel.shutdown()
         except Exception:                                                        # noqa: BLE001

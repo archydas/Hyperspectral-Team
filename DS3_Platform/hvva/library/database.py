@@ -63,6 +63,16 @@ class Database:
         if self.url.startswith("postgresql"):
             kw["connect_args"] = {"connect_timeout": connect_timeout}
         self.engine = create_engine(self.url, **kw)
+        if self.url.startswith("sqlite"):                       # DS3: Library 1 / Image write to the same file
+            from sqlalchemy import event
+
+            @event.listens_for(self.engine, "connect")
+            def _sqlite_wait(dbapi_conn, _):
+                dbapi_conn.execute("PRAGMA busy_timeout=30000")
+                try:
+                    dbapi_conn.execute("PRAGMA journal_mode=WAL")
+                except Exception:                              # noqa: BLE001
+                    pass
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
     @property

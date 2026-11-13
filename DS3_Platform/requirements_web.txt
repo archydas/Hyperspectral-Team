@@ -1,0 +1,9 @@
+# Extra packages for the DS3 web modules (Library, Image). Install after requirements.txt:
+#     pip install -r requirements_web.txt
+PyQtWebEngine>=5.15       # shows the web pages inside the Qt window
+fastapi>=0.110
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+psycopg[binary]>=3.2      # PostgreSQL driver of the web modules (the Qt modules use psycopg2)
+python-dotenv>=1.0
+python-multipart>=0.0.9
