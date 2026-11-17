@@ -363,7 +363,6 @@ class DS3Window(W.QMainWindow):
         m.addSeparator()
         self._act(m, "Collected Spectra (Data Aggregation)…", lambda: (self.show_module("analysis"), an.on_show_collected()))
         self._act(m, "Library Images…", lambda: an.on_library_images())
-        self._act(m, "Plugins", lambda: self.analysis.goto_tab("Plugins"))
         # Spectral
         m = mb.addMenu("Spectral")
         sub = m.addMenu("Spectral Libraries")
@@ -605,8 +604,8 @@ class DS3Window(W.QMainWindow):
             "the category tree, materials, spectrum, compare, match and the filters (acquisition, unit, purity, "
             "covers). Spectral ▸ Spectral Libraries: Builder, Viewer, Resampling, Export.\n\n"
             "Data Aggregation: add scenes (or send the image from Viewer and Analysis), draw ROIs per class, Wavelength "
-            "Grid ▸ Aggregation ▸ Signature Export (CSV / JSON / ENVI .sli or the library). Mosaic / Stack, the "
-            "map background (for georeferenced files), Plugins."))
+            "Grid ▸ Aggregation ▸ Signature Export (CSV / JSON / ENVI .sli or the library). Mosaic / Stack and the "
+            "map background (for georeferenced files)."))
 
     def on_about(self):
         W.QMessageBox.about(self, f"About {APP_NAME}", (

@@ -315,21 +315,144 @@ class LibraryBuilderWindow(W.QMainWindow):
 
     # --- Mosaic tab -------------------------------------------------------
     def _tab_mosaic(self):
+        self.cb_msource = W.QComboBox()
+        self.cb_msource.addItems(["Scenes (two or more scenes)", "ROIs of one scene (same scene)"])
+        self.cb_msource.setToolTip("Build from whole scenes, or from the ROIs drawn on one scene (ROI Analysis tab).")
         self.cb_mode = W.QComboBox(); self.cb_mode.addItems(["Mosaic (side by side)", "Composite (same area)", "Stack cube (same area)"])
         self.cb_blend = W.QComboBox(); self.cb_blend.addItems(["mean", "first", "last", "max"])
         self.cb_comp = W.QComboBox(); self.cb_comp.addItems(["mean", "median", "max", "min"])
         self.ed_mname = W.QLineEdit("mosaic")
         btn = W.QPushButton("Build"); btn.clicked.connect(self.on_build)
-        form = W.QFormLayout(); form.addRow("Operation", self.cb_mode); form.addRow("Overlap blend (mosaic)", self.cb_blend)
+        form = W.QFormLayout(); form.addRow("Source", self.cb_msource); form.addRow("Operation", self.cb_mode)
+        form.addRow("Overlap blend (mosaic)", self.cb_blend)
         form.addRow("Composite method", self.cb_comp); form.addRow("Result name", self.ed_mname); form.addRow(btn)
         left = _group("Mosaic / stack", _help(
-            "Uses the scenes selected in the Scenes tab (all scenes if fewer than two are selected). All scenes are "
-            "put on the common grid first. Mosaic places georeferenced scenes by map coordinates (same CRS and "
-            "pixel size required) and blends overlaps; scenes without georeferencing are laid out left to right. "
+            "Source = Scenes: uses the scenes selected in the Scenes tab (all scenes if fewer than two are selected). "
+            "All scenes are put on the common grid first. Mosaic places georeferenced scenes by map coordinates (same "
+            "CRS and pixel size required) and blends overlaps; scenes without georeferencing are laid out left to right. "
             "Composite collapses scenes of the same area to one cube. Stack cube keeps them as a 4-D array "
-            "(scenes, rows, cols, bands) and saves it as .npy."), form)
+            "(scenes, rows, cols, bands) and saves it as .npy.\n\n"
+            "Source = ROIs of one scene: no second scene is needed. Each ticked ROI of the chosen scene is cut out as a "
+            "patch (its bounding box). Mosaic lays the patches side by side (one row or N columns) or keeps them in "
+            "place on the scene; Composite centres them and collapses them pixel by pixel; Stack cube saves "
+            "(ROIs, rows, cols, bands) as .npy with a .json of the ROI names and classes. The ROI classes are kept "
+            "as a label map, so the result can go to Aggregation. The scene's own bands are used (no resampling)."), form)
+        # ROIs of one scene
+        self.cb_mroi_scene = W.QComboBox()
+        self.cb_mroi_scene.currentIndexChanged.connect(lambda _: self.refresh_mosaic_rois())
+        self.lst_mrois = W.QListWidget()
+        self.lst_mrois.setMinimumHeight(90)
+        b_all = W.QPushButton("All"); b_all.clicked.connect(lambda: self._mroi_check(True))
+        b_none = W.QPushButton("None"); b_none.clicked.connect(lambda: self._mroi_check(False))
+        b_sel = W.QPushButton("ROI Analysis selection")
+        b_sel.setToolTip("Tick the ROIs selected in the ROI Manager table (ROI Analysis tab)")
+        b_sel.clicked.connect(self._mroi_from_selection)
+        self.cb_mplace = W.QComboBox()
+        self.cb_mplace.addItem("Side by side (new image of the patches)", "side")
+        self.cb_mplace.addItem("In place (same scene size, rest = no data)", "in_place")
+        self.cb_moutside = W.QComboBox()
+        self.cb_moutside.addItem("Only the ROI pixels (rest of the box = no data)", "nan")
+        self.cb_moutside.addItem("Whole bounding box of each ROI", "bbox")
+        self.sp_mgap = W.QSpinBox(); self.sp_mgap.setRange(0, 50); self.sp_mgap.setValue(2); self.sp_mgap.setSuffix(" px")
+        self.sp_mcols = W.QSpinBox(); self.sp_mcols.setRange(0, 50); self.sp_mcols.setSpecialValueText("one row")
+        rform = W.QFormLayout()
+        rform.addRow("Scene", self.cb_mroi_scene)
+        rform.addRow("Placement (mosaic)", self.cb_mplace)
+        rform.addRow("Pixels used", self.cb_moutside)
+        rform.addRow("Gap between patches", self.sp_mgap)
+        rform.addRow("Columns", self.sp_mcols)
+        self.grp_mrois = _group("ROIs of one scene (draw them in the ROI Analysis tab)", self.lst_mrois,
+                                _row(b_all, b_none, b_sel), rform)
         self.lbl_mosaic = W.QLabel("Nothing built yet."); self.lbl_mosaic.setWordWrap(True)
-        return _pair(left, _group("Result", self.lbl_mosaic))
+        self.cb_msource.currentIndexChanged.connect(self._mosaic_source_changed)
+        self.cb_mode.currentIndexChanged.connect(lambda _: self._mosaic_source_changed())
+        self.cb_mplace.currentIndexChanged.connect(lambda _: self._mosaic_source_changed())
+        page = _pair(left, self.grp_mrois, _group("Result", self.lbl_mosaic))
+        self._mosaic_source_changed()
+        return page
+
+    def _mosaic_roi_mode(self):
+        return hasattr(self, "cb_msource") and self.cb_msource.currentIndex() == 1
+
+    def _mosaic_source_changed(self, *_):
+        roi = self._mosaic_roi_mode()
+        mode = self.cb_mode.currentIndex()
+        self.grp_mrois.setVisible(roi)
+        self.cb_blend.setEnabled(not roi and mode == 0)
+        self.cb_comp.setEnabled(mode == 1)
+        side = self.cb_mplace.currentData() == "side"
+        self.cb_mplace.setEnabled(mode == 0)
+        self.sp_mgap.setEnabled(mode == 0 and side)
+        self.sp_mcols.setEnabled(mode == 0 and side)
+        if roi:
+            self.refresh_mosaic_rois()
+            if self.ed_mname.text().strip() in ("", "mosaic", "composite", "stack"):
+                self.ed_mname.setText(("roi_mosaic", "roi_composite", "roi_stack")[mode])
+        elif self.ed_mname.text().strip() in ("", "roi_mosaic", "roi_composite", "roi_stack"):
+            self.ed_mname.setText(("mosaic", "composite", "stack")[mode])
+
+    def refresh_mosaic_rois(self):
+        """Scene list (scenes with ROIs) + the ROIs of the chosen scene; keeps the ticks by ROI id."""
+        if not hasattr(self, "cb_mroi_scene"):
+            return
+        cur = self.cb_mroi_scene.currentData()
+        cur_sc = self.current_scene()
+        self.cb_mroi_scene.blockSignals(True)
+        self.cb_mroi_scene.clear()
+        for i, sc in enumerate(self.scenes):
+            if sc.rois:
+                self.cb_mroi_scene.addItem(f"{sc.name}  ({len(sc.rois)} ROIs)", i)
+        if self.cb_mroi_scene.count() == 0:
+            self.cb_mroi_scene.addItem("(no scene has ROIs yet)", None)
+        want = cur if cur is not None else (self.scenes.index(cur_sc) if cur_sc in self.scenes else None)
+        j = self.cb_mroi_scene.findData(want) if want is not None else -1
+        self.cb_mroi_scene.setCurrentIndex(max(0, j))
+        self.cb_mroi_scene.blockSignals(False)
+        sc = self._mosaic_roi_scene()
+        ticked = {self.lst_mrois.item(i).data(QtCore.Qt.UserRole) for i in range(self.lst_mrois.count())
+                  if self.lst_mrois.item(i).checkState() == QtCore.Qt.Checked}
+        first = not getattr(self, "_mroi_seen", None) or self._mroi_seen != id(sc)
+        self._mroi_seen = id(sc)
+        self.lst_mrois.clear()
+        if sc is None:
+            return
+        from ..core.rois import roi_mask
+        h, w, _ = sc.cube.shape
+        for r in sc.rois:
+            it = W.QListWidgetItem(f"{r['name']}  ·  class {r['class']}  ·  {int(roi_mask(r, h, w).sum())} px")
+            it.setData(QtCore.Qt.UserRole, r["id"])
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if first or r["id"] in ticked else QtCore.Qt.Unchecked)
+            self.lst_mrois.addItem(it)
+
+    def _mosaic_roi_scene(self):
+        i = self.cb_mroi_scene.currentData() if hasattr(self, "cb_mroi_scene") else None
+        return self.scenes[i] if i is not None and 0 <= i < len(self.scenes) else None
+
+    def _mroi_check(self, on):
+        for i in range(self.lst_mrois.count()):
+            self.lst_mrois.item(i).setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+
+    def _mroi_from_selection(self):
+        sel = self.roipanel.selected_items()
+        if not sel:
+            return self.say("Select ROIs in the ROI Manager table (ROI Analysis tab) first.")
+        sc = sel[0][0]
+        if sc in self.scenes:
+            j = self.cb_mroi_scene.findData(self.scenes.index(sc))
+            if j >= 0:
+                self.cb_mroi_scene.setCurrentIndex(j)
+        ids = {r["id"] for s, r in sel if s is sc}
+        for i in range(self.lst_mrois.count()):
+            it = self.lst_mrois.item(i)
+            it.setCheckState(QtCore.Qt.Checked if it.data(QtCore.Qt.UserRole) in ids else QtCore.Qt.Unchecked)
+        if any(s is not sc for s, _r in sel):
+            self.say(f"Only the ROIs of '{sc.name}' were ticked: a ROI mosaic uses one scene.")
+
+    def _mosaic_rois_ticked(self, sc):
+        ids = [self.lst_mrois.item(i).data(QtCore.Qt.UserRole) for i in range(self.lst_mrois.count())
+               if self.lst_mrois.item(i).checkState() == QtCore.Qt.Checked]
+        return [r for r in sc.rois if r["id"] in ids] if sc else []
 
     # --- Export tab -------------------------------------------------------
     def _tab_export(self):
@@ -494,6 +617,7 @@ class LibraryBuilderWindow(W.QMainWindow):
             self.tbl_scenes.selectRow(keep)
         if hasattr(self, "roipanel"):
             self.roipanel.refresh()
+        self.refresh_mosaic_rois()
 
     # ------------------------------------------------------------ scenes
     def on_add_scenes(self):
@@ -1011,6 +1135,8 @@ class LibraryBuilderWindow(W.QMainWindow):
 
     # ------------------------------------------------------------ mosaic / stack
     def on_build(self):
+        if self._mosaic_roi_mode():
+            return self.on_build_rois()
         if not self._need_scenes(2):
             return
         use = self._selected_or_all()
@@ -1041,6 +1167,52 @@ class LibraryBuilderWindow(W.QMainWindow):
                                 f"{len(res.class_masks())} classes carried over.")
         self.say(self.lbl_mosaic.text() + " Added to the scene list.")
         self.plot_footprints()
+
+    def on_build_rois(self):
+        """Mosaic / composite / stack of the ticked ROIs of one scene (the same scene, no second image)."""
+        import json
+        from ..core.roi_mosaic import roi_composite, roi_mosaic, roi_stack
+        sc = self._mosaic_roi_scene()
+        rois = self._mosaic_rois_ticked(sc)
+        if sc is None or not rois:
+            return self._err("draw ROIs on a scene (ROI Analysis tab), then tick them here")
+        mode = self.cb_mode.currentIndex()
+        name = self.ed_mname.text().strip() or "roi_result"
+        outside = self.cb_moutside.currentData()
+        try:
+            if mode == 0:
+                res = roi_mosaic(sc, rois, self.cb_mplace.currentData(), self.sp_mgap.value(), self.sp_mcols.value(),
+                                 outside, name)
+            elif mode == 1:
+                res = roi_composite(sc, rois, self.cb_comp.currentText(), outside, name)
+            else:
+                arr, masks, meta = roi_stack(sc, rois, outside)
+                p, _ = W.QFileDialog.getSaveFileName(self, "Save ROI stack cube", name + ".npy", "NumPy (*.npy)")
+                if p:
+                    np.save(p, arr)
+                    base = os.path.splitext(p)[0]
+                    np.save(base + "_masks.npy", masks)
+                    info = {"scene": sc.name, "source_path": sc.path, "unit": sc.unit, "shape": list(arr.shape),
+                            "axes": "rois, rows, cols, bands", "outside": outside,
+                            "wavelengths_nm": None if sc.wavelengths is None else [float(v) for v in sc.wavelengths],
+                            "bad_bands": [int(b) for b in np.flatnonzero(sc.bad_bands)], "rois": meta}
+                    with open(base + ".json", "w", encoding="utf-8") as f:
+                        json.dump(info, f, indent=2)
+                self.lbl_mosaic.setText(
+                    f"ROI stack cube {arr.shape} (ROIs, rows, cols, bands) from '{sc.name}', {len(meta)} ROIs in "
+                    f"{len({m['class'] for m in meta})} classes" +
+                    (f" saved to {p} (+ _masks.npy and .json)." if p else " (not saved)."))
+                self.say(self.lbl_mosaic.text())
+                return
+        except Exception as e:                                               # noqa: BLE001
+            return self._err(e)
+        self.add_scene(res)
+        place = "in place" if mode == 0 and self.cb_mplace.currentData() == "in_place" else (
+            "side by side" if mode == 0 else f"composite ({self.cb_comp.currentText()})")
+        self.lbl_mosaic.setText(f"{res.name}: {len(rois)} ROIs of '{sc.name}' {place} - {res.shape[0]} x {res.shape[1]} px, "
+                                f"{res.n_bands} bands, {'georeferenced (' + str(res.geo.crs) + ')' if res.geo else 'not georeferenced'}, "
+                                f"{len(res.class_masks())} classes carried over.")
+        self.say(self.lbl_mosaic.text() + " Added to the scene list.")
 
     # ------------------------------------------------------------ export / library
     def _checked_sigs(self):
@@ -1253,6 +1425,8 @@ class LibraryBuilderWindow(W.QMainWindow):
             self.plot_coverage()
         elif name == "Aggregation":
             self.plot_aggregate()
+        elif name == "Mosaic / Stack":
+            self.refresh_mosaic_rois()
         elif name == "Library":
             self.libpanel.on_shown()
 

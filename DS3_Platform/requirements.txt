@@ -16,7 +16,7 @@ scikit-learn             # K-Means, PCA, RF / SVM (Image module)
 scikit-image             # image filters (Viewer and Analysis)
 joblib                   # save / load trained classifiers (Viewer and Analysis)
 psutil                   # free-memory check before deep-learning training (optional)
-# optional
+
 netCDF4
 zarr
 rasterio                 # GeoTIFF CRS + transform

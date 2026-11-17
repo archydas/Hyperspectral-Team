@@ -1,6 +1,6 @@
 """Data Aggregation module: the Library and Data Aggregation tool (hvva) - scene view with band selection, map and
-collected spectra; tabs Scenes, ROI Analysis, Wavelength Grid, Aggregation, Mosaic / Stack, Signature Export,
-Plugins (the Georeferencing tab is left out in DS3). Its Library tab moves to the Library module (same panel, same connection)."""
+collected spectra; tabs Scenes, ROI Analysis, Wavelength Grid, Aggregation, Mosaic / Stack, Signature Export
+(the Georeferencing and Plugins tabs are left out in DS3). Its Library tab moves to the Library module (same panel, same connection)."""
 from __future__ import annotations
 
 from PyQt5 import QtCore, QtWidgets
@@ -31,8 +31,8 @@ class AnalysisPage(W.QWidget):
         idx = win.tabs.indexOf(win.libpanel)              # the Library tab becomes the Library module
         if idx >= 0:
             win.tabs.removeTab(idx)
-        for i in reversed(range(win.tabs.count())):       # DS3: no Georeferencing tab in Data Aggregation
-            if win.tabs.tabText(i) == "Georeferencing":
+        for i in reversed(range(win.tabs.count())):       # DS3: no Georeferencing / Plugins tab in Data Aggregation
+            if win.tabs.tabText(i) in ("Georeferencing", "Plugins"):
                 win.tabs.removeTab(i)
         orig_say = win.say
 

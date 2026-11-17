@@ -2,7 +2,7 @@
 
     Library    spectral library database (hvva library panel: browse, import, filters, compare, match, Builder ...)
     Data Aggregation   aggregation across scenes (scenes, ROIs, wavelength grid, aggregation, mosaic / stack,
-                       signature export, map view, plugins)
+                       signature export, map view)
     Viewer and Analysis  the DS3 Viewer & Analysis Tool (display, preprocessing, band management, correction, analysis,
                        unmixing, PCA / MNF, classification, spectral matching, segmentation) + a Library tab linking the image to the database
 
