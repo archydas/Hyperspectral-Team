@@ -20,6 +20,13 @@ from .library_tools import Hub, ImportDialog, cell, get_spectrum, table
 W = QtWidgets
 Qt = QtCore.Qt
 SETTINGS = ("DS3", "native_image")
+# every file type the image readers open (ds3lib.ingest.api: ENVI, TIFF stacks, MATLAB, HDF5 / HDF4 / NetCDF,
+# NumPy, GDAL rasters) + .zip products (EnMAP ...)
+IMAGE_FILTER = ("Hyperspectral images (*.hdr *.tif *.tiff *.mat *.zip *.h5 *.he5 *.hdf5 *.hdf *.h4 *.nc *.nc4 *.cdf "
+                "*.npy *.npz *.img *.dat *.bin *.raw *.bsq *.bil *.bip *.hsi *.pix *.vrt *.jp2 *.ntf *.nitf *.lbl "
+                "*.fits *.fit *.L1R *.L1B *.kea);;ENVI (*.hdr *.img *.dat *.bin *.raw *.bsq *.bil *.bip *.hsi);;"
+                "GeoTIFF / TIFF (*.tif *.tiff);;MATLAB (*.mat);;HDF5 / HDF-EOS / NetCDF (*.h5 *.he5 *.hdf5 *.hdf *.h4 *.nc *.nc4);;"
+                "NumPy (*.npy *.npz);;Products in a zip (*.zip);;All files (*.*)")
 
 
 def dist_seg(p, a, b):
@@ -496,6 +503,8 @@ class ImageMainPage(W.QWidget):
             self.cb_img.addItem(f"{im['name']} ({im['rows']}×{im['cols']}×{im['bands']})", im["id"])
         if not self.images:
             self.cb_img.addItem("(no images yet)", None)
+        elif not cur:                                   # nothing shown yet: say so instead of naming an image
+            self.cb_img.insertItem(0, "— choose an image —", None)
         i = self.cb_img.findData(cur) if cur else -1
         self.cb_img.setCurrentIndex(max(0, i))
         self.cb_img.blockSignals(False)
@@ -504,15 +513,33 @@ class ImageMainPage(W.QWidget):
 
     def open_dialog(self, wl=None):
         paths, _ = W.QFileDialog.getOpenFileNames(
-            self, "Open image file", "", "Images (*.hdr *.tif *.tiff *.mat *.zip *.h5 *.hdf *.he5 *.nc *.img *.dat);;All files (*.*)")
+            self, "Open image file", self.settings.value("last_dir", "") or "", IMAGE_FILTER)
         if paths:
+            import os
+            self.settings.setValue("last_dir", os.path.dirname(paths[0]))
             self._open_paths(paths, wl)
 
     def _open_paths(self, paths, wl=None):
         self.busy_lab.setText("⌛ Reading the file(s)…")
+
+        def fail(m):
+            self.busy_lab.setText("")
+            if "no wavelengths" in m or "MissingWavelengths" in m or "no 'wavelength'" in m:
+                return self._ask_range(paths, m)
+            W.QMessageBox.warning(self, "Open image", m)
         run_bg(self.api.post, "/api/import/path", dict(paths=paths, wavelengths=wl or None),
-               done=lambda rep: self._after_open(rep, paths), failed=lambda m: (self.busy_lab.setText(""),
-                                                                               W.QMessageBox.warning(self, "Open image", m)))
+               done=lambda rep: self._after_open(rep, paths), failed=fail)
+
+    def _ask_range(self, paths, msg):
+        """The file carries no band wavelengths (plain TIFF stacks, NumPy, most .mat files ...): ask the sensor range."""
+        msg = msg.split(": ", 1)[-1] if msg.startswith("MissingWavelengthsError") else msg
+        wl, ok = W.QInputDialog.getText(
+            self, "Wavelengths needed", f"{msg}\n\nWavelength range of the sensor in nm, first band to last band "
+            "(the bands are spread evenly over it), for example 430-860 (ROSIS), 400-2500 (AVIRIS), 420-2450 (EnMAP):",
+            text=self.settings.value("last_range", "400-1000") or "400-1000")
+        if ok and wl.strip():
+            self.settings.setValue("last_range", wl.strip())
+            self._open_paths(paths, wl.strip())
 
     def _after_open(self, rep, paths):
         self.busy_lab.setText("")
@@ -536,10 +563,9 @@ class ImageMainPage(W.QWidget):
             return self.flash(f"{rep['imported']} spectra were added to the library “{rep.get('library')}” (no image in these files).")
         txt = "\n".join(f"{f['file']}: {f.get('detail')}" for f in bad) or \
             "No hyperspectral image was found in the chosen file(s). For ENVI, choose the .hdr file."
-        wl, ok = W.QInputDialog.getText(self, "Could not open", txt + "\n\nIf the file has no wavelengths, give the range of the "
-                                        "sensor (for example 430-860) and open it again:")
-        if ok and wl.strip():
-            self._open_paths(paths, wl.strip())
+        if any("no wavelengths" in (f.get("detail") or "") or "no 'wavelength'" in (f.get("detail") or "") for f in bad):
+            return self._ask_range(paths, txt)
+        W.QMessageBox.warning(self, "Open image", txt)
 
     def bands_dialog(self, image_id=None):
         image_id = image_id or (self.active["id"] if self.active else (self.images[0]["id"] if self.images else None))
@@ -857,20 +883,29 @@ class ImageMainPage(W.QWidget):
         if self.pixel:
             return dict(row=self.pixel[0], col=self.pixel[1], size=self.cb_win.currentData() or 1), \
                 f"pixel ({self.pixel[0]}, {self.pixel[1]})"
-        c = next((c for c in reversed(self.coll) if c.get("kind") == "px" and c.get("row", -1) >= 0), None)
+        c = next((c for c in reversed(self.coll_here()) if c.get("kind") == "px" and c.get("row", -1) >= 0), None)
         if c:
             return dict(row=c["row"], col=c["col"], size=1), "collected spectrum"
         return None, None
 
     # ================================================================== current spectrum
+    def coll_here(self):
+        """The collected spectra of the image shown now (each image keeps its own list)."""
+        iid = (self.active or {}).get("id")
+        return [c for c in self.coll if iid and (c.get("img") or {}).get("id") == iid]
+
+    def _img_ref(self):
+        a = self.active
+        return dict(id=a["id"], name=a["name"], path=a.get("path") or "") if a else None
+
     def add_current(self):
         s = self.spec
         if not s:
             return self.flash("Click a pixel (or finish an ROI) first.")
         if s["kind"] == "roi":
             return self.obj_add(s, self.ed_label.text(), self.ed_class.text())
-        if len(self.coll) >= 24:
-            return self.flash("At most 24 collected spectra: remove some first.")
+        if len(self.coll_here()) >= 24:
+            return self.flash("At most 24 collected spectra per image: remove some first.")
         a = self.active
         if any(c.get("row") == s["row"] and c.get("col") == s["col"] and (c.get("img") or {}).get("id") == a["id"]
                for c in self.coll):
@@ -898,11 +933,12 @@ class ImageMainPage(W.QWidget):
 
     def add_spectra_to_collected(self, spectra):
         for s in spectra:
-            if len(self.coll) >= 24:
+            if len(self.coll_here()) >= 24:
                 break
             self.coll_n += 1
             self.coll.append(dict(name=s["name"], color=DS_COLORS[(self.coll_n - 1) % len(DS_COLORS)], show=True, kind="px",
-                                  row=-1, col=-1, n=0, unit=s.get("unit"), wavelengths=self.wl, values=s["values"], img=None))
+                                  row=-1, col=-1, n=0, unit=s.get("unit"), wavelengths=self.wl, values=s["values"],
+                                  img=self._img_ref()))
         self.refresh_side()
 
     def set_overlay(self, pixmap, legend, unmatched=None):
@@ -961,8 +997,8 @@ class ImageMainPage(W.QWidget):
                     for p in pts:
                         items.append(marker(p[1], p[0], "#22d3ee", r=3, width=2))
             if self.ck_px.isChecked():
-                for i, c in enumerate(self.coll):
-                    if c.get("show") and c.get("kind") == "px" and (c.get("img") or {}).get("id") == a["id"] and c["row"] >= 0:
+                for i, c in enumerate(self.coll_here()):
+                    if c.get("show") and c.get("kind") == "px" and c["row"] >= 0:
                         items.append(marker(c["col"] + 0.5, c["row"] + 0.5, c["color"], str(i + 1)))
             if self.pixel and not self.roi["drawing"]:
                 items.append(marker(self.pixel[1] + 0.5, self.pixel[0] + 0.5, "#fbbf24", r=7, width=2))
@@ -1004,14 +1040,14 @@ class ImageMainPage(W.QWidget):
         s, a = self.spec, self.active
         ser, unit = [], None
         if self.ck_px.isChecked():
-            for c in self.coll:
+            for c in self.coll_here():                  # only this image's spectra
                 if c.get("show"):
                     x, y = xy(c["wavelengths"], c["values"])
                     ser.append(dict(name=c["name"], x=x, y=y, color=c["color"]))
                     unit = unit or c.get("unit")
         if self.ck_obj.isChecked():
             for o in self.objs:
-                if o.get("show", True) and o.get("values"):
+                if o.get("show", True) and o.get("values") and a and o.get("image_id") == a["id"]:
                     x, y = xy(o["wavelengths"], o["values"])
                     ser.append(dict(name=f"{o['name']} (ROI)", x=x, y=y, color=o["color"], ls="--"))
                     unit = unit or o.get("unit")
@@ -1057,10 +1093,12 @@ class ImageMainPage(W.QWidget):
 
     # ================================================================== collected spectra
     def _fill_coll(self):
-        self.coll_head.setText(f"Collected spectra ({len(self.coll)})")
+        here = self._coll_rows = self.coll_here()
+        other = len(self.coll) - len(here)
+        self.coll_head.setText(f"Collected spectra ({len(here)})" + (f"  ·  {other} more on other images" if other else ""))
         self.tbl_coll.blockSignals(True)
-        self.tbl_coll.setRowCount(len(self.coll))
-        for i, c in enumerate(self.coll):
+        self.tbl_coll.setRowCount(len(here))
+        for i, c in enumerate(here):
             it = W.QTableWidgetItem()
             it.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             it.setCheckState(Qt.Checked if c.get("show") else Qt.Unchecked)
@@ -1071,21 +1109,20 @@ class ImageMainPage(W.QWidget):
             self.tbl_coll.setItem(i, 0, it)
             nm = W.QTableWidgetItem(c["name"])
             self.tbl_coll.setItem(i, 1, nm)
-            where = (f"{c['row']}, {c['col']}" if c.get("row", -1) >= 0 else "analysis") + \
-                (f" · {c['img']['name']}" if c.get("img") and self.active and c["img"]["id"] != self.active["id"] else "")
+            where = f"{c['row']}, {c['col']}" if c.get("row", -1) >= 0 else "analysis"
             w = W.QTableWidgetItem(where)
             w.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.tbl_coll.setItem(i, 2, w)
         self.tbl_coll.blockSignals(False)
 
     def _coll_changed(self, it):
-        i = it.row()
-        if not 0 <= i < len(self.coll):
+        i, rows = it.row(), getattr(self, "_coll_rows", [])
+        if not 0 <= i < len(rows):
             return
         if it.column() == 0:
-            self.coll[i]["show"] = it.checkState() == Qt.Checked
+            rows[i]["show"] = it.checkState() == Qt.Checked
         elif it.column() == 1:
-            self.coll[i]["name"] = it.text().strip() or self.coll[i]["name"]
+            rows[i]["name"] = it.text().strip() or rows[i]["name"]
         self._draw_chart()
         self.refresh_view()
         self._map_markers()
@@ -1094,7 +1131,7 @@ class ImageMainPage(W.QWidget):
         return sorted({i.row() for i in tbl.selectedIndexes()})
 
     def _coll_all(self, on):
-        for c in self.coll:
+        for c in self.coll_here():
             c["show"] = on
         self.refresh_side()
         self.refresh_view()
@@ -1103,25 +1140,28 @@ class ImageMainPage(W.QWidget):
         rows = self._sel_rows(self.tbl_coll)
         if not rows:
             return self.flash("Select a row of the list first.")
-        for i, c in enumerate(self.coll):
+        for i, c in enumerate(self.coll_here()):
             c["show"] = i in rows
         self.refresh_side()
         self.refresh_view()
 
     def coll_remove(self):
-        for i in reversed(self._sel_rows(self.tbl_coll)):
-            self.coll.pop(i)
+        here = self.coll_here()
+        gone = [here[i] for i in self._sel_rows(self.tbl_coll) if 0 <= i < len(here)]
+        self.coll = [c for c in self.coll if not any(c is g for g in gone)]
         self.refresh_side()
         self.refresh_view()
 
     def coll_clear(self):
-        if self.coll and W.QMessageBox.question(self, "Collected spectra", "Delete all collected spectra?") == W.QMessageBox.Yes:
-            self.coll, self.coll_n = [], 0
+        here = self.coll_here()
+        if here and W.QMessageBox.question(self, "Collected spectra",
+                                           f"Delete the {len(here)} collected spectra of this image?") == W.QMessageBox.Yes:
+            self.coll = [c for c in self.coll if not any(c is h for h in here)]
             self.refresh_side()
             self.refresh_view()
 
     def coll_angles(self):
-        c = [x for x in self.coll if x.get("show")] or self.coll
+        c = [x for x in self.coll_here() if x.get("show")] or self.coll_here()
         if len(c) < 2:
             return self.flash("Collect at least 2 spectra.")
         d = W.QDialog(self)
@@ -1138,13 +1178,12 @@ class ImageMainPage(W.QWidget):
                 t.setItem(i, j, cell("–" if a is None else f"{a:.2f}", align=Qt.AlignCenter))
         t.resizeColumnsToContents()
         l.addWidget(t)
-        l.addWidget(small("Smaller angle = more similar shape (independent of brightness). Spectra of different images are "
-                          "compared band by band."))
+        l.addWidget(small("Smaller angle = more similar shape (independent of brightness)."))
         l.addWidget(btn("Close", d.accept))
         d.exec_()
 
     def coll_csv(self):
-        c = self.coll
+        c = self.coll_here()
         if not c:
             return
         wl = c[0]["wavelengths"]
@@ -1154,16 +1193,17 @@ class ImageMainPage(W.QWidget):
                  ["wavelength_nm"] + [s["name"] for s in c], rows)
 
     def coll_save(self):
-        if not self.coll:
+        here = self.coll_here()
+        if not here:
             return self.flash("Nothing to save.")
         nm = f"{(self.active or {}).get('name') or 'Image'} spectra"
-        d = SaveDialog(self, "Save collected spectra to a library", f"{len(self.coll)} spectra will be stored in the database.",
+        d = SaveDialog(self, "Save collected spectra to a library", f"{len(here)} spectra will be stored in the database.",
                        self.store, nm, "pixel")
         if not d.exec_():
             return
         v = d.values()
         items = []
-        for s in self.coll:
+        for s in here:
             im = s.get("img") or ({"id": self.active["id"], "name": self.active["name"], "path": self.active.get("path") or ""}
                                   if self.active else {})
             items.append(dict(name=s["name"], wavelengths_nm=s["wavelengths"], values=s["values"], unit=s.get("unit"),

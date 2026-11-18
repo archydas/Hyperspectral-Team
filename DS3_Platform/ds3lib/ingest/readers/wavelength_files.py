@@ -95,4 +95,20 @@ def find_sibling_xml(tif_path):
                 if c.is_file():
                     return c
     others = [f for f in p.parent.iterdir() if f.is_file() and f.name.lower().endswith("metadata.xml")]
-    return others[0] if len(others) == 1 else None
+    if len(others) == 1:
+        return others[0]
+    # renamed copies (e.g. downloaded / uploaded as 'ENMAP0_1.XML'): an .xml that names this product's datatake
+    import re as _re
+    m = _re.search(r"DT\d{6,}_\d{8}T\d{6}Z_\d{3}", p.name)
+    xmls = [f for f in p.parent.iterdir() if f.is_file() and f.suffix.lower() == ".xml"]
+    hits = []
+    for f in xmls:
+        try:
+            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                head = fh.read(4096)
+        except OSError:
+            continue
+        if "wavelengthCenterOfBand" in head or "<level_X" in head or "EnMAP" in head:
+            if m is None or m.group(0) in head:
+                hits.append(f)
+    return hits[0] if len(hits) == 1 else None

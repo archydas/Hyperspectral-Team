@@ -15,7 +15,7 @@ def _find_array(g):
     raise InvalidHeaderError(f"zarr group has none of the arrays {ARRAY_NAMES}")
 
 
-def read_zarr(path, unit=None, wavelengths=None, **_):
+def read_zarr(path, unit=None, wavelengths=None, wavelength_range=None, **_):
     g = zarr.open_group(str(path), mode="r")
     name = _find_array(g)
     a = g[name]
@@ -28,8 +28,11 @@ def read_zarr(path, unit=None, wavelengths=None, **_):
     wl = wavelengths if wavelengths is not None else at.get("wavelengths_nm", at.get("wavelengths"))
     if wl is None and "wavelengths" in g:
         wl = g["wavelengths"][:]
+    if wl is None and wavelength_range is not None:
+        wl = np.linspace(float(wavelength_range[0]), float(wavelength_range[1]), shape[2])
     if wl is None:
-        raise MissingWavelengthsError("zarr store has no 'wavelengths_nm' attribute or 'wavelengths' array")
+        raise MissingWavelengthsError(f"zarr store has no 'wavelengths_nm' attribute or 'wavelengths' array ({shape[2]} bands). "
+                                      "Give the sensor's wavelength range (for example 430-860) to open it.")
     if len(wl) != shape[2]:
         raise InvalidHeaderError(f"{len(wl)} wavelengths but {shape[2]} bands")
     bad = at.get("bad_band_mask")

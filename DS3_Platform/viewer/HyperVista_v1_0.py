@@ -14,6 +14,13 @@ Data Correction work (HyperVistap5):
       4. Noise reduction: NGmeet (validation mode with PSNR / SSIM, or denoise the active cube)
   * One processing history shared by every operation that changes the cube (View > Processing
     history), written into exported cube headers, and View > Revert to original cube.
+  * Target Detection tab: continuum removal; CEM, ACE, Signed ACE, MF, GLRT, AMSD and OSP detectors; threshold,
+    ground-truth comparison (Dice, precision, recall, AUC) and a comparison of all techniques.
+  * Library Matching tab: ECOSTRESS-style spectral library; segment a region with one library spectrum
+    (score map, threshold, original / segmented / overlaid view) and identify an unknown spectrum.
+  * Spectral Matching tab: SAM, SID, SID-SAM, JMSAM and NS3 scores; (1) match every pixel to ROI /
+    endmember / N-FINDR / PPI / FIPPI reference spectra with an RGB + matched-index display,
+    (2) similarity of every endmember to a chosen reference endmember.
 """
 import os
 import re
@@ -1951,6 +1958,449 @@ def spectral_angle_map(X, E, chunk=200000):
         best_idx[s:s + chunk] = j
         best_ang[s:s + chunk] = a
     return best_idx, best_ang
+
+
+# ----------------------------------------------------------------------
+# Spectral matching scores (SAM, SID, SID-SAM, JMSAM, NS3).
+# Formulas: MathWorks, "Spectral Matching and Target Detection Techniques" (R2026b).
+# Every score is "lower = more similar".
+# ----------------------------------------------------------------------
+MATCH_METHODS = [
+    ("sam", "SAM - Spectral Angle Mapper"),
+    ("sid", "SID - Spectral Information Divergence"),
+    ("sidsam", "SID-SAM"),
+    ("jmsam", "JMSAM - Jeffries-Matusita SAM"),
+    ("ns3", "NS3 - Normalized Spectral Similarity Score"),
+]
+MATCH_SHORT = {"sam": "SAM", "sid": "SID", "sidsam": "SID-SAM", "jmsam": "JMSAM", "ns3": "NS3"}
+SM_SOURCES = [
+    "ROI classes (mean per class)",
+    "Endmember list (Unmixing tab)",
+    "N-FINDR result (Unmixing tab)",
+    "PPI result (Unmixing tab)",
+    "FIPPI result (Unmixing tab)",
+]
+
+
+def spectral_match_scores(X, E, method="sam"):
+    """Score matrix (n_pixels, n_refs) between pixel spectra X (N, bands) and references E (M, bands).
+
+    sam    : alpha = acos(t.x / (|t||x|))                      (radians)
+    sid    : sum_i t_i log(t_i/x_i) + x_i log(x_i/t_i)         (spectra normalised to sum 1)
+    sidsam : SID * tan(alpha)
+    jmsam  : JM * tan(alpha), JM = 2(1 - exp(-B)), B = (mu_x-mu_t)^2 / (8 s)
+             + 0.5 ln(s / sqrt(sigma_x sigma_t)), s = (sigma_x + sigma_t) / 2 (mean / std of each spectrum)
+    ns3    : sqrt(E^2 + (1 - cos alpha)^2), E = sqrt(mean((x - t)^2))
+    """
+    if method not in MATCH_SHORT:
+        raise ValueError(f"Unknown matching method: {method}")
+    X = np.asarray(X, dtype=np.float64)
+    E = np.asarray(E, dtype=np.float64)
+    nx = np.maximum(np.linalg.norm(X, axis=1), 1e-12)
+    ne = np.maximum(np.linalg.norm(E, axis=1), 1e-12)
+    cos = np.clip((X @ E.T) / (nx[:, None] * ne[None, :]), -1.0, 1.0)
+    if method == "sam":
+        return np.arccos(cos)
+    if method == "ns3":
+        d2 = (X ** 2).sum(axis=1)[:, None] + (E ** 2).sum(axis=1)[None, :] - 2.0 * (X @ E.T)
+        e_dist = np.sqrt(np.maximum(d2, 0.0) / X.shape[1])
+        return np.sqrt(e_dist ** 2 + (1.0 - cos) ** 2)
+    alpha = np.arccos(cos)
+    if method in ("sid", "sidsam"):
+        eps = 1e-10
+        P = np.clip(X, eps, None)
+        P /= P.sum(axis=1, keepdims=True)
+        Q = np.clip(E, eps, None)
+        Q /= Q.sum(axis=1, keepdims=True)
+        lp, lq = np.log(P), np.log(Q)
+        sid = (P * lp).sum(axis=1)[:, None] + (Q * lq).sum(axis=1)[None, :] - P @ lq.T - lp @ Q.T
+        sid = np.maximum(sid, 0.0)
+        return sid if method == "sid" else sid * np.tan(alpha)
+    # jmsam
+    mx, sx = X.mean(axis=1)[:, None], np.maximum(X.std(axis=1), 1e-12)[:, None]
+    mt, st = E.mean(axis=1)[None, :], np.maximum(E.std(axis=1), 1e-12)[None, :]
+    s = (sx + st) / 2.0
+    b_dist = (mx - mt) ** 2 / (8.0 * s) + 0.5 * np.log(s / np.sqrt(sx * st))
+    jm = 2.0 * (1.0 - np.exp(-np.maximum(b_dist, 0.0)))
+    return jm * np.tan(alpha)
+
+
+def match_best(X, E, method="sam", chunk=20000, keep_scores=False, degrees=False,
+               progress=None, cancel=None):
+    """Best (minimum-score) reference for every pixel.
+
+    Returns (best_idx (N,), best_score (N,), scores (N, M) or None). Pixels with ~zero norm get idx -1 and
+    a NaN score. With degrees=True the SAM scores are returned in degrees.
+    """
+    E = np.asarray(E, dtype=np.float64)
+    N, M = X.shape[0], E.shape[0]
+    unit = 180.0 / np.pi if (degrees and method == "sam") else 1.0
+    best_idx = np.empty(N, dtype=np.int32)
+    best = np.empty(N, dtype=np.float32)
+    scores = np.empty((N, M), dtype=np.float32) if keep_scores else None
+    for s in range(0, N, chunk):
+        _check_cancel(cancel)
+        xb = np.asarray(X[s:s + chunk], dtype=np.float64)
+        sc = spectral_match_scores(xb, E, method) * unit
+        j = np.argmin(sc, axis=1)
+        b = sc[np.arange(len(j)), j]
+        zero = np.linalg.norm(xb, axis=1) <= 1e-12
+        j[zero] = -1
+        b[zero] = np.nan
+        best_idx[s:s + chunk] = j
+        best[s:s + chunk] = b
+        if scores is not None:
+            scores[s:s + chunk] = sc
+        if progress is not None:
+            progress(f"{MATCH_SHORT[method]}: {min(s + chunk, N)}/{N} pixels matched")
+    return best_idx, best, scores
+
+
+# ----------------------------------------------------------------------
+# Spectral library matching (ECOSTRESS-style spectra, segmentation, identification)
+# ----------------------------------------------------------------------
+def read_ecostress_spectrum(path):
+    """Read one library spectrum from an ECOSTRESS / ASTER / USGS-style text file (or a plain 2-column file).
+
+    The 'Key: value' header (Name, Type, Class, ... X Units, Y Units) becomes the metadata. Wavelengths are
+    converted to nm (micrometres are detected from the header or from the values) and sorted ascending;
+    reflectance in percent is converted to a fraction. Fill values (e.g. -1.2e34) are dropped.
+    Returns {"name","type","class","subclass","wavelength","values","meta","path"}.
+    """
+    import re
+    meta, wl, val = {}, [], []
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            parts = [q for q in re.split(r"[,;\t ]+", s) if q]
+            nums = None
+            if len(parts) >= 2:
+                try:
+                    nums = (float(parts[0]), float(parts[1]))
+                except ValueError:
+                    nums = None
+            if nums is not None:
+                if np.isfinite(nums[0]) and np.isfinite(nums[1]) and nums[1] > -1e3:
+                    wl.append(nums[0])
+                    val.append(nums[1])
+            elif ":" in s and not wl:
+                k, _, v = s.partition(":")
+                meta[k.strip()] = v.strip()
+    if len(wl) < 3:
+        raise ValueError("fewer than three numeric 'wavelength value' lines")
+    lower = {k.lower(): v for k, v in meta.items()}
+    xu = (lower.get("x units") or lower.get("wavelength unit") or lower.get("wavelength units") or "").lower()
+    yu = (lower.get("y units") or lower.get("data unit") or lower.get("data units") or "").lower()
+    wl = np.asarray(wl, dtype=float)
+    val = np.asarray(val, dtype=float)
+    if "wavenumber" in xu or "cm-1" in xu or "cm^-1" in xu:
+        raise ValueError("wavenumber spectra are not supported")
+    if "micro" in xu or "µ" in xu:
+        wl = wl * 1000.0
+    elif "nano" in xu:
+        pass
+    else:
+        wl = auto_wavelengths_to_nm(wl)
+    if "percent" in yu or "%" in yu:
+        val = val / 100.0
+    wl, idx = np.unique(wl, return_index=True)               # ascending, duplicates removed
+    val = val[idx]
+    return {"name": lower.get("name") or Path(path).stem, "type": lower.get("type", ""),
+            "class": lower.get("class", ""), "subclass": lower.get("subclass") or lower.get("sub class", ""),
+            "wavelength": wl, "values": val, "meta": meta, "path": str(path)}
+
+
+def score_spectrum_against_library(test_wl, test_vals, library, method="sid", min_overlap=0.5, match_level=True):
+    """Distance of one test spectrum to every library spectrum (lower = more similar).
+
+    Each reference is interpolated to the test wavelengths; only wavelengths inside the reference range are
+    used. A reference whose range covers less than `min_overlap` of the test bands (or fewer than 3 bands)
+    gets NaN. With match_level the reference is multiplied by one gain so both have the same mean level.
+    SAM scores are returned in degrees. Returns (scores, overlap_fraction), both of length len(library).
+    """
+    test_wl = np.asarray(test_wl, dtype=float)
+    test_vals = np.asarray(test_vals, dtype=float)
+    n_test = max(int(np.isfinite(test_vals).sum()), 1)
+    scores = np.full(len(library), np.nan)
+    overlap = np.zeros(len(library))
+    for i, ent in enumerate(library):
+        r = np.interp(test_wl, ent["wavelength"], ent["values"], left=np.nan, right=np.nan)
+        ok = np.isfinite(r) & np.isfinite(test_vals)
+        overlap[i] = ok.sum() / n_test
+        if ok.sum() < 3 or overlap[i] < min_overlap:
+            continue
+        x, t = test_vals[ok], r[ok]
+        if match_level and t.mean() > 0 and x.mean() > 0:
+            t = t * (x.mean() / t.mean())
+        sc = spectral_match_scores(x[None, :], t[None, :], method)[0, 0]
+        scores[i] = np.rad2deg(sc) if method == "sam" else sc
+    return scores, overlap
+
+
+def score_cube_against_spectrum(cube, wl_nm, ref_wl, ref_vals, method="sam", min_overlap=0.5, match_level=True,
+                                progress=None, cancel=None):
+    """Distance score of every pixel to one library spectrum -> (score_map (rows, cols), overlap, n_bands_used).
+
+    The reference is interpolated to the cube wavelengths and only bands inside its range are used.
+    NaN for pixels without valid data. SAM scores are in degrees.
+    """
+    rows, cols, bands = cube.shape
+    r = np.interp(np.asarray(wl_nm, dtype=float), ref_wl, ref_vals, left=np.nan, right=np.nan)
+    ok = np.isfinite(r)
+    frac = float(ok.mean())
+    if ok.sum() < 3 or frac < min_overlap:
+        raise RuntimeError(f"The reference covers only {frac * 100:.0f}% of the cube's bands "
+                           f"({int(ok.sum())} bands); the minimum overlap is {min_overlap * 100:.0f}%.")
+    X, valid_px = prepare_features(cube.reshape(-1, bands))
+    if not valid_px.any():
+        raise RuntimeError("The cube has no valid pixels.")
+    Xv = np.ascontiguousarray(X[valid_px][:, ok])
+    del X
+    t = r[ok]
+    if match_level and t.mean() > 0 and float(Xv.mean()) > 0:
+        t = t * (float(Xv.mean()) / t.mean())
+    _idx, best, _sc = match_best(Xv, t[None, :], method, degrees=True, progress=progress, cancel=cancel)
+    full = np.full(rows * cols, np.nan, dtype=np.float32)
+    full[valid_px] = best
+    return full.reshape(rows, cols), frac, int(ok.sum())
+
+
+def otsu_threshold(values, bins=256, log_scale=False):
+    """Otsu's threshold of the finite values (optionally computed on log10 of the values).
+
+    The log scale suits distance scores: they are heavy-tailed, and on a linear axis the split falls
+    between the dissimilar materials instead of between the matching pixels and the rest.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    if log_scale:
+        floor = max(float(v.max()) * 1e-6, 1e-12)
+        return float(10.0 ** otsu_threshold(np.log10(np.maximum(v, floor)), bins))
+    if v.min() == v.max():
+        return float(v.min())
+    hist, edges = np.histogram(v, bins=bins)
+    p = hist / hist.sum()
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    w0 = np.cumsum(p)
+    w1 = 1.0 - w0
+    m0 = np.cumsum(p * centers)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = (m0[-1] * w0 - m0) ** 2 / (w0 * w1)
+    return float(centers[int(np.argmax(np.nan_to_num(between)))])
+
+
+def rescale01(v):
+    """Linear rescale of the finite values to [0, 1] (like MATLAB rescale)."""
+    v = np.asarray(v, dtype=float)
+    lo, hi = np.nanmin(v), np.nanmax(v)
+    return (v - lo) / (hi - lo) if hi > lo else np.zeros_like(v)
+
+
+# ----------------------------------------------------------------------
+# Target detection (CEM, ACE, Signed ACE, MF, GLRT, AMSD, OSP)
+# Formulas: MathWorks, "Spectral Matching and Target Detection Techniques" (R2026b).
+# For every detector a HIGHER score means a higher probability that the target is present.
+# ----------------------------------------------------------------------
+TD_METHODS = [
+    ("cem", "CEM - Constrained Energy Minimization"),
+    ("ace", "ACE - Adaptive Cosine Estimator"),
+    ("signedace", "Signed ACE"),
+    ("mf", "MF - Matched Filter"),
+    ("glrt", "GLRT - Generalized Likelihood Ratio Test"),
+    ("amsd", "AMSD - Adaptive Matched Subspace Detector"),
+    ("osp", "OSP - Orthogonal Subspace Projection"),
+]
+TD_SHORT = {"cem": "CEM", "ace": "ACE", "signedace": "Signed ACE", "mf": "MF", "glrt": "GLRT",
+            "amsd": "AMSD", "osp": "OSP"}
+TD_SUBSPACE = {"amsd", "osp"}          # detectors that need background endmembers
+
+
+def continuum_remove_spectra(X, wl, chunk=20000, progress=None, cancel=None):
+    """Divide every spectrum (row of X) by its continuum, the upper convex hull over the wavelengths.
+
+    X: (n, bands) finite values; wl: (bands,). Returns float32 (n, bands); values are <= 1 for positive data
+    and equal 1 on the hull vertices. All spectra advance along their hull together, so it is vectorised.
+    """
+    X = np.asarray(X)
+    wl = np.asarray(wl, dtype=float)
+    n, B = X.shape
+    order = np.argsort(wl, kind="stable")
+    inv = np.argsort(order)
+    x = wl[order].copy()
+    if np.any(np.diff(x) <= 0):
+        x = x + np.arange(B) * 1e-6                       # strictly increasing for the slope computation
+    cols_idx = np.arange(B)[None, :]
+    out = np.empty((n, B), dtype=np.float32)
+    for s in range(0, n, chunk):
+        _check_cancel(cancel)
+        y = np.asarray(X[s:s + chunk][:, order], dtype=np.float64)
+        m = y.shape[0]
+        cont = np.empty_like(y)
+        cont[:, 0] = y[:, 0]
+        cur = np.zeros(m, dtype=np.int64)
+        active = np.flatnonzero(cur < B - 1)
+        for _ in range(B):                                 # a hull has at most B vertices
+            if active.size == 0:
+                break
+            ii = cur[active]
+            ya = y[active]
+            ar = np.arange(active.size)
+            y0 = ya[ar, ii]
+            dx = x[None, :] - x[ii][:, None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                slope = (ya - y0[:, None]) / dx
+            slope[dx <= 0] = -np.inf
+            j = np.argmax(slope, axis=1)                   # steepest line to a later band = next hull vertex
+            line = y0[:, None] + slope[ar, j][:, None] * dx
+            between = (cols_idx > ii[:, None]) & (cols_idx <= j[:, None])
+            ca = cont[active]
+            ca[between] = line[between]
+            cont[active] = ca
+            cur[active] = j
+            active = active[j < B - 1]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cr = np.where(cont > 1e-12, y / np.maximum(cont, 1e-12), 1.0)
+        out[s:s + chunk] = cr[:, inv]
+        if progress is not None:
+            progress(f"Removing the continuum: {min(s + chunk, n)}/{n} pixels")
+    return out
+
+
+def mean_covariance(X, chunk=50000):
+    """Mean and sample covariance of the rows of X (two passes, float64, chunked)."""
+    n, B = X.shape
+    s = np.zeros(B)
+    for a in range(0, n, chunk):
+        s += np.asarray(X[a:a + chunk], dtype=np.float64).sum(axis=0)
+    mu = s / n
+    ss = np.zeros((B, B))
+    for a in range(0, n, chunk):
+        d = np.asarray(X[a:a + chunk], dtype=np.float64) - mu
+        ss += d.T @ d
+    return mu, ss / max(n - 1, 1)
+
+
+def target_detection_scores(X, t, methods, background=None, reg=1e-5, chunk=20000, progress=None, cancel=None):
+    """Detection scores of every row of X for the target spectrum t -> {method: float32 (n,)}.
+
+    C is the covariance of X (background), mu its mean; C is regularised as C + reg*trace(C)/bands * I.
+      cem       t'C^-1 x / t'C^-1 t                              (raw spectra)
+      mf        t'C^-1 x / t'C^-1 t                              (mean-subtracted x and t)
+      ace       (t'C^-1 x)^2 / ((t'C^-1 t)(x'C^-1 x))            (mean-subtracted)
+      signedace (x'C^-1 t)|x'C^-1 t| / ((t'C^-1 t)(x'C^-1 x))   (mean-subtracted)
+      glrt      (t'C^-1 x)^2 / ((t'C^-1 t)(1 + x'C^-1 x))        (mean-subtracted)
+      osp       t'P_B x / t'P_B t                                 (raw), P_B = I - B(B'B)^+ B'
+      amsd      x'(P_B - P_E)x / x'P_B x                          (raw), E = [B t]
+    B holds the background endmembers (bands x k); an endmember equal to t is dropped. The AMSD score is the
+    target / background ratio (the reciprocal of the ratio printed in the MathWorks table), so a higher
+    score means more target for every method.
+    """
+    methods = list(methods)
+    t = np.asarray(t, dtype=np.float64).ravel()
+    n, nb = X.shape
+    need_stats = any(m in ("cem", "mf", "ace", "signedace", "glrt") for m in methods)
+    if need_stats:
+        mu, C = mean_covariance(X)
+        lam = reg * float(np.trace(C)) / nb if np.trace(C) > 0 else 1e-12
+        A = np.linalg.inv(C + lam * np.eye(nb))
+        tm = t - mu
+        At, Atm = A @ t, A @ tm
+        tAt, tmAtm = float(t @ At), float(tm @ Atm)
+        if min(abs(tAt) if "cem" in methods else 1.0, abs(tmAtm)) <= 0:
+            raise RuntimeError("The target has no variation relative to the background (t'C^-1 t = 0).")
+    if any(m in TD_SUBSPACE for m in methods):
+        Bm = np.zeros((0, nb)) if background is None else np.asarray(background, dtype=np.float64).reshape(-1, nb)
+        Bm = Bm[np.linalg.norm(Bm - t, axis=1) > 1e-3 * max(np.linalg.norm(t), 1e-12)] if Bm.shape[0] else Bm
+        Bc = Bm.T                                          # (bands, k)
+        I = np.eye(nb)
+        PB = I - Bc @ np.linalg.pinv(Bc) if Bc.shape[1] else I
+        Ec = np.column_stack([Bc, t])
+        PE = I - Ec @ np.linalg.pinv(Ec)
+        D = PB - PE
+        tPB = PB @ t
+        ospden = float(t @ tPB)
+        if "osp" in methods and ospden <= 1e-12 * float(t @ t):
+            raise RuntimeError("The target lies in the background subspace (OSP undefined). Use fewer "
+                               "background endmembers.")
+    out = {m: np.empty(n, dtype=np.float32) for m in methods}
+    for s in range(0, n, chunk):
+        _check_cancel(cancel)
+        xb = np.asarray(X[s:s + chunk], dtype=np.float64)
+        e = s + xb.shape[0]
+        if need_stats:
+            xm = xb - mu
+            if "cem" in methods:
+                out["cem"][s:e] = (xb @ At) / tAt
+            if "mf" in methods:
+                out["mf"][s:e] = (xm @ Atm) / tmAtm
+            if any(m in methods for m in ("ace", "signedace", "glrt")):
+                txm = xm @ Atm                                # t'C^-1 x
+                xAx = np.maximum(np.einsum("ij,ij->i", xm @ A, xm), 1e-12)
+                if "ace" in methods:
+                    out["ace"][s:e] = txm ** 2 / (tmAtm * xAx)
+                if "signedace" in methods:
+                    out["signedace"][s:e] = txm * np.abs(txm) / (tmAtm * xAx)
+                if "glrt" in methods:
+                    out["glrt"][s:e] = txm ** 2 / (tmAtm * (1.0 + xAx))
+        if "osp" in methods:
+            out["osp"][s:e] = (xb @ tPB) / ospden
+        if "amsd" in methods:
+            tot = np.einsum("ij,ij->i", xb @ PB, xb)          # energy outside the background subspace
+            tgt = np.einsum("ij,ij->i", xb @ D, xb)           # part of it along the target direction
+            out["amsd"][s:e] = np.where(tot > 1e-12, tgt / np.maximum(tot, 1e-12), 0.0)
+        if progress is not None:
+            progress(f"Target detection: {e}/{n} pixels scored")
+    return out
+
+
+def detection_metrics(pred, gt):
+    """Dice similarity, precision and recall of a binary detection against a binary ground truth."""
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
+    tp = int((pred & gt).sum())
+    fp = int((pred & ~gt).sum())
+    fn = int((~pred & gt).sum())
+    nan = float("nan")
+    return {"dice": 2.0 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else nan,
+            "precision": tp / (tp + fp) if (tp + fp) else nan,
+            "recall": tp / (tp + fn) if (tp + fn) else nan, "tp": tp, "fp": fp, "fn": fn}
+
+
+def roc_auc(score, gt):
+    """Area under the ROC curve of a score map against a binary ground truth (NaN scores ignored)."""
+    from scipy.stats import rankdata
+    score = np.asarray(score, dtype=float).ravel()
+    gt = np.asarray(gt, dtype=bool).ravel()
+    m = np.isfinite(score)
+    s, g = score[m], gt[m]
+    P = int(g.sum())
+    N = int(g.size - P)
+    if P == 0 or N == 0:
+        return float("nan")
+    r = rankdata(s)
+    return float((r[g].sum() - P * (P + 1) / 2.0) / (P * N))
+
+
+def best_dice_threshold(score, gt):
+    """Largest Dice similarity over all thresholds (detection = score > threshold) -> (dice, threshold)."""
+    score = np.asarray(score, dtype=float).ravel()
+    gt = np.asarray(gt, dtype=bool).ravel()
+    m = np.isfinite(score)
+    s, g = score[m], gt[m].astype(np.int64)
+    P = int(g.sum())
+    if P == 0 or s.size == 0:
+        return float("nan"), float("nan")
+    order = np.argsort(-s, kind="stable")
+    ss, tp = s[order], np.cumsum(g[order])
+    dice = 2.0 * tp / (np.arange(1, s.size + 1) + P)
+    distinct = np.r_[ss[1:] < ss[:-1], True]               # only cut between different scores
+    kb = int(np.argmax(np.where(distinct, dice, -1.0)))
+    thr = (ss[kb] + ss[kb + 1]) / 2.0 if kb + 1 < ss.size else float(ss[kb]) - 1e-12
+    return float(dice[kb]), float(thr)
 
 
 def build_label_images(rois, class_names, rows, cols):
@@ -5344,7 +5794,16 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.roi_counter = 0
         self.show_roi_outlines = True
 
-        self.sam_angle_map = None
+        self.match_result = None         # last spectral-matching run (Spectral Matching tab, column 1)
+        self.sm2_result = None           # last endmember-similarity comparison (column 2)
+        self.spec_library = []           # Library Matching tab: reference spectra (dicts)
+        self.lib_seg = None              # score map / mask of the last library segmentation
+        self.lib_ident = None            # last identification of a test spectrum
+        self.lib_test_file = None        # (wavelengths_nm, values, name) of a loaded test spectrum
+        self.td_result = None            # Target Detection tab: active score map / mask
+        self.td_compare = None           # scores of all techniques
+        self.td_gt = None                # {'mask', 'name'} ground-truth target image
+        self._td_cache = None            # pixel matrix (continuum removed) reused between runs
         self.class_names_result = None
         self.last_report = None
         self._worker = None
@@ -6009,28 +6468,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         tab6 = QtWidgets.QWidget()
         tab6_layout = QtWidgets.QHBoxLayout(tab6)
 
-        sam_group = QtWidgets.QGroupBox("Spectral Angle Mapper (SAM)")
-        sam_layout = QtWidgets.QGridLayout(sam_group)
-        sam_layout.addWidget(QtWidgets.QLabel("Reference spectra:"), 0, 0)
-        self.combo_sam_source = QtWidgets.QComboBox()
-        self.combo_sam_source.addItems(
-            ["ROI classes (mean per class)", "Endmember list (Unmixing tab)"]
-        )
-        sam_layout.addWidget(self.combo_sam_source, 0, 1)
-        sam_layout.addWidget(QtWidgets.QLabel("Max angle (deg, 0 = none):"), 1, 0)
-        self.spin_sam_thr = QtWidgets.QDoubleSpinBox()
-        self.spin_sam_thr.setRange(0.0, 90.0)
-        self.spin_sam_thr.setDecimals(2)
-        self.spin_sam_thr.setSingleStep(0.5)
-        self.spin_sam_thr.setValue(0.0)
-        sam_layout.addWidget(self.spin_sam_thr, 1, 1)
-        self.btn_sam = QtWidgets.QPushButton("Run SAM classification")
-        self.btn_sam.clicked.connect(self.on_run_sam)
-        sam_layout.addWidget(self.btn_sam, 2, 0, 1, 2)
-        self.btn_sam_angle = QtWidgets.QPushButton("Show best-match angle map")
-        self.btn_sam_angle.clicked.connect(self.on_show_sam_angle)
-        sam_layout.addWidget(self.btn_sam_angle, 3, 0, 1, 2)
-        sam_layout.setRowStretch(4, 1)
+        # (the SAM widgets now live in the Spectral Matching tab: _build_spectral_matching_tab)
 
         # Supervised classification: Random Forest / SVM with the same workflow as the Segmentation tab
         self.clf_ctx = None
@@ -6255,13 +6693,10 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         tab6_layout.addLayout(right, 1)
         self.tabs.addTab(self._scroll_wrap(tab6), "Classification")
 
-        # ---- Spectral Matching tab (SAM) ----
-        tab_sm = QtWidgets.QWidget()
-        tab_sm_layout = QtWidgets.QHBoxLayout(tab_sm)
-        sam_group.setMaximumWidth(520)
-        tab_sm_layout.addWidget(sam_group, 0)
-        tab_sm_layout.addStretch(1)
-        self.tabs.addTab(self._scroll_wrap(tab_sm), "Spectral Matching")
+        # ---- Spectral Matching tab (SAM, SID, SID-SAM, JMSAM, NS3) ----
+        self._build_spectral_matching_tab()
+        self._build_library_matching_tab()
+        self._build_target_detection_tab()
 
         # ---- Segmentation tab (deep models of the Survey_2024 notebook; replaces the 2D CNN tab) ----
         tab8 = QtWidgets.QWidget()
@@ -7142,7 +7577,8 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
 
         self._busy_buttons = [self.btn_clf_train, self.btn_clf_cv, self.btn_clf_gt, self.btn_clf_preview,
                               self.btn_seg_train, self.btn_seg_gt, self.btn_seg_preview,
-                              self.btn_sam, self.btn_nmf, self.btn_ngmeet]
+                              self.btn_sam, self.btn_lib_score, self.btn_td_run, self.btn_td_compare,
+                              self.btn_nmf, self.btn_ngmeet]
         self.btn_stop = QtWidgets.QPushButton("Stop task")
         self.btn_stop.setVisible(False)
         self.btn_stop.clicked.connect(self.on_stop_task)
@@ -8901,7 +9337,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.roi_counter = 0
         self._refresh_roi_list()
         self._refresh_class_combo()
-        self.sam_angle_map = None
+        self._reset_extraction_and_matching()
         self.class_names_result = None
         self.last_report = None
 
@@ -9343,6 +9779,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.last_roi_mean_full = None
         self.endmembers = []
         self.endmember_label.setText("Endmembers: 0")
+        self._reset_extraction_and_matching()
         self.pca_scores = None
         self.pca_explained_ratio = None
         self.pca_valid_mask = None
@@ -9404,7 +9841,7 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         self.snr_band = None
         self.snr_pixel = None
         self.snr_label.setText("SNR: not computed")
-        self.sam_angle_map = None
+        self._reset_extraction_and_matching()
         self.anomaly_map = None
         self.class_labels = None
         self.class_rgb_map = None
@@ -10288,6 +10725,9 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
         if row < 0 or row >= rows or col < 0 or col >= cols:
             return
 
+        if hasattr(self, "spin_td_row"):                      # Target Detection tab: clicked pixel = target
+            self.spin_td_row.setValue(row)
+            self.spin_td_col.setValue(col)
         pix = np.asarray(self.cube[row, col, :], dtype=float).ravel()
         valid_band_mask = ~np.isnan(pix)
         if not np.any(valid_band_mask):
@@ -11008,84 +11448,1648 @@ class HyperspectralViewer(QtWidgets.QMainWindow):
             + (f", unclassified: {n_unc} px" if n_unc else "")
         )
 
-    def on_run_sam(self):
+    # ------------------------------------------------------------------
+    # Spectral Matching tab: (1) match pixels to reference spectra, (2) similarity between endmembers
+    # ------------------------------------------------------------------
+    def _build_spectral_matching_tab(self):
+        tab = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(tab)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        methods_help = (
+            "Lower score = more similar, for every method.\n"
+            "SAM: angle between the reference t and the pixel x, acos(t.x / (|t||x|)). Insensitive to "
+            "illumination changes.\n"
+            "SID: divergence between the spectra seen as probability distributions, sum t log(t/x) + x log(x/t). "
+            "Good for mixed pixels.\n"
+            "SID-SAM: SID x tan(SAM angle).\n"
+            "JMSAM: Jeffries-Matusita distance (from the Bhattacharyya distance of the spectra's mean and "
+            "standard deviation) x tan(SAM angle). Good for spectrally close targets.\n"
+            "NS3: sqrt(E^2 + (1 - cos(angle))^2), E = root-mean-square difference between the spectra. "
+            "Needs extensive reference data for high accuracy.")
+        methods_ref = "MathWorks. Spectral Matching and Target Detection Techniques (R2026b)."
+
+        # ---- Column 1: match every pixel to the reference spectra ----
+        g1 = QtWidgets.QGroupBox("1. Match pixels to reference spectra")
+        v1 = QtWidgets.QVBoxLayout(g1)
+        v1.setContentsMargins(8, 14, 8, 8)
+        v1.setSpacing(6)
+        v1.addWidget(self._help_box(
+            "1) In the Unmixing tab estimate the number of endmembers (HFC) and extract them (N-FINDR, PPI or "
+            "FIPPI).\n"
+            "2) Choose the reference source and plot the spectra.\n"
+            "3) Run: every pixel is scored against every reference; the reference with the minimum score is "
+            "the best match.\n"
+            "4) Show the RGB image next to the matched index map. An index n at (x, y) means the pixel at "
+            "(x, y) best matches reference n.\n\n" + methods_help, methods_ref, title="How to use / methods"))
+        form1 = QtWidgets.QFormLayout()
+        form1.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form1.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.combo_sam_source = QtWidgets.QComboBox()
+        self.combo_sam_source.addItems(SM_SOURCES)
+        self.combo_sam_source.setToolTip("N-FINDR / PPI / FIPPI results can be used directly, without adding "
+                                         "them to the endmember list first.")
+        form1.addRow("Reference spectra:", self.combo_sam_source)
+        self.combo_sm_method = QtWidgets.QComboBox()
+        for key, label in MATCH_METHODS:
+            self.combo_sm_method.addItem(label, key)
+        form1.addRow("Method:", self.combo_sm_method)
+        self.lbl_sam_thr = QtWidgets.QLabel("Max angle (deg, 0 = none):")
+        self.spin_sam_thr = QtWidgets.QDoubleSpinBox()
+        self.spin_sam_thr.setRange(0.0, 90.0)
+        self.spin_sam_thr.setDecimals(4)
+        self.spin_sam_thr.setSingleStep(0.5)
+        self.spin_sam_thr.setValue(0.0)
+        self.spin_sam_thr.setToolTip("Pixels whose best score is above this value stay unclassified (black).")
+        form1.addRow(self.lbl_sam_thr, self.spin_sam_thr)
+        v1.addLayout(form1)
+        self.combo_sm_method.currentIndexChanged.connect(self._sm_method_changed)
+
+        self.btn_sm_to_unmix = QtWidgets.QPushButton("Estimate / extract endmembers (go to Unmixing tab)")
+        self.btn_sm_to_unmix.clicked.connect(lambda: self._goto_tab("Unmixing"))
+        v1.addWidget(self.btn_sm_to_unmix)
+        self.btn_sm_plot_refs = QtWidgets.QPushButton("Plot reference spectra")
+        self.btn_sm_plot_refs.clicked.connect(self.on_sm_plot_refs)
+        v1.addWidget(self.btn_sm_plot_refs)
+        self.btn_sam = QtWidgets.QPushButton("Run spectral matching")
+        self.btn_sam.clicked.connect(self.on_run_sam)
+        v1.addWidget(self.btn_sam)
+        self.btn_sm_rgb_index = QtWidgets.QPushButton("Show RGB image and matched index map")
+        self.btn_sm_rgb_index.clicked.connect(self.on_sm_show_rgb_index)
+        v1.addWidget(self.btn_sm_rgb_index)
+        self.combo_sm_map = QtWidgets.QComboBox()
+        self.combo_sm_map.addItem("Best match (minimum score)")
+        v1.addWidget(self.combo_sm_map)
+        self.btn_sam_angle = QtWidgets.QPushButton("Show score map")
+        self.btn_sam_angle.clicked.connect(self.on_show_sam_angle)
+        v1.addWidget(self.btn_sam_angle)
+        self.sm_summary_label = QtWidgets.QLabel("Matching: not run")
+        self.sm_summary_label.setWordWrap(True)
+        v1.addWidget(self.sm_summary_label)
+        v1.addStretch(1)
+
+        # ---- Column 2: similarity between endmember spectra ----
+        g2 = QtWidgets.QGroupBox("2. Similarity between endmember spectra")
+        v2 = QtWidgets.QVBoxLayout(g2)
+        v2.setContentsMargins(8, 14, 8, 8)
+        v2.setSpacing(6)
+        v2.addWidget(self._help_box(
+            "Take one spectrum as the reference and score every other spectrum against it. The test spectrum "
+            "with the minimum score is the most similar to the reference; the one with the maximum score has "
+            "the highest spectral variability and characterises a different material.\n\n" + methods_help,
+            methods_ref, title="How to use / methods"))
+        form2 = QtWidgets.QFormLayout()
+        form2.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form2.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.combo_sm2_source = QtWidgets.QComboBox()
+        self.combo_sm2_source.addItems(SM_SOURCES)
+        self.combo_sm2_source.setCurrentIndex(2)
+        form2.addRow("Spectra:", self.combo_sm2_source)
+        self.combo_sm2_method = QtWidgets.QComboBox()
+        for key, label in MATCH_METHODS:
+            self.combo_sm2_method.addItem(label, key)
+        form2.addRow("Method:", self.combo_sm2_method)
+        self.spin_sm2_ref = QtWidgets.QSpinBox()
+        self.spin_sm2_ref.setRange(1, 1000)
+        self.spin_sm2_ref.setValue(1)
+        self.spin_sm2_ref.setToolTip("Number of the spectrum used as the reference (1 = first).")
+        form2.addRow("Reference spectrum #:", self.spin_sm2_ref)
+        v2.addLayout(form2)
+        self.btn_sm2_run = QtWidgets.QPushButton("Compare with reference spectrum")
+        self.btn_sm2_run.clicked.connect(self.on_sm2_compare)
+        v2.addWidget(self.btn_sm2_run)
+        self.btn_sm2_matrix = QtWidgets.QPushButton("Pairwise score matrix (all spectra)")
+        self.btn_sm2_matrix.clicked.connect(self.on_sm2_matrix)
+        v2.addWidget(self.btn_sm2_matrix)
+        self.sm2_text = QtWidgets.QPlainTextEdit()
+        self.sm2_text.setReadOnly(True)
+        self.sm2_text.setMinimumHeight(140)
+        self.sm2_text.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.sm2_text.setPlaceholderText("Scores of every test spectrum against the reference appear here.")
+        v2.addWidget(self.sm2_text, 1)
+
+        for g in (g1, g2):
+            g.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            g.setMinimumWidth(300)
+            lay.addWidget(g, 1)
+        self.tabs.addTab(self._scroll_wrap(tab), "Spectral Matching")
+
+    def _goto_tab(self, name):
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == name:
+                self.tabs.setCurrentIndex(i)
+                return
+
+    def _reset_extraction_and_matching(self):
+        """Drop endmember-extraction and spectral-matching results tied to the previous cube."""
+        self.nfindr_endmembers = None
+        self.ppi_endmembers = None
+        self.fippi_endmembers = None
+        self._hfc_details = None
+        for b in (self.btn_nfindr_add, self.btn_ppi_add, self.btn_fippi_add, self.btn_hfc_plot):
+            b.setEnabled(False)
+        self.hfc_result_label.setText("Estimated endmembers: not computed")
+        self.match_result = None
+        self.sm2_result = None
+        self.combo_sm_map.clear()
+        self.combo_sm_map.addItem("Best match (minimum score)")
+        self.sm_summary_label.setText("Matching: not run")
+        self.sm2_text.clear()
+        self.lib_seg = None
+        self.lib_seg_status.setText("Segmentation: not run")
+        self.td_result = None
+        self.td_compare = None
+        self._td_cache = None
+        self.td_status.setText("Detection: not run")
+        self.td_text.clear()
+
+    def _sm_method_changed(self, *_):
+        if self.combo_sm_method.currentData() == "sam":
+            self.lbl_sam_thr.setText("Max angle (deg, 0 = none):")
+            self.spin_sam_thr.setDecimals(4)
+            self.spin_sam_thr.setMaximum(90.0)
+        else:
+            self.lbl_sam_thr.setText("Max score (0 = none):")
+            self.spin_sam_thr.setDecimals(10)
+            self.spin_sam_thr.setMaximum(1e9)
+        self.spin_sam_thr.setValue(0.0)
+
+    def _sm_axis(self, n_bands):
+        wl = self.wavelengths
+        if wl is not None and len(wl) == n_bands and np.all(np.isfinite(wl)):
+            return np.asarray(wl, dtype=float), "Wavelength (nm)"
+        return np.arange(1, n_bands + 1), "Band Number"
+
+    def _sm_colors(self, names):
+        """Same colours as _show_classification, so the figure matches the main view."""
+        all_names = self._class_list()
+        palette = class_colors(max(1, len(all_names)))
+        fallback = class_colors(max(1, len(names)))
+        return [palette[all_names.index(n)] if n in all_names else fallback[k] for k, n in enumerate(names)]
+
+    def _sm_references(self, source):
+        """Reference spectra of a source: (E (M, bands) float64, names). NaN bands are kept."""
+        rows, cols, bands = self.cube.shape
+        if source == 0:
+            names = self._class_list()
+            if not names:
+                raise RuntimeError("Add labelled ROIs first in the ROI Analysis tab.")
+            refs = []
+            for name in names:
+                union = np.zeros((rows, cols), dtype=bool)
+                for roi in self.rois:
+                    if roi["class"] == name:
+                        union |= roi["mask"]
+                vals = np.asarray(self.cube[union], dtype=np.float64)
+                vals = vals[~np.all(np.isnan(vals), axis=1)]
+                if vals.shape[0] == 0:
+                    raise RuntimeError(f"Class '{name}' has no valid pixels.")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    refs.append(np.nanmean(vals, axis=0))
+            return np.vstack(refs), list(names)
+        if source == 1:
+            items = list(self.endmembers)
+            names = [f"E{i + 1}" for i in range(len(items))]
+            if not items:
+                raise RuntimeError("The endmember list is empty (add endmembers in the Unmixing tab).")
+        else:
+            attr, label = {2: ("nfindr_endmembers", "N-FINDR"), 3: ("ppi_endmembers", "PPI"),
+                           4: ("fippi_endmembers", "FIPPI")}[source]
+            arr = getattr(self, attr)
+            if arr is None:
+                raise RuntimeError(f"Run {label} first (Unmixing tab, column 2).")
+            items = [np.asarray(e, dtype=float) for e in arr]
+            names = [f"{label} {i + 1}" for i in range(len(items))]
+        if any(np.asarray(e).size != bands for e in items):
+            raise RuntimeError("These spectra have a different number of bands than the active cube; "
+                               "extract them again.")
+        return np.vstack([np.asarray(e, dtype=np.float64).ravel() for e in items]), names
+
+    # ---- Task 1: pixels vs. reference spectra ----
+    def on_sm_plot_refs(self):
         if self.cube is None:
             QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
             return
-
-        rows, cols, bands = self.cube.shape
-        thr_deg = float(self.spin_sam_thr.value())
-        use_rois = self.combo_sam_source.currentIndex() == 0
-
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.info_label.setText("Running Spectral Angle Mapper...")
-            X, valid_px = prepare_features(self.cube.reshape(-1, bands))
+            E, names = self._sm_references(self.combo_sam_source.currentIndex())
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.warning(self, "Spectral matching", str(e))
+            return
+        x, xlabel = self._sm_axis(E.shape[1])
+        colors = self._sm_colors(names)
+        self.plot_canvas.show_multiline(
+            x, [(names[i], E[i], colors[i]) for i in range(len(names))],
+            title=f"Spectral signatures of the references - {len(names)} spectra",
+            xlabel=xlabel, ylabel="Data Values")
+        self.info_label.setText(f"Plotted {len(names)} reference spectra.")
 
-            if use_rois:
-                names = self._class_list()
-                if not names:
-                    raise RuntimeError("Add labelled ROIs first in the ROI Analysis tab.")
-                refs = []
-                for name in names:
-                    union = np.zeros((rows, cols), dtype=bool)
-                    for roi in self.rois:
-                        if roi["class"] == name:
-                            union |= roi["mask"]
-                    sel = union.ravel() & valid_px
-                    if not sel.any():
-                        raise RuntimeError(f"Class '{name}' has no valid pixels.")
-                    refs.append(X[sel].mean(axis=0))
-                E = np.vstack(refs)
-            else:
-                if not self.endmembers:
-                    raise RuntimeError("The endmember list is empty (add endmembers from ROIs first).")
-                names = [f"E{i + 1}" for i in range(len(self.endmembers))]
-                E = np.stack(self.endmembers, axis=0).astype(np.float32)
-                band_means = X[valid_px].mean(axis=0)
-                E = np.where(np.isnan(E), band_means, E)
+    def on_run_sam(self):
+        if self._busy:
+            return
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        method = self.combo_sm_method.currentData()
+        short = MATCH_SHORT[method]
+        thr = float(self.spin_sam_thr.value())
+        try:
+            E, names = self._sm_references(self.combo_sam_source.currentIndex())
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to run {short}:\n{e}")
+            return
+        if E.shape[0] < 2 and thr <= 0:
+            QtWidgets.QMessageBox.information(
+                self, "Threshold needed",
+                "With a single reference spectrum set a maximum value above 0, "
+                "otherwise every pixel would be assigned to it.")
+            return
+        cube = self.cube
+        rows, cols, bands = cube.shape
+        keep = rows * cols * E.shape[0] <= 30_000_000       # keep every score only when it fits in memory
 
-            if E.shape[0] < 2 and thr_deg <= 0:
-                raise RuntimeError(
-                    "With a single reference spectrum set a maximum angle above 0, "
-                    "otherwise every pixel would be assigned to it."
-                )
-
-            best_idx, best_ang = spectral_angle_map(X[valid_px], E)
-
-            labels = -np.ones(rows * cols, dtype=np.int32)
-            angle_full = np.full(rows * cols, np.nan, dtype=np.float32)
-            labels[valid_px] = best_idx
-            angle_full[valid_px] = best_ang
-
-            if thr_deg > 0:
+        def job(progress, cancel):
+            progress(f"{short}: preparing the pixel spectra...")
+            X, valid_px = prepare_features(cube.reshape(-1, bands))
+            if not valid_px.any():
+                raise RuntimeError("The cube has no valid pixels.")
+            Xv = X[valid_px]
+            del X
+            Ef = np.where(np.isnan(E), Xv.mean(axis=0), E)
+            idx_v, best_v, sc_v = match_best(Xv, Ef, method, keep_scores=keep, degrees=True,
+                                             progress=progress, cancel=cancel)
+            idx_full = -np.ones(rows * cols, dtype=np.int32)
+            idx_full[valid_px] = idx_v
+            best_full = np.full(rows * cols, np.nan, dtype=np.float32)
+            best_full[valid_px] = best_v
+            labels = idx_full.copy()
+            if thr > 0:
                 with np.errstate(invalid="ignore"):
-                    labels[angle_full > np.deg2rad(thr_deg)] = -1
+                    labels[best_full > thr] = -1
+            return {"method": method, "names": names, "E": Ef,
+                    "index": idx_full.reshape(rows, cols), "labels": labels.reshape(rows, cols),
+                    "score_map": best_full.reshape(rows, cols), "scores": sc_v, "valid_px": valid_px,
+                    "threshold": thr}
 
-            labels_img = labels.reshape(rows, cols)
-            self.class_labels = labels_img
-            self.sam_angle_map = np.rad2deg(angle_full).reshape(rows, cols)
-            self.class_names_result = names
+        self._start_job(job, self._finish_matching, f"Running {short} with {E.shape[0]} reference spectra...")
 
-            self._show_classification(labels_img, names, "SAM")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to run SAM:\n{e}")
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+    def _finish_matching(self, res):
+        self.match_result = res
+        self.class_labels = res["labels"]
+        self.class_names_result = res["names"]
+        self.combo_sm_map.clear()
+        self.combo_sm_map.addItem("Best match (minimum score)")
+        if res["scores"] is not None:
+            for n in res["names"]:
+                self.combo_sm_map.addItem(f"Score against {n}")
+        short = MATCH_SHORT[res["method"]]
+        unit = " deg" if res["method"] == "sam" else ""
+        sm = res["score_map"]
+        self.sm_summary_label.setText(
+            f"{short}: {len(res['names'])} references; best-match score {np.nanmin(sm):.4g} to "
+            f"{np.nanmax(sm):.4g}{unit}.")
+        self._show_classification(res["labels"], res["names"], short)
 
     def on_show_sam_angle(self):
-        if self.sam_angle_map is None:
-            QtWidgets.QMessageBox.information(self, "SAM not run", "Run SAM classification first.")
+        res = self.match_result
+        if res is None:
+            QtWidgets.QMessageBox.information(self, "Not run", "Run spectral matching first.")
             return
-        ang = self.sam_angle_map
-        img = self.robust_normalize(ang)
-        self.image_canvas.show_image(img)
-        self.band_label.setText("SAM best-match angle (dark = small angle = close match)")
+        short = MATCH_SHORT[res["method"]]
+        unit = " deg" if res["method"] == "sam" else ""
+        rows, cols = res["score_map"].shape
+        k = self.combo_sm_map.currentIndex()
+        if k <= 0:
+            m = res["score_map"]
+            what = f"{short} best-match score"
+        else:
+            if res["scores"] is None or k - 1 >= res["scores"].shape[1]:
+                QtWidgets.QMessageBox.information(
+                    self, "Not available", "Per-reference scores were not kept for this large cube.")
+                return
+            full = np.full(rows * cols, np.nan, dtype=np.float32)
+            full[res["valid_px"]] = res["scores"][:, k - 1]
+            m = full.reshape(rows, cols)
+            what = f"{short} score against {res['names'][k - 1]}"
+        self.image_canvas.show_image(self.robust_normalize(m))
+        self.band_label.setText(f"{what} (dark = low score = close match)")
         self._draw_roi_patch()
         self.info_label.setText(
-            f"SAM best-match angle map. Range: {np.nanmin(ang):.2f} to {np.nanmax(ang):.2f} degrees. "
-            "Use it to choose a sensible maximum-angle threshold."
-        )
+            f"{what}. Range: {np.nanmin(m):.4g} to {np.nanmax(m):.4g}{unit}. "
+            "Use it to choose a sensible maximum-score threshold.")
+
+    def on_sm_show_rgb_index(self):
+        res = self.match_result
+        if res is None:
+            QtWidgets.QMessageBox.information(self, "Not run", "Run spectral matching first.")
+            return
+        rgb, _bands = rgb_estimate(self.cube, self.wavelengths)
+        labels, names = res["labels"], res["names"]
+        M = len(names)
+        colors = self._sm_colors(names)
+        short = MATCH_SHORT[res["method"]]
+
+        def build(fig):
+            from matplotlib.colors import ListedColormap
+            ax1 = fig.add_subplot(1, 2, 1)
+            ax1.imshow(rgb)
+            ax1.set_title("Estimated RGB image", fontsize=10)
+            ax1.axis("off")
+            ax2 = fig.add_subplot(1, 2, 2)
+            cmap = ListedColormap(colors)
+            cmap.set_bad("black")
+            im = ax2.imshow(np.ma.masked_less(labels, 0), cmap=cmap, vmin=-0.5, vmax=M - 0.5,
+                            interpolation="nearest")
+            ax2.set_title(f"Matched endmember index ({short})", fontsize=10)
+            ax2.axis("off")
+            step = max(1, M // 12)
+            ticks = list(range(0, M, step))
+            cb = fig.colorbar(im, ax=ax2, ticks=ticks, fraction=0.046, pad=0.04)
+            if M <= 12:
+                cb.ax.set_yticklabels([f"{t + 1}: {names[t]}" for t in ticks], fontsize=8)
+            else:
+                cb.ax.set_yticklabels([str(t + 1) for t in ticks], fontsize=8)
+            fig.tight_layout()
+
+        self._show_figure_dialog("RGB image and matched index map", build, size=(11, 5))
+
+    # ---- Task 2: similarity between endmember spectra ----
+    def _sm2_inputs(self):
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return None
+        try:
+            E, names = self._sm_references(self.combo_sm2_source.currentIndex())
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.warning(self, "Spectral matching", str(e))
+            return None
+        if E.shape[0] < 2:
+            QtWidgets.QMessageBox.information(self, "Not enough spectra",
+                                              "At least two spectra are needed (one reference and one test).")
+            return None
+        ok = np.all(np.isfinite(E), axis=0)                 # bands usable for every spectrum
+        if int(ok.sum()) < 2:
+            QtWidgets.QMessageBox.warning(self, "Spectral matching",
+                                          "The spectra share fewer than two valid bands.")
+            return None
+        return E, names, ok, self.combo_sm2_method.currentData()
+
+    def on_sm2_compare(self):
+        inp = self._sm2_inputs()
+        if inp is None:
+            return
+        E, names, ok, method = inp
+        M = E.shape[0]
+        r = int(self.spin_sm2_ref.value()) - 1
+        if r < 0 or r >= M:
+            QtWidgets.QMessageBox.information(self, "Reference", f"Choose a reference between 1 and {M}.")
+            return
+        short = MATCH_SHORT[method]
+        unit = " deg" if method == "sam" else ""
+        test_idx = [i for i in range(M) if i != r]
+        sc = spectral_match_scores(E[test_idx][:, ok], E[r:r + 1][:, ok], method)[:, 0]
+        if method == "sam":
+            sc = np.rad2deg(sc)
+        k_min, k_max = int(np.argmin(sc)), int(np.argmax(sc))
+        minval, maxval = float(sc[k_min]), float(sc[k_max])
+        best, worst, ref = E[test_idx[k_min]], E[test_idx[k_max]], E[r]
+        self.sm2_result = {"method": method, "names": names, "reference": r, "test_idx": test_idx,
+                           "scores": sc, "min_idx": test_idx[k_min], "max_idx": test_idx[k_max]}
+
+        lines = [f"{short} scores against reference {names[r]}{' (deg)' if unit else ''}:"]
+        for i, v in zip(test_idx, sc):
+            tag = "  <- most similar" if i == test_idx[k_min] else ("  <- least similar" if i == test_idx[k_max] else "")
+            lines.append(f"{names[i]:<14}{v:10.4f}{tag}")
+        self.sm2_text.setPlainText("\n".join(lines))
+        self.info_label.setText(
+            f"{short}: most similar to {names[r]} is {names[test_idx[k_min]]} (score {minval:.4g}{unit}); "
+            f"least similar is {names[test_idx[k_max]]} (score {maxval:.4g}{unit}).")
+
+        x, xlabel = self._sm_axis(E.shape[1])
+        ink = "white" if self.theme == "dark" else "black"     # the "black" curve of the original example
+
+        def build(fig):
+            ax = fig.add_subplot(111)
+            ax.plot(x, ref, color="tab:blue", label=f"Reference spectrum ({names[r]})")
+            ax.plot(x, best, color=ink,
+                    label=f"Minimum score, most similar ({names[test_idx[k_min]]})")
+            ax.plot(x, worst, color="red",
+                    label=f"Maximum score, least similar ({names[test_idx[k_max]]})")
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Data Values")
+            ax.set_title(f"Similarity Between Spectra ({short})")
+            ax.grid(True, alpha=0.3)
+            kb = int(np.argmin(np.where(ok, np.abs(best - ref), np.inf)))
+            kw = int(np.argmax(np.where(ok, np.abs(worst - ref), -np.inf)))
+            ax.annotate(f"Min score: {minval:.4g}{unit}", xy=(x[kb], best[kb]), xytext=(0, -45),
+                        textcoords="offset points", ha="center", fontsize=9, annotation_clip=False,
+                        arrowprops=dict(arrowstyle="->", color=ink))
+            ax.annotate(f"Max score: {maxval:.4g}{unit}", xy=(x[kw], worst[kw]), xytext=(0, 45),
+                        textcoords="offset points", ha="center", fontsize=9, color="red",
+                        annotation_clip=False, arrowprops=dict(arrowstyle="->", color="red"))
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), fontsize=8)
+            fig.subplots_adjust(left=0.1, right=0.97, top=0.92, bottom=0.30)
+
+        self._show_figure_dialog("Similarity between spectra", build, size=(8, 6))
+
+    def on_sm2_matrix(self):
+        inp = self._sm2_inputs()
+        if inp is None:
+            return
+        E, names, ok, method = inp
+        short = MATCH_SHORT[method]
+        S = spectral_match_scores(E[:, ok], E[:, ok], method)
+        if method == "sam":
+            S = np.rad2deg(S)
+        np.fill_diagonal(S, 0.0)                            # a spectrum matches itself exactly
+        M = len(names)
+
+        def build(fig):
+            ax = fig.add_subplot(111)
+            im = ax.imshow(S, cmap="viridis")
+            ax.set_xticks(range(M))
+            ax.set_yticks(range(M))
+            ax.set_xticklabels([str(i + 1) for i in range(M)], fontsize=8)
+            ax.set_yticklabels([names[i] for i in range(M)] if M <= 20 else [str(i + 1) for i in range(M)],
+                               fontsize=8)
+            if M <= 12:
+                mid = (np.nanmin(S) + np.nanmax(S)) / 2.0
+                for i in range(M):
+                    for j in range(M):
+                        ax.text(j, i, f"{S[i, j]:.3g}", ha="center", va="center", fontsize=7,
+                                color="white" if S[i, j] < mid else "black")
+            ax.set_title(f"{short} score between spectra (lower = more similar)", fontsize=10)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+
+        self._show_figure_dialog("Pairwise score matrix", build, size=(7, 6))
+
+    # ------------------------------------------------------------------
+    # Library Matching tab: spectral library, region segmentation, identification of an unknown spectrum
+    # ------------------------------------------------------------------
+    def _build_library_matching_tab(self):
+        tab = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(tab)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+        ref = ("MathWorks. spectralMatch - Identify unknown regions or materials using spectral library "
+               "(R2026b). Examples: Segment Vegetation Regions in Hyperspectral Data Using Spectral Matching; "
+               "Identify Unknown Spectral Signature Using Spectral Matching.")
+        score_help = ("Scores: lower = more similar (SAM in degrees; 0.3 rad = 17.2 deg). A reference is "
+                      "interpolated to the test wavelengths and only the wavelengths inside its range are used; "
+                      "if it covers less than the minimum overlap of the test bands the score is NaN.")
+
+        # ---- Column 1: spectral library ----
+        g1 = QtWidgets.QGroupBox("1. Spectral library")
+        v1 = QtWidgets.QVBoxLayout(g1)
+        v1.setContentsMargins(8, 14, 8, 8)
+        v1.setSpacing(6)
+        v1.addWidget(self._help_box(
+            "Add reference spectra from ECOSTRESS / ASTER / USGS text files (the header gives name, type, class "
+            "and units; micrometres and percent are converted to nm and fractions), plain 'wavelength, value' "
+            "files, or the ASD spectra imported in the Unmixing tab. Select a row to use it as the reference "
+            "in step 2.", ref, title="How to use"))
+        self.btn_lib_add_files = QtWidgets.QPushButton("Add spectrum files (ECOSTRESS / CSV / TXT)...")
+        self.btn_lib_add_files.clicked.connect(self.on_lib_add_files)
+        v1.addWidget(self.btn_lib_add_files)
+        self.btn_lib_add_folder = QtWidgets.QPushButton("Add all spectra from a folder...")
+        self.btn_lib_add_folder.clicked.connect(self.on_lib_add_folder)
+        v1.addWidget(self.btn_lib_add_folder)
+        self.btn_lib_add_asd = QtWidgets.QPushButton("Add imported ASD spectra")
+        self.btn_lib_add_asd.clicked.connect(self.on_lib_add_asd)
+        v1.addWidget(self.btn_lib_add_asd)
+        row = QtWidgets.QHBoxLayout()
+        self.btn_lib_remove = QtWidgets.QPushButton("Remove selected")
+        self.btn_lib_remove.clicked.connect(self.on_lib_remove)
+        row.addWidget(self.btn_lib_remove)
+        self.btn_lib_clear = QtWidgets.QPushButton("Clear library")
+        self.btn_lib_clear.clicked.connect(self.on_lib_clear)
+        row.addWidget(self.btn_lib_clear)
+        v1.addLayout(row)
+        self.lib_table = QtWidgets.QTableWidget(0, 6)
+        self.lib_table.setHorizontalHeaderLabels(["Name", "Type", "Class", "Sub-class", "Range (nm)", "Points"])
+        self.lib_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.lib_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.lib_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.lib_table.verticalHeader().setVisible(False)
+        self.lib_table.horizontalHeader().setStretchLastSection(True)
+        self.lib_table.setMinimumHeight(200)
+        v1.addWidget(self.lib_table, 1)
+        self.lib_count_label = QtWidgets.QLabel("Library: 0 spectra")
+        v1.addWidget(self.lib_count_label)
+        self.btn_lib_plot = QtWidgets.QPushButton("Plot selected spectra")
+        self.btn_lib_plot.clicked.connect(self.on_lib_plot)
+        v1.addWidget(self.btn_lib_plot)
+        self.chk_lib_gain = QtWidgets.QCheckBox("Scale each reference to the data level (one gain)")
+        self.chk_lib_gain.setChecked(True)
+        self.chk_lib_gain.setToolTip(
+            "Library reflectance (fraction or percent) and image values (DN, radiance, reflectance) have "
+            "different scales. SAM, SID and SID-SAM ignore a gain; JMSAM and NS3 do not.")
+        v1.addWidget(self.chk_lib_gain)
+
+        # ---- Column 2: segment a region with one library spectrum ----
+        g2 = QtWidgets.QGroupBox("2. Segment a region with a library spectrum")
+        v2 = QtWidgets.QVBoxLayout(g2)
+        v2.setContentsMargins(8, 14, 8, 8)
+        v2.setSpacing(6)
+        v2.addWidget(self._help_box(
+            "1) Select the reference spectrum (e.g. vegetation) in the library table.\n"
+            "2) Compute the score map: every pixel is compared with the reference; low scores are strong "
+            "matches.\n"
+            "3) Show the map and histogram, choose a threshold (the Otsu button suggests one) and segment: "
+            "pixels with a score below the threshold form the region.\n"
+            "4) Show the original, segmented and overlaid images, or apply the segmentation to the cube "
+            "(pixels outside the region are set to 0).\n\n" + score_help, ref, title="How to use"))
+        form2 = QtWidgets.QFormLayout()
+        form2.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form2.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.lib_seg_ref_label = QtWidgets.QLabel("none selected")
+        self.lib_seg_ref_label.setWordWrap(True)
+        form2.addRow("Reference:", self.lib_seg_ref_label)
+        self.combo_lib_seg_method = QtWidgets.QComboBox()
+        for key, label in MATCH_METHODS:
+            self.combo_lib_seg_method.addItem(label, key)
+        form2.addRow("Method:", self.combo_lib_seg_method)
+        self.spin_lib_seg_overlap = QtWidgets.QSpinBox()
+        self.spin_lib_seg_overlap.setRange(1, 100)
+        self.spin_lib_seg_overlap.setValue(50)
+        self.spin_lib_seg_overlap.setSuffix(" %")
+        self.spin_lib_seg_overlap.setToolTip("Minimum share of the cube bands that the reference must cover.")
+        form2.addRow("Minimum overlap:", self.spin_lib_seg_overlap)
+        v2.addLayout(form2)
+        self.btn_lib_score = QtWidgets.QPushButton("Compute score map")
+        self.btn_lib_score.clicked.connect(self.on_lib_score)
+        v2.addWidget(self.btn_lib_score)
+        self.btn_lib_show_score = QtWidgets.QPushButton("Show score map and histogram")
+        self.btn_lib_show_score.clicked.connect(self.on_lib_show_score)
+        v2.addWidget(self.btn_lib_show_score)
+        thr_row = QtWidgets.QHBoxLayout()
+        self.lbl_lib_thr = QtWidgets.QLabel("Threshold (deg):")
+        thr_row.addWidget(self.lbl_lib_thr)
+        self.spin_lib_thr = QtWidgets.QDoubleSpinBox()
+        self.spin_lib_thr.setRange(0.0, 90.0)
+        self.spin_lib_thr.setDecimals(4)
+        self.spin_lib_thr.setSingleStep(0.5)
+        self.spin_lib_thr.setValue(17.2)
+        thr_row.addWidget(self.spin_lib_thr, 1)
+        self.btn_lib_otsu = QtWidgets.QPushButton("Otsu")
+        self.btn_lib_otsu.setToolTip("Suggest a threshold (Otsu on the log scores). A starting point: check it "
+                                     "against the histogram.")
+        self.btn_lib_otsu.clicked.connect(self.on_lib_otsu)
+        thr_row.addWidget(self.btn_lib_otsu)
+        v2.addLayout(thr_row)
+        self.combo_lib_seg_method.currentIndexChanged.connect(self._lib_seg_method_changed)
+        self.btn_lib_segment = QtWidgets.QPushButton("Segment (score below threshold)")
+        self.btn_lib_segment.clicked.connect(self.on_lib_segment)
+        v2.addWidget(self.btn_lib_segment)
+        self.btn_lib_montage = QtWidgets.QPushButton("Show original | segmented | overlaid")
+        self.btn_lib_montage.clicked.connect(self.on_lib_montage)
+        v2.addWidget(self.btn_lib_montage)
+        self.btn_lib_apply = QtWidgets.QPushButton("Apply segmentation to the cube (outside = 0)")
+        self.btn_lib_apply.clicked.connect(self.on_lib_apply)
+        v2.addWidget(self.btn_lib_apply)
+        self.lib_seg_status = QtWidgets.QLabel("Segmentation: not run")
+        self.lib_seg_status.setWordWrap(True)
+        v2.addWidget(self.lib_seg_status)
+        v2.addStretch(1)
+
+        # ---- Column 3: identify an unknown spectrum ----
+        g3 = QtWidgets.QGroupBox("3. Identify an unknown spectrum")
+        v3 = QtWidgets.QVBoxLayout(g3)
+        v3.setContentsMargins(8, 14, 8, 8)
+        v3.setSpacing(6)
+        v3.addWidget(self._help_box(
+            "Score a test spectrum against every library spectrum. The test spectrum can come from the cube "
+            "(ROI class means, endmembers, N-FINDR / PPI / FIPPI results) or from a file with its own "
+            "wavelengths. The table ranks the library from best to worst match; references that do not "
+            "overlap the test wavelengths are listed last as 'no overlap'.\n\n" + score_help,
+            ref, title="How to use"))
+        form3 = QtWidgets.QFormLayout()
+        form3.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form3.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.combo_lib_test_source = QtWidgets.QComboBox()
+        self.combo_lib_test_source.addItems(SM_SOURCES + ["Spectrum file (wavelength, value)"])
+        form3.addRow("Test spectrum:", self.combo_lib_test_source)
+        self.spin_lib_test_idx = QtWidgets.QSpinBox()
+        self.spin_lib_test_idx.setRange(1, 1000)
+        self.spin_lib_test_idx.setToolTip("Which spectrum of the chosen source to test (1 = first).")
+        form3.addRow("Spectrum #:", self.spin_lib_test_idx)
+        self.combo_lib_id_method = QtWidgets.QComboBox()
+        for key, label in MATCH_METHODS:
+            self.combo_lib_id_method.addItem(label, key)
+        self.combo_lib_id_method.setCurrentIndex(1)                       # SID, as in the example
+        form3.addRow("Method:", self.combo_lib_id_method)
+        self.spin_lib_id_overlap = QtWidgets.QSpinBox()
+        self.spin_lib_id_overlap.setRange(1, 100)
+        self.spin_lib_id_overlap.setValue(50)
+        self.spin_lib_id_overlap.setSuffix(" %")
+        self.spin_lib_id_overlap.setToolTip("Minimum share of the test bands that a reference must cover.")
+        form3.addRow("Minimum overlap:", self.spin_lib_id_overlap)
+        v3.addLayout(form3)
+        self.btn_lib_test_file = QtWidgets.QPushButton("Load test spectrum file...")
+        self.btn_lib_test_file.clicked.connect(self.on_lib_load_test_file)
+        v3.addWidget(self.btn_lib_test_file)
+        self.lib_test_file_label = QtWidgets.QLabel("no test file loaded")
+        self.lib_test_file_label.setWordWrap(True)
+        v3.addWidget(self.lib_test_file_label)
+        self.btn_lib_identify = QtWidgets.QPushButton("Identify test spectrum")
+        self.btn_lib_identify.clicked.connect(self.on_lib_identify)
+        v3.addWidget(self.btn_lib_identify)
+        self.lib_result_table = QtWidgets.QTableWidget(0, 6)
+        self.lib_result_table.setHorizontalHeaderLabels(["Rank", "Name", "Type", "Class", "Score", "Overlap"])
+        self.lib_result_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.lib_result_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.lib_result_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.lib_result_table.verticalHeader().setVisible(False)
+        self.lib_result_table.horizontalHeader().setStretchLastSection(True)
+        self.lib_result_table.setMinimumHeight(170)
+        self.lib_result_table.itemSelectionChanged.connect(self._lib_result_selected)
+        v3.addWidget(self.lib_result_table, 1)
+        self.btn_lib_plot_match = QtWidgets.QPushButton("Plot test spectrum vs. selected match")
+        self.btn_lib_plot_match.clicked.connect(self.on_lib_plot_match)
+        v3.addWidget(self.btn_lib_plot_match)
+        self.lib_detail_text = QtWidgets.QPlainTextEdit()
+        self.lib_detail_text.setReadOnly(True)
+        self.lib_detail_text.setMinimumHeight(110)
+        self.lib_detail_text.setPlaceholderText("Details of the selected library spectrum appear here.")
+        v3.addWidget(self.lib_detail_text)
+
+        for g in (g1, g2, g3):
+            g.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            g.setMinimumWidth(300)
+            lay.addWidget(g, 1)
+        self.lib_table.itemSelectionChanged.connect(self._lib_selection_changed)
+        self.tabs.addTab(self._scroll_wrap(tab), "Library Matching")
+
+    # ---- library handling ----
+    def _lib_refresh_table(self):
+        self.lib_table.setRowCount(len(self.spec_library))
+        for r, e in enumerate(self.spec_library):
+            wl = e["wavelength"]
+            cells = [e["name"], e["type"], e["class"], e["subclass"], f"{wl.min():.0f}-{wl.max():.0f}", str(wl.size)]
+            for c, text in enumerate(cells):
+                self.lib_table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
+        self.lib_table.resizeColumnsToContents()
+        self.lib_count_label.setText(f"Library: {len(self.spec_library)} spectra")
+        self._lib_selection_changed()
+
+    def _lib_selected_entries(self):
+        rows = sorted({i.row() for i in self.lib_table.selectedIndexes()})
+        return [self.spec_library[r] for r in rows if r < len(self.spec_library)]
+
+    def _lib_selection_changed(self):
+        sel = self._lib_selected_entries()
+        self.lib_seg_ref_label.setText(sel[0]["name"] if sel else "none selected")
+
+    def _lib_add_paths(self, paths):
+        known = {e.get("path") for e in self.spec_library}
+        added, failed = 0, []
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for p in paths:
+                if str(p) in known:
+                    continue
+                try:
+                    self.spec_library.append(read_ecostress_spectrum(p))
+                    added += 1
+                except Exception as e:
+                    failed.append(f"{Path(p).name}: {e}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._lib_refresh_table()
+        self.info_label.setText(f"Added {added} spectra to the library ({len(self.spec_library)} in total).")
+        if failed:
+            QtWidgets.QMessageBox.warning(
+                self, "Some files were skipped",
+                f"{len(failed)} file(s) could not be read:\n" + "\n".join(failed[:15])
+                + ("\n..." if len(failed) > 15 else ""))
+
+    def on_lib_add_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add spectra to the library", "", "Spectra (*.txt *.csv *.asc *.dat);;All files (*)")
+        if paths:
+            self._lib_add_paths(paths)
+
+    def on_lib_add_folder(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder with spectrum files")
+        if not d:
+            return
+        paths = sorted(str(p) for p in Path(d).iterdir() if p.suffix.lower() in (".txt", ".csv", ".asc", ".dat"))
+        if not paths:
+            QtWidgets.QMessageBox.information(self, "No spectra", "The folder has no .txt, .csv, .asc or .dat files.")
+            return
+        self._lib_add_paths(paths)
+
+    def on_lib_add_asd(self):
+        if not self.asd_library:
+            QtWidgets.QMessageBox.information(self, "No ASD spectra",
+                                              "Import ASD field spectra first (File menu or Unmixing tab).")
+            return
+        known = {e.get("path") for e in self.spec_library}
+        added = 0
+        for spec in self.asd_library:
+            if spec["path"] in known:
+                continue
+            wl = np.asarray(spec["wavelengths"], dtype=float)
+            order = np.argsort(wl)
+            self.spec_library.append({
+                "name": spec["name"], "type": "ASD field spectrum", "class": spec.get("kind", ""), "subclass": "",
+                "wavelength": wl[order], "values": np.asarray(spec["values"], dtype=float)[order],
+                "meta": dict(spec.get("meta", {})), "path": spec["path"]})
+            added += 1
+        self._lib_refresh_table()
+        self.info_label.setText(f"Added {added} ASD spectra to the library.")
+
+    def on_lib_remove(self):
+        rows = sorted({i.row() for i in self.lib_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            del self.spec_library[r]
+        self._lib_refresh_table()
+
+    def on_lib_clear(self):
+        self.spec_library = []
+        self.lib_ident = None
+        self.lib_result_table.setRowCount(0)
+        self.lib_detail_text.clear()
+        self._lib_refresh_table()
+
+    def on_lib_plot(self):
+        sel = self._lib_selected_entries()
+        if not sel:
+            QtWidgets.QMessageBox.information(self, "Nothing selected", "Select one or more library spectra.")
+            return
+        sel = sel[:25]
+        colors = class_colors(len(sel))
+
+        def build(fig):
+            ax = fig.add_subplot(111)
+            for c, e in zip(colors, sel):
+                ax.plot(e["wavelength"], e["values"], color=c, label=e["name"])
+            ax.set_xlabel("Wavelength (nm)")
+            ax.set_ylabel("Reflectance")
+            ax.set_title(f"Library spectra ({len(sel)})")
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7)
+            fig.tight_layout()
+
+        self._show_figure_dialog("Library spectra", build, size=(8, 5))
+
+    # ---- step 2: segment a region ----
+    def _lib_seg_method_changed(self, *_):
+        if self.combo_lib_seg_method.currentData() == "sam":
+            self.lbl_lib_thr.setText("Threshold (deg):")
+            self.spin_lib_thr.setDecimals(4)
+            self.spin_lib_thr.setMaximum(90.0)
+            self.spin_lib_thr.setValue(17.2)                       # 0.3 rad, as in the example
+        else:
+            self.lbl_lib_thr.setText("Threshold:")
+            self.spin_lib_thr.setDecimals(10)                      # SID-SAM / JMSAM scores can be ~1e-6
+            self.spin_lib_thr.setMaximum(1e9)
+            self.spin_lib_thr.setValue(0.3)
+
+    def on_lib_score(self):
+        if self._busy:
+            return
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        if self.wavelengths is None or len(self.wavelengths) != self.cube.shape[2]:
+            QtWidgets.QMessageBox.warning(self, "No wavelengths",
+                                          "Library matching needs the cube wavelengths.")
+            return
+        sel = self._lib_selected_entries()
+        if not sel:
+            QtWidgets.QMessageBox.information(self, "No reference", "Select a spectrum in the library table.")
+            return
+        ent = sel[0]
+        method = self.combo_lib_seg_method.currentData()
+        short = MATCH_SHORT[method]
+        min_ov = self.spin_lib_seg_overlap.value() / 100.0
+        gain = self.chk_lib_gain.isChecked()
+        cube = self.cube
+        wl_nm = auto_wavelengths_to_nm(self.wavelengths)
+
+        def job(progress, cancel):
+            score_map, frac, nb = score_cube_against_spectrum(
+                cube, wl_nm, ent["wavelength"], ent["values"], method, min_ov, gain, progress, cancel)
+            return {"score_map": score_map, "name": ent["name"], "method": method, "overlap": frac,
+                    "bands": nb, "mask": None}
+
+        self._start_job(job, self._finish_lib_score, f"{short}: matching every pixel with {ent['name']}...")
+
+    def _finish_lib_score(self, res):
+        self.lib_seg = res
+        sm = res["score_map"]
+        unit = " deg" if res["method"] == "sam" else ""
+        self.lib_seg_status.setText(
+            f"{MATCH_SHORT[res['method']]} scores against {res['name']}: {np.nanmin(sm):.4g} to "
+            f"{np.nanmax(sm):.4g}{unit} ({res['bands']} bands, {res['overlap'] * 100:.0f}% overlap). "
+            "Choose a threshold, then Segment.")
+        self.image_canvas.show_image(self.robust_normalize(sm))
+        self.band_label.setText(f"{MATCH_SHORT[res['method']]} score against {res['name']} (dark = strong match)")
+        self._draw_roi_patch()
+
+    def _lib_need_scores(self):
+        if self.lib_seg is None:
+            QtWidgets.QMessageBox.information(self, "No score map", "Compute the score map first.")
+            return None
+        return self.lib_seg
+
+    def on_lib_otsu(self):
+        res = self._lib_need_scores()
+        if res is None:
+            return
+        self.spin_lib_thr.setValue(min(otsu_threshold(res["score_map"], log_scale=True), self.spin_lib_thr.maximum()))
+
+    def on_lib_show_score(self):
+        res = self._lib_need_scores()
+        if res is None:
+            return
+        sm = res["score_map"]
+        short = MATCH_SHORT[res["method"]]
+        unit = " (deg)" if res["method"] == "sam" else ""
+        thr = float(self.spin_lib_thr.value())
+
+        def build(fig):
+            ax1 = fig.add_subplot(1, 2, 1)
+            im = ax1.imshow(sm, cmap="viridis")
+            ax1.set_title(f"Distance scores ({short}{unit}) - {res['name']}", fontsize=9)
+            ax1.axis("off")
+            fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+            ax2 = fig.add_subplot(1, 2, 2)
+            vals = sm[np.isfinite(sm)]
+            ax2.hist(vals, bins=100, color="tab:blue")
+            ax2.axvline(thr, color="red", linestyle="--", label=f"threshold {thr:.4g}")
+            ax2.set_xlabel(f"Score{unit}")
+            ax2.set_ylabel("Number of pixels")
+            ax2.set_title("Score histogram", fontsize=9)
+            ax2.legend(fontsize=8)
+            fig.tight_layout()
+
+        self._show_figure_dialog("Distance scores", build, size=(11, 4.5))
+
+    def on_lib_segment(self):
+        res = self._lib_need_scores()
+        if res is None:
+            return
+        thr = float(self.spin_lib_thr.value())
+        with np.errstate(invalid="ignore"):
+            bw = res["score_map"] < thr
+        res["mask"], res["threshold"] = bw, thr
+        labels = np.where(bw, 0, -1).astype(np.int32)
+        self.class_labels = labels
+        self.class_names_result = [res["name"]]
+        n = int(bw.sum())
+        self.lib_seg_status.setText(
+            f"Segmented {n} pixels ({100.0 * n / bw.size:.1f}%) with score below {thr:.4g} "
+            f"({MATCH_SHORT[res['method']]}, {res['name']}).")
+        self._show_classification(labels, [res["name"]], f"{MATCH_SHORT[res['method']]} < {thr:.4g}")
+
+    @staticmethod
+    def _stretch01(ch):
+        ch = np.asarray(ch, dtype=np.float32)
+        if np.all(np.isnan(ch)):
+            return np.zeros_like(ch)
+        lo, hi = np.nanpercentile(ch, (2, 98))
+        return np.clip((np.nan_to_num(ch, nan=lo) - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
+
+    def on_lib_montage(self):
+        res = self.lib_seg
+        if res is None or res.get("mask") is None:
+            QtWidgets.QMessageBox.information(self, "Not segmented", "Run Segment first.")
+            return
+        bw = res["mask"]
+        rgb, idx = rgb_estimate(self.cube, self.wavelengths)
+        seg = np.stack([self._stretch01(np.where(bw, self.cube[:, :, b], 0.0)) for b in idx], axis=2)
+        over = rgb.copy()
+        over[bw] = (1.0, 1.0, 0.0)                              # yellow overlay, like imoverlay
+
+        def build(fig):
+            for k, (img, title) in enumerate(((rgb, "Original Image"), (seg, "Segmented Image"),
+                                              (over, "Overlaid Image"))):
+                ax = fig.add_subplot(1, 3, k + 1)
+                ax.imshow(img)
+                ax.set_title(title, fontsize=10)
+                ax.axis("off")
+            fig.tight_layout()
+
+        self._show_figure_dialog("Original | Segmented | Overlaid", build, size=(13, 4.8))
+
+    def on_lib_apply(self):
+        res = self.lib_seg
+        if res is None or res.get("mask") is None:
+            QtWidgets.QMessageBox.information(self, "Not segmented", "Run Segment first.")
+            return
+        ans = QtWidgets.QMessageBox.question(
+            self, "Apply segmentation",
+            "Replace the active cube by the segmented cube (pixels outside the region set to 0)?\n"
+            "You can undo this with View > Revert to original cube.")
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        bw = res["mask"]
+        new = np.where(bw[:, :, None], self.cube, 0).astype(np.float32)
+        step = f"Spectral-match segmentation ({res['name']}, {MATCH_SHORT[res['method']]} < {res['threshold']:.4g})"
+        self._commit_cube(new, self.wavelengths, step,
+                          {"reference": res["name"], "method": MATCH_SHORT[res["method"]],
+                           "threshold": round(float(res["threshold"]), 6), "pixels kept": int(bw.sum())})
+
+    # ---- step 3: identify an unknown spectrum ----
+    def on_lib_load_test_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Test spectrum (wavelength, value)", "", "Spectra (*.txt *.csv *.asc *.dat);;All files (*)")
+        if not path:
+            return
+        try:
+            ent = read_ecostress_spectrum(path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Could not read the spectrum:\n{e}")
+            return
+        self.lib_test_file = (ent["wavelength"], ent["values"], ent["name"])
+        wl = ent["wavelength"]
+        self.lib_test_file_label.setText(f"{ent['name']}: {wl.size} points, {wl.min():.0f}-{wl.max():.0f} nm")
+        self.combo_lib_test_source.setCurrentIndex(len(SM_SOURCES))
+
+    def _lib_test_spectrum(self):
+        """(wavelengths_nm, values, name) of the chosen test spectrum, or None after telling the user."""
+        src = self.combo_lib_test_source.currentIndex()
+        if src == len(SM_SOURCES):
+            if self.lib_test_file is None:
+                QtWidgets.QMessageBox.information(self, "No test file", "Load a test spectrum file first.")
+                return None
+            return self.lib_test_file
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return None
+        if self.wavelengths is None or len(self.wavelengths) != self.cube.shape[2]:
+            QtWidgets.QMessageBox.warning(self, "No wavelengths", "Library matching needs the cube wavelengths.")
+            return None
+        try:
+            E, names = self._sm_references(src)
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.warning(self, "Library matching", str(e))
+            return None
+        k = int(self.spin_lib_test_idx.value()) - 1
+        if k >= E.shape[0]:
+            QtWidgets.QMessageBox.information(self, "Test spectrum", f"Choose a spectrum between 1 and {E.shape[0]}.")
+            return None
+        return auto_wavelengths_to_nm(self.wavelengths), E[k], names[k]
+
+    def on_lib_identify(self):
+        if not self.spec_library:
+            QtWidgets.QMessageBox.information(self, "Empty library", "Add reference spectra to the library first.")
+            return
+        test = self._lib_test_spectrum()
+        if test is None:
+            return
+        wl, vals, name = test
+        method = self.combo_lib_id_method.currentData()
+        short = MATCH_SHORT[method]
+        scores, overlap = score_spectrum_against_library(
+            wl, vals, self.spec_library, method, self.spin_lib_id_overlap.value() / 100.0,
+            self.chk_lib_gain.isChecked())
+        order = np.argsort(np.where(np.isnan(scores), np.inf, scores), kind="stable")
+        self.lib_ident = {"test": test, "method": method, "scores": scores, "overlap": overlap,
+                          "order": order}
+        unit = " (deg)" if method == "sam" else ""
+        self.lib_result_table.setHorizontalHeaderLabels(["Rank", "Name", "Type", "Class", f"{short}{unit}", "Overlap"])
+        self.lib_result_table.setRowCount(len(order))
+        for r, i in enumerate(order):
+            e = self.spec_library[i]
+            ok = np.isfinite(scores[i])
+            cells = [str(r + 1) if ok else "-", e["name"], e["type"], e["class"],
+                     f"{scores[i]:.5g}" if ok else "no overlap", f"{overlap[i] * 100:.0f}%"]
+            for c, text in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setData(QtCore.Qt.UserRole, int(i))
+                self.lib_result_table.setItem(r, c, item)
+        self.lib_result_table.resizeColumnsToContents()
+        n_ok = int(np.isfinite(scores).sum())
+        if n_ok == 0:
+            self.lib_detail_text.clear()
+            QtWidgets.QMessageBox.warning(
+                self, "No overlap",
+                "No library spectrum overlaps the test wavelengths enough. Lower the minimum overlap or add "
+                "references that cover this range.")
+            return
+        self.lib_result_table.selectRow(0)
+        best = self.spec_library[int(order[0])]
+        self.info_label.setText(
+            f"{short}: {name} matches {best['name']} best (score {scores[order[0]]:.5g}{' deg' if method == 'sam' else ''}); "
+            f"{n_ok} of {len(scores)} references overlap the test spectrum.")
+
+    def _lib_selected_result(self):
+        """(library entry, score) of the selected row of the result table, or None."""
+        rows = sorted({i.row() for i in self.lib_result_table.selectedIndexes()})
+        if not rows or self.lib_ident is None:
+            return None
+        item = self.lib_result_table.item(rows[0], 0)
+        if item is None:
+            return None
+        i = item.data(QtCore.Qt.UserRole)
+        return self.spec_library[i], float(self.lib_ident["scores"][i])
+
+    def _lib_result_selected(self):
+        sel = self._lib_selected_result()
+        if sel is None:
+            return
+        ent = sel[0]
+        lines = [f"Name: {ent['name']}"]
+        lines += [f"{k}: {v}" for k, v in ent["meta"].items() if k.lower() != "name"]
+        wl = ent["wavelength"]
+        lines.append(f"Wavelength range used: {wl.min():.1f}-{wl.max():.1f} nm ({wl.size} points)")
+        self.lib_detail_text.setPlainText("\n".join(lines))
+
+    def on_lib_plot_match(self):
+        sel = self._lib_selected_result()
+        if sel is None:
+            QtWidgets.QMessageBox.information(self, "Nothing selected", "Identify a test spectrum and select a row.")
+            return
+        ent, score = sel
+        twl, tvals, tname = self.lib_ident["test"]
+        tvals = np.asarray(tvals, dtype=float)
+        ok = np.isfinite(tvals)
+        short = MATCH_SHORT[self.lib_ident["method"]]
+
+        def build(fig):
+            ax = fig.add_subplot(111)
+            ax.plot(ent["wavelength"], rescale01(ent["values"]), color="tab:blue",
+                    label=f"Matching reference reflectance ({ent['name']})")
+            ax.plot(np.asarray(twl, dtype=float)[ok], rescale01(tvals[ok]), color="red",
+                    label=f"Test reflectance ({tname})")
+            ax.set_xlabel("Wavelength (nm)")
+            ax.set_ylabel("Reflectance value (rescaled to 0-1)")
+            ax.set_title(f"Test spectrum vs. library match ({short} score {score:.5g})", fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), fontsize=8)
+            fig.subplots_adjust(left=0.1, right=0.97, top=0.92, bottom=0.26)
+
+        self._show_figure_dialog("Test spectrum vs. library match", build, size=(8, 5.5))
+
+    # ------------------------------------------------------------------
+    # Target Detection tab: detect a target spectrum (CEM, ACE, Signed ACE, MF, GLRT, AMSD, OSP)
+    # ------------------------------------------------------------------
+    def _build_target_detection_tab(self):
+        tab = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(tab)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+        ref = ("MathWorks. Spectral Matching and Target Detection Techniques, and detectTarget "
+               "(example: Detect Target in Hyperspectral Image), R2026b.")
+        methods_help = (
+            "A higher score = a higher probability that the target is present. C is the covariance of the "
+            "image (background).\n"
+            "CEM: t'C^-1 x / t'C^-1 t on the raw spectra. Use when the background noise is minimal.\n"
+            "MF: the same formula on mean-subtracted spectra. Use for additive white Gaussian noise.\n"
+            "ACE: (t'C^-1 x)^2 / ((t'C^-1 t)(x'C^-1 x)) on mean-subtracted spectra. Use with significant "
+            "background clutter.\n"
+            "Signed ACE: like ACE but keeps the sign of the correlation.\n"
+            "GLRT: (t'C^-1 x)^2 / ((t'C^-1 t)(1 + x'C^-1 x)), similar to ACE.\n"
+            "AMSD: likelihood that x lies in the target subspace over the likelihood that it lies in the "
+            "background subspace, x'(P_B - P_E)x / x'P_B x. The table prints the inverse ratio, which falls "
+            "for targets; the target-over-background form is used here so that a higher score means more "
+            "target (the ranking is the same).\n"
+            "OSP: t'P_B x / t'P_B t with P_B = I - B(B'B)^-1 B'.\n"
+            "AMSD and OSP use background endmembers B (extracted from the image with N-FINDR, or taken from "
+            "the Unmixing tab); an endmember equal to the target is left out.")
+
+        # ---- Column 1: target and preprocessing ----
+        g1 = QtWidgets.QGroupBox("1. Target")
+        v1 = QtWidgets.QVBoxLayout(g1)
+        v1.setContentsMargins(8, 14, 8, 8)
+        v1.setSpacing(6)
+        v1.addWidget(self._help_box(
+            "1) Optionally normalise the image by removing the continuum of every spectrum (the example does "
+            "this first; the cube itself is not changed).\n"
+            "2) Choose the target: click a pixel of the target (e.g. a roof) on the image, or take a spectrum "
+            "from ROI classes, endmembers, N-FINDR / PPI / FIPPI results or the spectral library.\n"
+            "3) Plot the target spectrum to check it.", ref, title="How to use"))
+        self.chk_td_cr = QtWidgets.QCheckBox("Remove the continuum before detection")
+        self.chk_td_cr.setChecked(True)
+        self.chk_td_cr.setToolTip("Divides every spectrum by its upper convex hull (like removeContinuum). "
+                                  "The target and the background endmembers get the same treatment.")
+        v1.addWidget(self.chk_td_cr)
+        form1 = QtWidgets.QFormLayout()
+        form1.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form1.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.combo_td_target_source = QtWidgets.QComboBox()
+        self.combo_td_target_source.addItems(["Image pixel (row, col)"] + SM_SOURCES
+                                             + ["Library spectrum (Library Matching tab)"])
+        form1.addRow("Target from:", self.combo_td_target_source)
+        self.spin_td_row = QtWidgets.QSpinBox()
+        self.spin_td_row.setRange(0, 1000000)
+        self.spin_td_row.setToolTip("0-based, like the pixel read-out of the viewer. MATLAB (170, 133) is "
+                                    "row 169, col 132 here. Clicking the image fills row and column.")
+        form1.addRow("Pixel row:", self.spin_td_row)
+        self.spin_td_col = QtWidgets.QSpinBox()
+        self.spin_td_col.setRange(0, 1000000)
+        form1.addRow("Pixel column:", self.spin_td_col)
+        self.spin_td_idx = QtWidgets.QSpinBox()
+        self.spin_td_idx.setRange(1, 1000)
+        self.spin_td_idx.setToolTip("Which spectrum of ROI classes / endmembers / extraction result (1 = first).")
+        form1.addRow("Spectrum #:", self.spin_td_idx)
+        v1.addLayout(form1)
+        self.btn_td_plot_target = QtWidgets.QPushButton("Plot target spectrum")
+        self.btn_td_plot_target.clicked.connect(self.on_td_plot_target)
+        v1.addWidget(self.btn_td_plot_target)
+        self.td_target_label = QtWidgets.QLabel("Click a pixel of the target on the image (fills row / column).")
+        self.td_target_label.setWordWrap(True)
+        v1.addWidget(self.td_target_label)
+        v1.addStretch(1)
+
+        # ---- Column 2: detection ----
+        g2 = QtWidgets.QGroupBox("2. Detect")
+        v2 = QtWidgets.QVBoxLayout(g2)
+        v2.setContentsMargins(8, 14, 8, 8)
+        v2.setSpacing(6)
+        v2.addWidget(self._help_box(
+            "1) Choose the technique and compute the score of every pixel.\n"
+            "2) Look at the score map and histogram: with a clear target the histogram has two peaks. Set a "
+            "threshold between them (0.5 in the example; Otsu suggests one).\n"
+            "3) Detect: pixels with a score above the threshold contain the target.\n\n" + methods_help,
+            ref, title="How to use / techniques"))
+        form2 = QtWidgets.QFormLayout()
+        form2.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form2.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.combo_td_method = QtWidgets.QComboBox()
+        for key, label in TD_METHODS:
+            self.combo_td_method.addItem(label, key)
+        self.combo_td_method.setCurrentIndex(3)                           # MF, as in the example
+        form2.addRow("Technique:", self.combo_td_method)
+        self.combo_td_bg_source = QtWidgets.QComboBox()
+        self.combo_td_bg_source.addItems(["Auto: N-FINDR on the image"] + SM_SOURCES)
+        self.combo_td_bg_source.setToolTip("Background endmembers for AMSD and OSP.")
+        form2.addRow("Background endmembers:", self.combo_td_bg_source)
+        self.spin_td_bg_k = QtWidgets.QSpinBox()
+        self.spin_td_bg_k.setRange(2, 100)
+        self.spin_td_bg_k.setValue(10)
+        self.spin_td_bg_k.setToolTip("Number of endmembers N-FINDR extracts (auto mode).")
+        form2.addRow("Endmembers (auto):", self.spin_td_bg_k)
+        self.spin_td_reg = QtWidgets.QDoubleSpinBox()
+        self.spin_td_reg.setDecimals(8)
+        self.spin_td_reg.setRange(0.0, 1.0)
+        self.spin_td_reg.setSingleStep(1e-5)
+        self.spin_td_reg.setValue(1e-5)
+        self.spin_td_reg.setToolTip("Ridge added to the background covariance, relative to trace(C)/bands, "
+                                    "so that C can be inverted.")
+        form2.addRow("Covariance ridge:", self.spin_td_reg)
+        v2.addLayout(form2)
+        self.combo_td_method.currentIndexChanged.connect(self._td_method_changed)
+        self.btn_td_run = QtWidgets.QPushButton("Compute detection scores")
+        self.btn_td_run.clicked.connect(self.on_td_run)
+        v2.addWidget(self.btn_td_run)
+        self.btn_td_show = QtWidgets.QPushButton("Show score map and histogram")
+        self.btn_td_show.clicked.connect(self.on_td_show_scores)
+        v2.addWidget(self.btn_td_show)
+        thr_row = QtWidgets.QHBoxLayout()
+        thr_row.addWidget(QtWidgets.QLabel("Threshold:"))
+        self.spin_td_thr = QtWidgets.QDoubleSpinBox()
+        self.spin_td_thr.setDecimals(6)
+        self.spin_td_thr.setRange(-1e9, 1e9)
+        self.spin_td_thr.setSingleStep(0.05)
+        self.spin_td_thr.setValue(0.5)
+        thr_row.addWidget(self.spin_td_thr, 1)
+        self.btn_td_otsu = QtWidgets.QPushButton("Otsu")
+        self.btn_td_otsu.setToolTip("Suggest a threshold between the two histogram peaks.")
+        self.btn_td_otsu.clicked.connect(self.on_td_otsu)
+        thr_row.addWidget(self.btn_td_otsu)
+        v2.addLayout(thr_row)
+        self.btn_td_detect = QtWidgets.QPushButton("Detect target (score > threshold)")
+        self.btn_td_detect.clicked.connect(self.on_td_detect)
+        v2.addWidget(self.btn_td_detect)
+        self.td_status = QtWidgets.QLabel("Detection: not run")
+        self.td_status.setWordWrap(True)
+        v2.addWidget(self.td_status)
+        v2.addStretch(1)
+
+        # ---- Column 3: evaluation ----
+        g3 = QtWidgets.QGroupBox("3. Evaluate and compare")
+        v3 = QtWidgets.QVBoxLayout(g3)
+        v3.setContentsMargins(8, 14, 8, 8)
+        v3.setSpacing(6)
+        v3.addWidget(self._help_box(
+            "Load a ground-truth image (any non-zero value = target) or use an ROI class as ground truth. "
+            "The detected target is compared with it by the Dice similarity (2|A and B| / (|A| + |B|)), "
+            "precision, recall and the ROC area (AUC, independent of the threshold).\n\n"
+            "'Compare all techniques' scores the image with the seven techniques, shows their score maps and, "
+            "with a ground truth, ranks them by AUC and by the best Dice over all thresholds.", ref,
+            title="How to use"))
+        self.btn_td_load_gt = QtWidgets.QPushButton("Load ground-truth image...")
+        self.btn_td_load_gt.clicked.connect(self.on_td_load_gt)
+        v3.addWidget(self.btn_td_load_gt)
+        self.btn_td_roi_gt = QtWidgets.QPushButton("Use an ROI class as ground truth...")
+        self.btn_td_roi_gt.clicked.connect(self.on_td_roi_gt)
+        v3.addWidget(self.btn_td_roi_gt)
+        self.td_gt_label = QtWidgets.QLabel("Ground truth: none")
+        self.td_gt_label.setWordWrap(True)
+        v3.addWidget(self.td_gt_label)
+        self.btn_td_figure = QtWidgets.QPushButton("Show RGB | ground truth | detected target")
+        self.btn_td_figure.clicked.connect(self.on_td_show_figure)
+        v3.addWidget(self.btn_td_figure)
+        self.btn_td_compare = QtWidgets.QPushButton("Compare all techniques")
+        self.btn_td_compare.clicked.connect(self.on_td_compare)
+        v3.addWidget(self.btn_td_compare)
+        self.td_text = QtWidgets.QPlainTextEdit()
+        self.td_text.setReadOnly(True)
+        self.td_text.setMinimumHeight(180)
+        self.td_text.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.td_text.setPlaceholderText("Dice similarity and the technique comparison appear here.")
+        v3.addWidget(self.td_text, 1)
+
+        for g in (g1, g2, g3):
+            g.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            g.setMinimumWidth(300)
+            lay.addWidget(g, 1)
+        self._td_method_changed()
+        self.tabs.addTab(self._scroll_wrap(tab), "Target Detection")
+
+    def _td_method_changed(self, *_):
+        sub = self.combo_td_method.currentData() in TD_SUBSPACE
+        self.combo_td_bg_source.setEnabled(sub)
+        self.spin_td_bg_k.setEnabled(sub)
+
+    # ---- inputs ----
+    def _td_wavelengths(self):
+        bands = self.cube.shape[2]
+        if self.wavelengths is not None and len(self.wavelengths) == bands and np.all(np.isfinite(self.wavelengths)):
+            return np.asarray(self.wavelengths, dtype=float)
+        return np.arange(bands, dtype=float)
+
+    def _td_target_raw(self):
+        """(raw target spectrum (bands,), label) of the chosen source, or None after telling the user."""
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return None
+        rows, cols, bands = self.cube.shape
+        idx = self.combo_td_target_source.currentIndex()
+        if idx == 0:
+            r, c = int(self.spin_td_row.value()), int(self.spin_td_col.value())
+            if r >= rows or c >= cols:
+                QtWidgets.QMessageBox.warning(self, "Target", f"Pixel (row {r}, col {c}) is outside the image "
+                                                              f"({rows} x {cols}).")
+                return None
+            t = np.asarray(self.cube[r, c, :], dtype=np.float64)
+            label = f"pixel (row {r}, col {c})"
+        elif idx == len(SM_SOURCES) + 1:
+            sel = self._lib_selected_entries()
+            if not sel:
+                QtWidgets.QMessageBox.information(self, "Target", "Select a spectrum in the Library Matching tab.")
+                return None
+            if self.wavelengths is None or len(self.wavelengths) != bands:
+                QtWidgets.QMessageBox.warning(self, "Target", "A library target needs the cube wavelengths.")
+                return None
+            ent = sel[0]
+            wl = auto_wavelengths_to_nm(self.wavelengths)
+            t = np.interp(wl, ent["wavelength"], ent["values"], left=np.nan, right=np.nan)
+            if not np.all(np.isfinite(t)):
+                QtWidgets.QMessageBox.warning(
+                    self, "Target", f"'{ent['name']}' does not cover the cube wavelengths "
+                                    f"({wl.min():.0f}-{wl.max():.0f} nm).")
+                return None
+            if not self.chk_td_cr.isChecked():                  # match the image level (scale-free with continuum)
+                sub = np.asarray(self.cube[::max(1, rows // 40), ::max(1, cols // 40), :], dtype=np.float64)
+                lvl = float(np.nanmean(sub))
+                if np.isfinite(lvl) and lvl > 0 and t.mean() > 0:
+                    t = t * (lvl / t.mean())
+            label = f"library spectrum {ent['name']}"
+        else:
+            try:
+                E, names = self._sm_references(idx - 1)
+            except RuntimeError as e:
+                QtWidgets.QMessageBox.warning(self, "Target", str(e))
+                return None
+            k = int(self.spin_td_idx.value()) - 1
+            if k >= E.shape[0]:
+                QtWidgets.QMessageBox.information(self, "Target", f"Choose a spectrum between 1 and {E.shape[0]}.")
+                return None
+            t = E[k]
+            label = names[k]
+        if not np.all(np.isfinite(t)):
+            QtWidgets.QMessageBox.warning(self, "Target", "The target spectrum has NaN bands; choose another one.")
+            return None
+        return t, label
+
+    def on_td_plot_target(self):
+        got = self._td_target_raw()
+        if got is None:
+            return
+        t_raw, label = got
+        cr = self.chk_td_cr.isChecked()
+        t = continuum_remove_spectra(t_raw[None, :], self._td_wavelengths())[0] if cr else t_raw
+        x, xlabel = self._sm_axis(t.size)
+        self.plot_canvas.show_multiline(
+            x, [(label, t, "tab:red")],
+            title=f"Target spectrum: {label}" + (" (continuum removed)" if cr else ""),
+            xlabel=xlabel, ylabel="Continuum-removed value" if cr else "Data Values")
+        self.td_target_label.setText(f"Target: {label}.")
+
+    def _td_background_inputs(self):
+        """('auto', k) / ('given', E (k, bands)) for AMSD / OSP, or False after telling the user."""
+        src = self.combo_td_bg_source.currentIndex()
+        if src == 0:
+            return ("auto", int(self.spin_td_bg_k.value()))
+        try:
+            E, _names = self._sm_references(src - 1)
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.warning(self, "Background endmembers", str(e))
+            return False
+        return ("given", E)
+
+    def _td_start(self, methods, compare):
+        if self._busy:
+            return
+        got = self._td_target_raw()
+        if got is None:
+            return
+        t_raw, label = got
+        bg = None
+        if set(methods) & TD_SUBSPACE:
+            bg = self._td_background_inputs()
+            if bg is False:
+                return
+        cube = self.cube
+        rows, cols, bands = cube.shape
+        wl = self._td_wavelengths()
+        cr = self.chk_td_cr.isChecked()
+        reg = float(self.spin_td_reg.value())
+        key = (id(cube), cr)
+        cache_in = self._td_cache
+        methods = list(methods)
+
+        def job(progress, cancel):
+            if cache_in is not None and cache_in["key"] == key:
+                Xv, valid = cache_in["Xv"], cache_in["valid"]
+            else:
+                progress("Target detection: preparing the pixel spectra...")
+                X, valid = prepare_features(cube.reshape(-1, bands))
+                if not valid.any():
+                    raise RuntimeError("The cube has no valid pixels.")
+                Xv = X[valid]
+                del X
+                if cr:
+                    Xv = continuum_remove_spectra(Xv, wl, progress=progress, cancel=cancel)
+            t = continuum_remove_spectra(t_raw[None, :], wl)[0].astype(np.float64) if cr else t_raw
+            Bm = None
+            if bg is not None:
+                if bg[0] == "auto":
+                    progress("Target detection: extracting background endmembers (N-FINDR)...")
+                    Bm, _ = nfindr_endmembers(Xv.reshape(1, -1, bands), bg[1], progress=progress, cancel=cancel)
+                else:
+                    Bm = np.asarray(bg[1], dtype=np.float64)
+                    Bm = np.where(np.isnan(Bm), np.nanmean(Bm), Bm)
+                    if cr:
+                        Bm = continuum_remove_spectra(Bm, wl).astype(np.float64)
+            sc = target_detection_scores(Xv, t, methods, Bm, reg, progress=progress, cancel=cancel)
+            maps = {}
+            for m, v in sc.items():
+                full = np.full(rows * cols, np.nan, dtype=np.float32)
+                full[valid] = v
+                maps[m] = full.reshape(rows, cols)
+            return {"maps": maps, "label": label, "t": t, "cr": cr, "methods": methods,
+                    "cache": {"key": key, "Xv": Xv, "valid": valid}}
+
+        what = "all techniques" if compare else TD_SHORT[methods[0]]
+        self._start_job(job, self._finish_td_compare if compare else self._finish_td_single,
+                        f"Target detection ({what}) for {label}...")
+
+    def on_td_run(self):
+        self._td_start([self.combo_td_method.currentData()], compare=False)
+
+    def on_td_compare(self):
+        self._td_start([k for k, _ in TD_METHODS], compare=True)
+
+    def _td_store(self, res, method):
+        self._td_cache = res["cache"]
+        self.td_result = {"method": method, "score_map": res["maps"][method], "label": res["label"],
+                          "t": res["t"], "cr": res["cr"], "mask": None, "threshold": None}
+        self.td_target_label.setText(f"Target: {res['label']}.")
+
+    def _finish_td_single(self, res):
+        method = res["methods"][0]
+        self._td_store(res, method)
+        sm = self.td_result["score_map"]
+        self.td_status.setText(
+            f"{TD_SHORT[method]} scores for {res['label']}: {np.nanmin(sm):.4g} to {np.nanmax(sm):.4g}"
+            f"{' (continuum removed)' if res['cr'] else ''}. Choose a threshold, then Detect.")
+        self.image_canvas.show_image(self.robust_normalize(sm))
+        self.band_label.setText(f"{TD_SHORT[method]} detection score (bright = target)")
+        self._draw_roi_patch()
+        self.td_text.clear()
+
+    def _td_gt_mask(self):
+        """Ground-truth mask matching the cube, or None (with a message) when none / wrong size."""
+        if self.td_gt is None:
+            return None
+        if self.cube is None or self.td_gt["mask"].shape != self.cube.shape[:2]:
+            return None
+        return self.td_gt["mask"]
+
+    def _finish_td_compare(self, res):
+        cur = self.combo_td_method.currentData()
+        self._td_store(res, cur)
+        gt = self._td_gt_mask()
+        rows = []
+        for m, _label in TD_METHODS:
+            sm = res["maps"][m]
+            row = {"m": m, "min": float(np.nanmin(sm)), "max": float(np.nanmax(sm))}
+            if gt is not None:
+                row["auc"] = roc_auc(sm, gt)
+                row["dice"], row["thr"] = best_dice_threshold(sm, gt)
+            rows.append(row)
+        self.td_compare = {"maps": res["maps"], "rows": rows}
+        lines = [f"Target: {res['label']}" + (" (continuum removed)" if res["cr"] else "")]
+        if gt is not None:
+            lines.append(f"{'Technique':<11}{'AUC':>8}{'best Dice':>11}{'at thr.':>10}")
+            for r in sorted(rows, key=lambda r: -(r["auc"] if np.isfinite(r["auc"]) else -1)):
+                lines.append(f"{TD_SHORT[r['m']]:<11}{r['auc']:8.4f}{r['dice']:11.4f}{r['thr']:10.4g}")
+        else:
+            lines.append(f"{'Technique':<11}{'min':>12}{'max':>12}")
+            for r in rows:
+                lines.append(f"{TD_SHORT[r['m']]:<11}{r['min']:12.4g}{r['max']:12.4g}")
+            lines.append("Load a ground truth to rank the techniques.")
+        self.td_text.setPlainText("\n".join(lines))
+        self.td_status.setText(f"Scored all techniques; '{TD_SHORT[cur]}' is the active one for thresholding.")
+        maps = res["maps"]
+
+        def build(fig):
+            axes = fig.subplots(2, 4)
+            for ax in axes.ravel():
+                ax.axis("off")
+            for k, (m, _l) in enumerate(TD_METHODS):
+                ax = axes.ravel()[k]
+                v = maps[m]
+                lo, hi = np.nanpercentile(v, (2, 98))
+                ax.imshow(v, cmap="viridis", vmin=lo, vmax=hi if hi > lo else lo + 1e-9)
+                ttl = TD_SHORT[m]
+                if gt is not None:
+                    ttl += f" (AUC {rows[k]['auc']:.3f})"
+                ax.set_title(ttl, fontsize=9)
+            if gt is not None:
+                axes.ravel()[7].imshow(gt, cmap="gray")
+                axes.ravel()[7].set_title("Ground truth", fontsize=9)
+            fig.tight_layout()
+
+        self._show_figure_dialog("Target detection techniques", build, size=(13, 6.5))
+
+    # ---- thresholding and display ----
+    def _td_need_scores(self):
+        if self.td_result is None:
+            QtWidgets.QMessageBox.information(self, "No scores", "Compute the detection scores first.")
+            return None
+        return self.td_result
+
+    def on_td_otsu(self):
+        res = self._td_need_scores()
+        if res is not None:
+            self.spin_td_thr.setValue(otsu_threshold(res["score_map"]))
+
+    def on_td_show_scores(self):
+        res = self._td_need_scores()
+        if res is None:
+            return
+        sm = res["score_map"]
+        short = TD_SHORT[res["method"]]
+        thr = float(self.spin_td_thr.value())
+
+        def build(fig):
+            ax1 = fig.add_subplot(1, 2, 1)
+            lo, hi = np.nanpercentile(sm, (1, 99))
+            im = ax1.imshow(sm, cmap="viridis", vmin=lo, vmax=hi if hi > lo else lo + 1e-9)
+            ax1.set_title(f"{short} detection score - {res['label']}", fontsize=9)
+            ax1.axis("off")
+            fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+            ax2 = fig.add_subplot(1, 2, 2)
+            vals = sm[np.isfinite(sm)]
+            a, b = np.percentile(vals, (0.2, 99.8))
+            ax2.hist(vals, bins=100, range=(a, b if b > a else a + 1e-9), color="tab:blue")
+            ax2.axvline(thr, color="red", linestyle="--", label=f"threshold {thr:.4g}")
+            ax2.set_xlabel("Detection score")
+            ax2.set_ylabel("Number of pixels")
+            ax2.set_title("Score histogram (0.2-99.8 percentile range)", fontsize=9)
+            ax2.legend(fontsize=8)
+            fig.tight_layout()
+
+        self._show_figure_dialog("Detection scores", build, size=(11, 4.5))
+
+    def on_td_detect(self):
+        res = self._td_need_scores()
+        if res is None:
+            return
+        thr = float(self.spin_td_thr.value())
+        with np.errstate(invalid="ignore"):
+            mask = res["score_map"] > thr
+        res["mask"], res["threshold"] = mask, thr
+        short = TD_SHORT[res["method"]]
+        labels = np.where(mask, 0, -1).astype(np.int32)
+        self.class_labels = labels
+        self.class_names_result = [f"Target ({short})"]
+        n = int(mask.sum())
+        self.td_status.setText(f"Detected {n} target pixels ({100.0 * n / mask.size:.2f}%): {short} score "
+                               f"> {thr:.4g}.")
+        self._show_classification(labels, [f"Target ({short})"], f"{short} > {thr:.4g}")
+        self._td_update_metrics()
+
+    def _td_update_metrics(self):
+        res = self.td_result
+        if res is None or res.get("mask") is None:
+            return
+        short = TD_SHORT[res["method"]]
+        mask = res["mask"]
+        lines = [f"{short} detection, score > {res['threshold']:.4g}: {int(mask.sum())} pixels"]
+        if self.td_gt is not None and self.td_gt["mask"].shape != mask.shape:
+            lines.append("The ground truth has a different size than the cube; reload it.")
+        elif self.td_gt is not None:
+            gt = self.td_gt["mask"]
+            m = detection_metrics(mask, gt)
+            lines += [f"Dice similarity: {m['dice']:.4f}",
+                      f"Precision: {m['precision']:.4f}", f"Recall: {m['recall']:.4f}",
+                      f"ROC AUC: {roc_auc(res['score_map'], gt):.4f}",
+                      f"TP / FP / FN: {m['tp']} / {m['fp']} / {m['fn']}"]
+        else:
+            lines.append("Load a ground truth to get the Dice similarity.")
+        self.td_text.setPlainText("\n".join(lines))
+
+    def on_td_show_figure(self):
+        res = self.td_result
+        if res is None or res.get("mask") is None:
+            QtWidgets.QMessageBox.information(self, "Not detected", "Run Detect first.")
+            return
+        if self._td_gt_mask() is None:
+            QtWidgets.QMessageBox.information(self, "Ground truth",
+                                              "Next, choose the ground-truth image (for Pavia: paviauRoofingGT.mat). "
+                                              "Cancel to show the figure without it.")
+            self.on_td_load_gt()
+        rgb, _idx = rgb_estimate(self.cube, self.wavelengths)
+        mask = res["mask"]
+        gt = self._td_gt_mask()
+        panels = [(rgb, "RGB Image", False)]
+        if gt is not None:
+            panels.append((gt.astype(float), "Ground Truth", True))
+        panels.append((mask.astype(float), "Detected Target", True))
+        title = f"{TD_SHORT[res['method']]}, threshold {res['threshold']:.4g}"
+        if gt is not None:
+            title += f": Dice similarity = {detection_metrics(mask, gt)['dice']:.4f}"
+
+        def build(fig):
+            for k, (img, ttl, is_mask) in enumerate(panels):
+                ax = fig.add_subplot(1, len(panels), k + 1)
+                if is_mask:
+                    ax.imshow(img, cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
+                else:
+                    ax.imshow(img)
+                ax.set_title(ttl, fontsize=10)                  # pixel axes stay visible, as in the MATLAB figure
+            fig.suptitle(title, fontsize=10)
+            fig.tight_layout()
+
+        self._show_figure_dialog("RGB | ground truth | detected target", build, size=(4.4 * len(panels), 5.2))
+
+    # ---- ground truth ----
+    def _td_set_gt(self, mask, name, note=""):
+        self.td_gt = {"mask": np.asarray(mask, dtype=bool), "name": name}
+        n = int(self.td_gt["mask"].sum())
+        self.td_gt_label.setText(f"Ground truth: {name}: {n} target pixels ({100.0 * n / mask.size:.2f}%). {note}")
+        self._td_update_metrics()
+
+    def on_td_load_gt(self):
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Ground-truth target image", "",
+            "Label maps (*.mat *.npy *.npz *.tif *.tiff *.png *.bmp *.jpg *.h5 *.hdf5 *.hdr *.img *.csv *.txt);;All files (*)")
+        if not path:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            res = read_label_map(path, choose=self._choose_dataset_dialog)
+            rows, cols, _ = self.cube.shape
+            lab, note = conform_label_map(res["labels"], rows, cols)
+        except HSILoadCancelled:
+            return
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ground truth", f"Could not use this file:\n{e}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._td_set_gt(lab > 0, Path(path).name, "Every non-zero value counts as target.")
+
+    def on_td_roi_gt(self):
+        if self.cube is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "Load a hyperspectral cube first.")
+            return
+        names = self._class_list()
+        if not names or not self.rois:
+            QtWidgets.QMessageBox.information(self, "No ROIs", "Draw and label ROIs in the ROI Analysis tab first.")
+            return
+        name, ok = QtWidgets.QInputDialog.getItem(self, "Ground truth from ROIs", "Target ROI class:",
+                                                  list(names), 0, False)
+        if not ok:
+            return
+        mask = np.zeros(self.cube.shape[:2], dtype=bool)
+        for roi in self.rois:
+            if roi["class"] == name:
+                mask |= roi["mask"]
+        self._td_set_gt(mask, f"ROI class '{name}'")
 
     # ------------------------------------------------------------------
     # Background jobs (supervised, cross-validation, CNN, NMF)

@@ -55,6 +55,17 @@ def xy(wl, vals):
     """wavelengths + values (with None gaps) -> x, y float arrays (NaN gaps, so the line breaks there)."""
     x = np.asarray([float(w) for w in wl], float)
     y = np.asarray([np.nan if v is None else float(v) for v in vals], float)
+    # bands removed from the product (EnMAP L2A drops 1355-1460 and 1780-1968 nm, the water-absorption windows):
+    # break the line there instead of drawing a straight segment across wavelengths that have no data
+    if len(x) > 3 and len(x) == len(y):
+        d = np.diff(x)
+        pos = d[d > 0]
+        if pos.size:
+            lim = max(25.0, 3.0 * float(np.median(pos)))
+            cut = np.flatnonzero(d > lim)
+            if cut.size:
+                x = np.insert(x, cut + 1, (x[cut] + x[cut + 1]) / 2.0)
+                y = np.insert(y, cut + 1, np.nan)
     return x, y
 
 

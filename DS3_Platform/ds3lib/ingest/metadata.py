@@ -24,14 +24,23 @@ def to_nm(wl, units=None):
     """Return (wavelengths_nm, factor_applied, notes). Unit hint is respected;
     without a hint, values < 30 are assumed to be micrometres (and noted)."""
     wl = np.asarray(wl, dtype=float)
-    u = (units or "").strip().lower()
+    # GDAL / ENVI metadata often keeps the quotes or braces: "'nanometers'", "{Micrometers}"
+    u = str(units or "").strip().strip("'\"{}[]() \t").strip().lower()
     notes = []
     factor = 1.0
-    if u.startswith("micro") or u in ("um", "µm", "micron", "microns"):
+    if u in ("unknown", "none", "n/a", "na", "index", "band", "bands", "-"):
+        u = ""
+    if u.startswith("micro") or u in ("um", "µm", "μm", "micron", "microns", "mu", "mum"):
         factor = 1000.0
         notes.append("wavelengths converted from micrometres to nm (header units)")
     elif u.startswith("nano") or u == "nm":
         pass
+    elif u.startswith("milli") or u == "mm":
+        factor = 1e6
+        notes.append("wavelengths converted from millimetres to nm (header units)")
+    elif u in ("cm-1", "1/cm", "cm^-1", "wavenumber", "wavenumbers") and np.all(np.asarray(wl, float) > 0):
+        wl = 1e7 / wl
+        notes.append("wavenumbers (cm-1) converted to wavelengths in nm")
     elif u:
         raise InvalidHeaderError(f"Unsupported wavelength units: {units!r}")
     elif np.nanmax(wl) < 30:

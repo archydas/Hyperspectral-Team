@@ -218,9 +218,7 @@ class DS3Window(W.QMainWindow):
         self.statusBar().showMessage(str(text).replace("\n", "  "), ms)
 
     def update_title(self):
-        v = self.image.viewer
-        p = getattr(v, "_ds3_path", None) if v else None
-        self.setWindowTitle(APP_TITLE + (f" — {os.path.basename(p)}" if p else ""))
+        self.setWindowTitle(APP_TITLE)               # the open file is shown in its own panel, not in the title bar
         rec = self.image.recent
         self.lst_recent.clear()
         for path in rec[:6]:
@@ -373,7 +371,8 @@ class DS3Window(W.QMainWindow):
         self._act(m, "Spectral Analyst…", lambda: self._link_call("on_best_matches"))
         sub = m.addMenu("Mapping Methods")
         self._act(sub, "Spectral Angle Mapper (library)…", lambda: self._link_call("on_classify_library"))
-        self._act(sub, "Spectral Angle Mapper (ROI classes)…", lambda: self.image.goto_tab("Spectral Matching"))
+        self._act(sub, "Spectral Matching (SAM, SID, SID-SAM, JMSAM, NS3)…", lambda: self.image.goto_tab("Spectral Matching"))
+        self._act(sub, "Library Matching (segment / identify)…", lambda: self.image.goto_tab("Library Matching"))
         self._act(sub, "Linear Spectral Unmixing…", lambda: self.image.goto_tab("Unmixing"))
         self._act(sub, "K-Means Clustering…", lambda: self.image.goto_tab("Spectral Analysis"))
         sub = m.addMenu("Transforms")
@@ -386,11 +385,12 @@ class DS3Window(W.QMainWindow):
         sub.addSeparator()
         self._act(sub, "More indices and band features…", lambda: self.image.goto_tab("Preprocessing", "Indices"))
         self._act(m, "Anomaly Detection (RX)…", lambda: self._viewer_run("ROI Analysis", "on_compute_anomaly"))
+        self._act(m, "Target Detection (CEM, ACE, MF, GLRT, OSP, …)…", lambda: self.image.goto_tab("Target Detection"))
         self._act(m, "Signal-to-Noise Ratio…", lambda: self._viewer_run("Spectral Analysis", "on_compute_snr"))
         sub = m.addMenu("Classification")
         self._act(sub, "Supervised Classification (RF, SVM, …)…", lambda: self.image.goto_tab("Classification"))
         self._act(sub, "Deep Learning Segmentation…", lambda: self.image.goto_tab("Segmentation"))
-        self._act(sub, "Spectral Matching (SAM)…", lambda: self.image.goto_tab("Spectral Matching"))
+        self._act(sub, "Spectral Matching (SAM, SID, …)…", lambda: self.image.goto_tab("Spectral Matching"))
         m.addSeparator()
         self._act(m, "Data Aggregation…", lambda: self.analysis.goto_tab("Aggregation"))
         # Help
@@ -591,10 +591,11 @@ class DS3Window(W.QMainWindow):
             "4. Best matches / Classification map compare the image with the spectral library database.\n"
             "5. ROI Analysis tab (Tools ▸ Draw ROIs): draw rectangles / polygons with classes, ROI Manager, ROI "
             "spectra, save / load ROIs. ROIs drawn in Data Aggregation can be added with Tools ▸ Get ROIs from "
-            "Data Aggregation. Classification, Spectral Matching, Segmentation, Unmixing and Data Correction use "
+            "Data Aggregation. Classification, Spectral Matching, Library Matching, Target Detection, Segmentation, Unmixing and Data Correction use "
             "them.\n"
             "6. Preprocessing, Band Management, Data Correction, Spectral Analysis, Unmixing, Dimensionality "
-            "Reduction (PCA / MNF), Classification, Spectral Matching and Segmentation tabs, or the Spectral menu, "
+            "Reduction (PCA / MNF), Classification, Spectral Matching, Library Matching, Target Detection and "
+            "Segmentation tabs, or the Spectral menu, "
             "process and analyse the image."))
 
     def on_help_library(self):

@@ -146,8 +146,22 @@ def _safe(cb, arg):
         traceback.print_exc()
 
 
-def run_bg(fn, *args, done=None, failed=None, **kwargs):
-    """Run fn(*args) in the thread pool; done(result) / failed(message) are called in the GUI thread."""
+_POOLS = {}
+
+
+def _pool(name):
+    """A separate thread pool per kind of work, so slow map tiles (or no internet) never hold up the data calls."""
+    if name is None:
+        return QtCore.QThreadPool.globalInstance()
+    if name not in _POOLS:
+        _POOLS[name] = QtCore.QThreadPool()
+        _POOLS[name].setMaxThreadCount(4)
+    return _POOLS[name]
+
+
+def run_bg(fn, *args, done=None, failed=None, pool=None, **kwargs):
+    """Run fn(*args) in a thread pool; done(result) / failed(message) are called in the GUI thread.
+    pool = None (shared pool for API calls) or a name such as "tiles" (its own small pool)."""
     job = _Job(fn, args, kwargs)
     _JOBS.add(job.sig)
 
@@ -163,7 +177,7 @@ def run_bg(fn, *args, done=None, failed=None, **kwargs):
     job.sig.done.connect(_done)
     job.sig.failed.connect(_fail)
     job.setAutoDelete(True)
-    QtCore.QThreadPool.globalInstance().start(job)
+    _pool(pool).start(job)
     return job
 
 

@@ -151,8 +151,8 @@ class EndmemberBox(W.QWidget):
         lay.addWidget(section("Spectra to use"))
         self.lst = W.QListWidget()
         self.lst.setMaximumHeight(150)
-        self.coll = page.coll
-        for i, s in enumerate(page.coll):
+        self.coll = page.coll_here()                 # the collected spectra of the image shown now
+        for i, s in enumerate(self.coll):
             it = W.QListWidgetItem(f"{s['name']}  ·  " + (f"{s.get('n')} px" if s.get("kind") == "roi" else f"{s.get('row')}, {s.get('col')}"))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked)
@@ -160,7 +160,7 @@ class EndmemberBox(W.QWidget):
             pm.fill(QtGui.QColor(s["color"]))
             it.setIcon(QtGui.QIcon(pm))
             self.lst.addItem(it)
-        if not page.coll:
+        if not self.coll:
             self.lst.addItem("(no collected spectra — click pixels and press Add, or choose a library)")
             self.lst.setEnabled(False)
         lay.addWidget(self.lst)

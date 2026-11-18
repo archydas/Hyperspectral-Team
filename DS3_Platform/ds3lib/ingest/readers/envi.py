@@ -52,7 +52,7 @@ def _get_int(hdr, key):
         raise InvalidHeaderError(f"ENVI header missing/invalid '{key}'")
 
 
-def read_envi(path, unit=None, reflectance_divisor=None, **_):
+def read_envi(path, unit=None, reflectance_divisor=None, wavelengths=None, wavelength_range=None, **_):
     hdr_path, data_path = _find_files(path)
     hdr = parse_envi_header(hdr_path)
     ns, nl, nb = _get_int(hdr, "samples"), _get_int(hdr, "lines"), _get_int(hdr, "bands")
@@ -72,10 +72,16 @@ def read_envi(path, unit=None, reflectance_divisor=None, **_):
     mm = np.memmap(data_path, dtype=dt, mode="r", offset=offset, shape=shape_file)
 
     # --- spectral metadata
-    if "wavelength" not in hdr:
+    if wavelengths is not None:
+        wl = [float(v) for v in wavelengths]
+    elif "wavelength" in hdr:
+        wl = parse_number_list(hdr["wavelength"])
+    elif wavelength_range is not None:
+        wl = list(np.linspace(float(wavelength_range[0]), float(wavelength_range[1]), nb))
+    else:
         from ..metadata import MissingWavelengthsError
-        raise MissingWavelengthsError(f"{hdr_path.name}: no 'wavelength' field in ENVI header")
-    wl = parse_number_list(hdr["wavelength"])
+        raise MissingWavelengthsError(f"{hdr_path.name}: the image has {nb} bands but no 'wavelength' field in its "
+                                      "ENVI header. Give the sensor's wavelength range (for example 430-860) to open it.")
     if len(wl) != nb:
         raise InvalidHeaderError(f"{hdr_path.name}: {len(wl)} wavelengths but {nb} bands")
     fwhm = parse_number_list(hdr["fwhm"]) if "fwhm" in hdr else None
@@ -84,7 +90,8 @@ def read_envi(path, unit=None, reflectance_divisor=None, **_):
         bbl = parse_number_list(hdr["bbl"])
         if len(bbl) == nb:
             bad = np.array(bbl) == 0          # ENVI bbl: 1 = good, 0 = bad
-    spec = standardize_spectral_axis(wl, hdr.get("wavelength units"), fwhm, bad)
+    spec = standardize_spectral_axis(wl, None if (wavelengths is not None or "wavelength" not in hdr)
+                                     else hdr.get("wavelength units"), fwhm, bad)
 
     # --- scaling / nodata
     nodata = float(hdr["data ignore value"]) if "data ignore value" in hdr else None

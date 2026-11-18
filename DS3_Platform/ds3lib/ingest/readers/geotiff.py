@@ -1,11 +1,17 @@
 """GeoTIFF reader (rasterio). Spectral metadata is NOT standardised in TIFF, so
-wavelengths are searched in a fixed priority order (see read_geotiff)."""
+wavelengths are searched in a fixed priority order (see read_geotiff).
+
+TIFFs that GDAL sees as ONE band (multi-page stacks written by tifffile / ImageJ / many lab cameras) and
+setups without rasterio go to the general loader (anyformat.read_any), which reads the whole stack."""
 from __future__ import annotations
 import re
 from pathlib import Path
 import numpy as np
-import rasterio
-from rasterio.windows import Window
+try:
+    import rasterio
+    from rasterio.windows import Window
+except ImportError:                                  # no GDAL: plain TIFF stacks still open through tifffile
+    rasterio = None
 from ..contract import Cube, to_physical
 from ..metadata import (standardize_spectral_axis, parse_number_list, parse_wavelength_strings,
                         infer_unit, MissingWavelengthsError)
@@ -15,9 +21,12 @@ from .wavelength_files import read_wavelengths_file, find_sibling_xml
 WL_KEYS = ("wavelength", "WAVELENGTH", "center_wavelength", "CENTER_WAVELENGTH", "wavelength_nm", "WAVELENGTH_NM")
 
 
-def _find_wavelengths(ds, path, user_wl):
+def _find_wavelengths(ds, path, user_wl, wavelength_range=None):
     tried = []
     n = ds.count
+    if user_wl is None and wavelength_range is not None:
+        lo, hi = map(float, wavelength_range)
+        return list(np.linspace(lo, hi, n)), "nm", None, None, f"user range {lo:g}-{hi:g} nm (evenly spaced, ASSUMED)"
     if user_wl is not None:
         wl = np.asarray(user_wl, float)
         if len(wl) != n:
@@ -49,7 +58,10 @@ def _find_wavelengths(ds, path, user_wl):
         per.append(v)
     if all(v is not None for v in per):
         try:
-            return [float(parse_number_list(v)[0]) for v in per], tags.get("wavelength_units"), None, None, "per-band tags"
+            wl = [float(parse_number_list(v)[0]) for v in per]
+            fw = [ds.tags(i).get("fwhm") or ds.tags(i).get("FWHM") for i in range(1, n + 1)]
+            fw = [float(parse_number_list(v)[0]) for v in fw] if all(fw) else None
+            return wl, tags.get("wavelength_units"), fw, None, "per-band tags"
         except Exception:
             pass
     tried.append("per-band tags")
@@ -80,14 +92,26 @@ def _find_wavelengths(ds, path, user_wl):
     else:
         tried.append("sibling METADATA.XML")
     raise MissingWavelengthsError(
-        f"{Path(path).name}: no wavelengths found (tried: {', '.join(tried)}). "
-        "Pass wavelengths=[...] to open_cube().")
+        f"{Path(path).name}: the image has {n} bands but no wavelengths in the file (tried: {', '.join(tried)}). "
+        "Give the sensor's wavelength range (for example 430-860) to open it.")
 
 
-def read_geotiff(path, unit=None, wavelengths=None, reflectance_divisor=None, **_):
-    ds = rasterio.open(path)
+def read_geotiff(path, unit=None, wavelengths=None, reflectance_divisor=None, wavelength_range=None, **kw):
+    from .anyformat import read_any
+    if rasterio is None:
+        return read_any(path, unit=unit, wavelengths=wavelengths, wavelength_range=wavelength_range,
+                        reflectance_divisor=reflectance_divisor, **kw)
+    try:
+        ds = rasterio.open(path)
+    except Exception:                                # noqa: BLE001 - a TIFF GDAL cannot read: try tifffile
+        return read_any(path, unit=unit, wavelengths=wavelengths, wavelength_range=wavelength_range,
+                        reflectance_divisor=reflectance_divisor, **kw)
+    if ds.count == 1:                                # GDAL shows only page 1 of a multi-page stack
+        ds.close()
+        return read_any(path, unit=unit, wavelengths=wavelengths, wavelength_range=wavelength_range,
+                        reflectance_divisor=reflectance_divisor, **kw)
     nb, nl, ns = ds.count, ds.height, ds.width
-    wl, units, fwhm, bad, how = _find_wavelengths(ds, path, wavelengths)
+    wl, units, fwhm, bad, how = _find_wavelengths(ds, path, wavelengths, wavelength_range)
     spec = standardize_spectral_axis(wl, units, fwhm, bad)
     spec["notes"].insert(0, f"wavelengths read from {how}")
     scale = float(ds.scales[0]) if ds.scales and ds.scales[0] not in (None, 0) else 1.0

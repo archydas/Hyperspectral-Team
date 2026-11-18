@@ -56,6 +56,10 @@ def classify(path) -> str:
     if p.is_file() and ANCILLARY.search(p.name if p.suffix.lower() == ".hdr" else p.stem if p.suffix.lower() in CUBE_BIN_EXT else p.name) \
             and (p.suffix.lower() == ".hdr" or p.suffix.lower() in CUBE_BIN_EXT or not p.suffix):
         raise UnsupportedFormatError(f"{p.name}: ancillary product (geometry / observation / water-vapour), not a spectral image")
+    from .ingest.readers.anyformat import product_layer_hint
+    hint = product_layer_hint(p) if p.is_file() else None
+    if hint:                                                      # EnMAP water vapour / quicklook / quality TIFFs ...
+        raise UnsupportedFormatError(hint)
     if p.suffix.lower() == ".hdr":
         try:
             ft = parse_envi_header(p).get("file type", "").lower()
@@ -69,12 +73,16 @@ def classify(path) -> str:
             return "cube"
         raise UnsupportedFormatError(f"{p.name}: no 3-D array ({[(k, sh) for k, sh, _ in info]}) - looks like a label/ground-truth "
                                      "map; import the image, then use this file as 'labels' to build class-mean spectra")
-    if p.suffix.lower() in (".tif", ".tiff", ".h5", ".he5", ".hdf5", ".hdf", ".nc", ".nc4"):
+    from .ingest.api import CUBE_EXTENSIONS, GDAL_EXT, _sniff
+    ext = p.suffix.lower()
+    if ext in CUBE_EXTENSIONS and ext not in GDAL_EXT:            # TIFF stacks, HDF5 / HDF4 / NetCDF, NumPy ...
         return "cube"
-    if p.suffix.lower() in CUBE_BIN_EXT and _has_hdr(p):
+    if ext in CUBE_BIN_EXT and _has_hdr(p):
         return "cube"
     if detect_spectra_format(p):
         return "spectra"
+    if ext in GDAL_EXT or (p.is_file() and _sniff(p)):            # ERDAS .img, .pix, .vrt ... or a known magic number
+        return "cube"
     raise UnsupportedFormatError(f"don't know how to ingest {p.name}")
 
 

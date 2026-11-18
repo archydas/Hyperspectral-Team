@@ -168,7 +168,7 @@ class MapView(W.QWidget):
     # ---- tiles
     def _need(self, z, x, y):
         key = (self.provider, z, x, y)
-        if key in self.tiles or key in self.pending or key in self.failed or len(self.pending) > 24:
+        if key in self.tiles or key in self.pending or key in self.failed or len(self.pending) > 12:
             return
         self.pending.add(key)
         prov = self.provider
@@ -188,7 +188,7 @@ class MapView(W.QWidget):
             self.failed.add(key)
             self.error = m
             self.update()
-        run_bg(tile_bytes, prov, z, x, y, done=done, failed=fail)
+        run_bg(tile_bytes, prov, z, x, y, done=done, failed=fail, pool="tiles")
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)

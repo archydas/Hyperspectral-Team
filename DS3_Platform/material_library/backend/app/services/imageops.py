@@ -325,8 +325,11 @@ def snr(img, **_):
     """Nearest-neighbour SNR: signal = mean spectrum, noise = std of the difference of horizontally adjacent pixels / sqrt(2)."""
     cube = open_image(img)
     step = 1
-    rows = min(cube.rows, max(1, int(2_000_000 // max(cube.cols, 1))))
-    blk = cube.read(rows=(0, rows)).astype(np.float64)
+    # memory-bounded: about 30 million values (a few hundred MB), a block of rows from the middle of the scene
+    # (the old 2 million PIXELS x all bands needed > 6 GB for an EnMAP scene)
+    rows = min(cube.rows, max(4, int(30_000_000 // max(cube.cols * cube.bands, 1))))
+    r0 = max(0, cube.rows // 2 - rows // 2)
+    blk = cube.read(rows=(r0, r0 + rows)).astype(np.float32)
     d = (blk[:, 1:, :] - blk[:, :-1, :]) / np.sqrt(2)
     m = np.isfinite(blk).all(axis=2)
     ok = m[:, 1:] & m[:, :-1] & (np.abs(blk[:, 1:, :]).sum(axis=2) > 0)
@@ -340,7 +343,7 @@ def snr(img, **_):
     wl = np.asarray(cube.wavelengths_nm, float)
     return dict(title="Signal-to-noise ratio", kind="table", step=step, width=0, height=0, unit=cube.unit, image=None,
                 table={"mean SNR": float(np.nanmean(s)), "median SNR": float(np.nanmedian(s)), "max SNR": float(np.nanmax(s)),
-                       "min SNR": float(np.nanmin(s)), "rows used": int(rows)},
+                       "min SNR": float(np.nanmin(s)), "rows used": int(rows), "first row": int(r0)},
                 plot=dict(x=[float(x) for x in wl], series=[dict(name="SNR", y=_jsonable(s))], xlabel="wavelength (nm)", ylabel="SNR",
                           title="SNR vs wavelength"))
 
