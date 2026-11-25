@@ -118,6 +118,7 @@ class Database:
         002: rois table, spectra.roi_id / spectra.roi_class, spectrum_rois link table (ROI analysis).
         003: spectra.purity (ground_measured | image_pixel | synthetic) + unit / purity indexes.
         004: images table, rois.image_id, spectra.wavelengths (filled from metadata), 'pixels' ROIs.
+        005: ground_truths, ground_truth_points, classification_models (DS3 classification).
         Existing data is never lost.
         """
         if not self.has_schema():
@@ -126,7 +127,8 @@ class Database:
         cols = {c["name"] for c in insp.get_columns("spectra")}
         changed = [f"spectra.{c}" for c in ("acquisition_type", "roi_id", "roi_class", "purity", "wavelengths")
                    if c not in cols]
-        changed += [t for t in ("rois", "spectrum_rois", "images") if not insp.has_table(t)]
+        changed += [t for t in ("rois", "spectrum_rois", "images", "ground_truths", "ground_truth_points",
+                                "classification_models") if not insp.has_table(t)]
         if insp.has_table("rois") and "image_id" not in {c["name"] for c in insp.get_columns("rois")}:
             changed.append("rois.image_id")
         if self.is_postgres:
@@ -134,7 +136,9 @@ class Database:
         elif changed:
             from . import models  # noqa: F401  (registers the tables)
             Base.metadata.create_all(self.engine, tables=[Base.metadata.tables[t] for t in
-                                                          ("images", "rois", "spectrum_rois")], checkfirst=True)
+                                                          ("images", "rois", "spectrum_rois", "ground_truths",
+                                                           "ground_truth_points", "classification_models")],
+                                  checkfirst=True)
             with self.engine.begin() as c:
                 adds = {"spectra.acquisition_type": "ALTER TABLE spectra ADD COLUMN acquisition_type VARCHAR(20)",
                         "spectra.roi_id": "ALTER TABLE spectra ADD COLUMN roi_id CHAR(32) REFERENCES rois(id)",

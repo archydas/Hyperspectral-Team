@@ -7,6 +7,9 @@ the stand-alone viewer did not have:
     store a pixel spectrum, ROI class means or the collected spectra in a library, register the image,
     hand the image (with its ROIs) to the Data Aggregation module.
 
+ds3/analysis_ext.py adds the library links of the ROI Analysis and Classification tabs (ROIs, point ground truth
+from Excel / CSV, trained models, classify any image or ROI with a stored model, class map GeoTIFF).
+
 The viewer is imported only when Viewer and Analysis is first opened (scikit-learn / scikit-image take a while).
 """
 from __future__ import annotations
@@ -909,6 +912,7 @@ class ImagePage(W.QWidget):
         self.setObjectName("ds3Page")
         self.viewer = None
         self.link = None
+        self.ext = None
         self.HV = None
         self.recent = []                      # paths opened in this session (File ▸ Open Previously Opened Image)
         self.n_opened = 0
@@ -974,6 +978,15 @@ class ImagePage(W.QWidget):
             v.tabs.insertTab(0, self._wrap(self.link), "Library")
             v.tabs.setCurrentIndex(0)
             self.shell.libpanel_libraries_changed.connect(self.link.refresh_libraries)
+            # ROIs / ground truth / trained models in the library database, point ground truth (Excel / CSV),
+            # library models on any image or ROI, test-pixel overlay, class map GeoTIFF (ds3/analysis_ext.py)
+            try:
+                from .analysis_ext import AnalysisExtension
+                self.ext = AnalysisExtension(self)
+            except Exception:                                                    # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self.ext = None
         finally:
             self._building = False
             W.QApplication.restoreOverrideCursor()
@@ -1135,6 +1148,9 @@ class ImagePage(W.QWidget):
                                                  cs if isinstance(cs, str) else None)
             except Exception:                                                    # noqa: BLE001
                 geo = None
+        if geo is None:                                    # GeoTIFF / any GDAL file: the file's geotransform
+            from .analysis_ext import viewer_geo
+            geo = viewer_geo(v)
         rois = []
         if with_rois:
             for roi in v.rois:

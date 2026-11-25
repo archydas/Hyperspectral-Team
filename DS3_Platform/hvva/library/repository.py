@@ -13,6 +13,9 @@ Additions needed by HyperVista (not in the original routes):
     set_spectrum_acquisition                            - lab / field / airborne / satellite tag per spectrum
     save_roi_spectra, list_rois, get_roi, roi_classes,  - ROI analysis (migration 002): ROIs class by class, from
     delete_roi, roi_spectra                               one or many images, with the spectra computed from them
+    save_ground_truth, list_ground_truths,              - classification (migration 005): point / label-map ground
+    get_ground_truth, delete_ground_truth,                truth placed by lat/lon, and trained models (joblib bytes,
+    save_model, list_models, get_model, delete_model      sha256-checked) with everything needed to reuse them
 """
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.orm import Session
 
 from ..core import quality as Q
-from .models import DataFile, Dataset, Image, Library, Material, Roi, Sample, Spectrum, SpectrumRoi
+from .models import (ClassificationModel, DataFile, Dataset, GroundTruth, GroundTruthPoint, Image, Library, Material, Roi,
+                     Sample, Spectrum, SpectrumRoi)
 
 MAX_PAGE = 100          # same upper bound as the API's Query(le=100)
 
@@ -1045,3 +1049,203 @@ def resample_library(db: Session, library_id, grid, new_name: str, method: str =
         added += 1
     db.commit()
     return {"library": library_dict(lib), "spectra": added, "skipped": len(skipped), "reasons": skipped[:50]}
+
+
+# ------------------------------------------------------------------ classification (migration 005)
+MAX_MODEL_BYTES = 512 * 2 ** 20
+
+
+def _iso(t):
+    return t.isoformat() if t else None
+
+
+def _opt_uuid(value, what):
+    return None if value in (None, "") else _uuid(value, what)
+
+
+def _image_id_of(db: Session, info):
+    """image_id from an image_info() dict (registers / updates the image) or from an id string."""
+    if not info:
+        return None
+    if isinstance(info, dict):
+        return _uuid(register_image(db, info, commit=False)["id"], "Image")
+    return _uuid(info, "Image")
+
+
+def gt_dict(x: GroundTruth, **extra):
+    d = {"id": str(x.id), "library_id": None if x.library_id is None else str(x.library_id),
+         "image_id": None if x.image_id is None else str(x.image_id), "name": x.name, "kind": x.kind,
+         "layers": list(x.layers or []), "value_meaning": x.value_meaning, "crs": x.crs,
+         "image_rows": x.image_rows, "image_cols": x.image_cols, "source_files": x.source_files or [],
+         "rule": x.rule, "class_names": x.class_names or {}, "n_points": x.n_points,
+         "metadata": x.gt_metadata or {}, "created_at": _iso(x.created_at)}
+    d.update(extra)
+    return d
+
+
+def save_ground_truth(db: Session, info: dict, points: list) -> dict:
+    """Store a ground truth and its points.
+
+    info:   {name, kind ('points' | 'label_map'), library_id?, image (image_info dict or image id)?, layers,
+             value_meaning?, crs?, image_rows?, image_cols?, source_files?, rule?, class_names?, metadata?,
+             label_map? (bytes, kind label_map)}
+    points: [{layer, lat, lon, row, col, value, cls}, ...]
+    """
+    name = str(info.get("name") or "").strip()
+    if not name:
+        raise ValueError("a ground truth needs a name")
+    kind = info.get("kind") or "points"
+    if kind not in ("points", "label_map"):
+        raise ValueError("kind must be points or label_map")
+    if kind == "points" and not points:
+        raise ValueError("no points to store")
+    if kind == "label_map" and not info.get("label_map"):
+        raise ValueError("no label map to store")
+    gt = GroundTruth(name=name[:255], kind=kind, library_id=_opt_uuid(info.get("library_id"), "Library"),
+                     image_id=_image_id_of(db, info.get("image")), layers=list(info.get("layers") or []),
+                     value_meaning=(info.get("value_meaning") or None) and str(info["value_meaning"])[:100],
+                     crs=info.get("crs") or None, image_rows=info.get("image_rows"), image_cols=info.get("image_cols"),
+                     source_files=list(info.get("source_files") or []), rule=info.get("rule"),
+                     class_names={str(k): v for k, v in (info.get("class_names") or {}).items()},
+                     n_points=len(points or []), label_map=info.get("label_map"), gt_metadata=info.get("metadata") or {})
+    db.add(gt)
+    db.flush()
+    rows = [{"ground_truth_id": gt.id, "layer": str(p.get("layer") or "layer")[:255],
+             "lat": p.get("lat"), "lon": p.get("lon"), "pixel_row": p.get("row"), "pixel_col": p.get("col"),
+             "value": p.get("value"), "class_name": (p.get("cls") or None) and str(p["cls"])[:255]}
+            for p in points or []]
+    for b in range(0, len(rows), 20000):
+        db.execute(GroundTruthPoint.__table__.insert(), rows[b:b + 20000])
+    db.commit()
+    return gt_dict(gt)
+
+
+def update_ground_truth_rule(db: Session, gt_id, rule, class_names=None) -> dict:
+    gt = db.query(GroundTruth).filter(GroundTruth.id == _uuid(gt_id, "Ground truth")).first()
+    if gt is None:
+        raise NotFound("Ground truth not found")
+    gt.rule = rule
+    if class_names is not None:
+        gt.class_names = {str(k): v for k, v in class_names.items()}
+    db.commit()
+    return gt_dict(gt)
+
+
+def list_ground_truths(db: Session, image_id=None, library_id=None, search: Optional[str] = None):
+    q = db.query(GroundTruth, Image.name).outerjoin(Image, Image.id == GroundTruth.image_id)
+    if image_id is not None:
+        q = q.filter(GroundTruth.image_id == _uuid(image_id, "Image"))
+    if library_id is not None:
+        q = q.filter(GroundTruth.library_id == _uuid(library_id, "Library"))
+    if search:
+        q = q.filter(GroundTruth.name.ilike(f"%{_like_escape(search)}%", escape="\\"))
+    rows = q.order_by(GroundTruth.created_at.desc()).all()
+    return [gt_dict(g, image_name=n) for g, n in rows]
+
+
+def get_ground_truth(db: Session, gt_id, with_points: bool = True) -> dict:
+    gt = db.query(GroundTruth).filter(GroundTruth.id == _uuid(gt_id, "Ground truth")).first()
+    if gt is None:
+        raise NotFound("Ground truth not found")
+    d = gt_dict(gt)
+    if with_points:
+        cols = (GroundTruthPoint.layer, GroundTruthPoint.lat, GroundTruthPoint.lon, GroundTruthPoint.pixel_row,
+                GroundTruthPoint.pixel_col, GroundTruthPoint.value, GroundTruthPoint.class_name)
+        pts = db.query(*cols).filter(GroundTruthPoint.ground_truth_id == gt.id).order_by(GroundTruthPoint.id).all()
+        d["points"] = [{"layer": a, "lat": b, "lon": c, "row": r, "col": k, "value": v, "cls": n}
+                       for a, b, c, r, k, v, n in pts]
+        if gt.kind == "label_map":
+            d["label_map"] = gt.label_map
+    return d
+
+
+def delete_ground_truth(db: Session, gt_id) -> dict:
+    gt = db.query(GroundTruth).filter(GroundTruth.id == _uuid(gt_id, "Ground truth")).first()
+    if gt is None:
+        raise NotFound("Ground truth not found")
+    db.query(GroundTruthPoint).filter(GroundTruthPoint.ground_truth_id == gt.id).delete(synchronize_session=False)
+    db.query(ClassificationModel).filter(ClassificationModel.ground_truth_id == gt.id) \
+        .update({ClassificationModel.ground_truth_id: None}, synchronize_session=False)
+    db.delete(gt)
+    db.commit()
+    return {"deleted": str(gt_id)}
+
+
+def model_dict(x: ClassificationModel, **extra):
+    d = {"id": str(x.id), "library_id": None if x.library_id is None else str(x.library_id),
+         "image_id": None if x.image_id is None else str(x.image_id),
+         "ground_truth_id": None if x.ground_truth_id is None else str(x.ground_truth_id),
+         "name": x.name, "model_type": x.model_type, "family": x.family, "class_names": list(x.class_names or []),
+         "n_bands": x.n_bands, "wavelengths": None if x.wavelengths is None else [float(v) for v in x.wavelengths],
+         "unit": x.unit, "feature_kind": x.feature_kind, "window": x.window, "components": x.components,
+         "label_source": x.label_source, "rule": x.rule, "roi_uids": x.roi_uids or [], "metrics": x.metrics or {},
+         "settings": x.settings or {}, "config": x.config or {}, "file_format": x.file_format,
+         "size_bytes": x.size_bytes, "sha256": x.sha256, "metadata": x.model_metadata or {},
+         "created_at": _iso(x.created_at)}
+    d.update(extra)
+    return d
+
+
+def save_model(db: Session, info: dict, file_bytes: bytes) -> dict:
+    """Store a trained model. info: {name, model_type, class_names, n_bands, wavelengths?, unit?, feature_kind?,
+    window?, components?, label_source?, rule?, roi_uids?, metrics?, settings?, config?, library_id?,
+    image (image_info dict or id)?, ground_truth_id?, metadata?}; file_bytes: joblib of {model, transform}."""
+    import hashlib
+    if not file_bytes:
+        raise ValueError("no model file")
+    if len(file_bytes) > MAX_MODEL_BYTES:
+        raise ValueError(f"the model file is {len(file_bytes) / 2 ** 20:.0f} MB; at most "
+                         f"{MAX_MODEL_BYTES / 2 ** 20:.0f} MB are stored (use fewer trees or a smaller depth)")
+    for k in ("name", "model_type", "class_names", "n_bands"):
+        if not info.get(k):
+            raise ValueError(f"model {k} missing")
+    wl = info.get("wavelengths")
+    m = ClassificationModel(
+        name=str(info["name"])[:255], model_type=str(info["model_type"])[:50], family=info.get("family") or "classical",
+        class_names=list(info["class_names"]), n_bands=int(info["n_bands"]),
+        wavelengths=None if wl is None else [float(v) for v in wl], unit=info.get("unit"),
+        feature_kind=info.get("feature_kind"), window=info.get("window"), components=info.get("components"),
+        label_source=info.get("label_source"), rule=info.get("rule"), roi_uids=list(info.get("roi_uids") or []),
+        metrics=info.get("metrics") or {}, settings=info.get("settings") or {}, config=info.get("config") or {},
+        library_id=_opt_uuid(info.get("library_id"), "Library"), image_id=_image_id_of(db, info.get("image")),
+        ground_truth_id=_opt_uuid(info.get("ground_truth_id"), "Ground truth"),
+        model_file=bytes(file_bytes), file_format=info.get("file_format") or "joblib", size_bytes=len(file_bytes),
+        sha256=hashlib.sha256(file_bytes).hexdigest(), model_metadata=info.get("metadata") or {})
+    db.add(m)
+    db.commit()
+    return model_dict(m)
+
+
+def list_models(db: Session, image_id=None, ground_truth_id=None, library_id=None):
+    q = db.query(ClassificationModel, Image.name).outerjoin(Image, Image.id == ClassificationModel.image_id)
+    if image_id is not None:
+        q = q.filter(ClassificationModel.image_id == _uuid(image_id, "Image"))
+    if ground_truth_id is not None:
+        q = q.filter(ClassificationModel.ground_truth_id == _uuid(ground_truth_id, "Ground truth"))
+    if library_id is not None:
+        q = q.filter(ClassificationModel.library_id == _uuid(library_id, "Library"))
+    rows = q.order_by(ClassificationModel.created_at.desc()).all()
+    return [model_dict(m, image_name=n) for m, n in rows]
+
+
+def get_model(db: Session, model_id, with_file: bool = True) -> dict:
+    import hashlib
+    m = db.query(ClassificationModel).filter(ClassificationModel.id == _uuid(model_id, "Model")).first()
+    if m is None:
+        raise NotFound("Model not found")
+    d = model_dict(m)
+    if with_file:
+        data = bytes(m.model_file)
+        if m.sha256 and hashlib.sha256(data).hexdigest() != m.sha256:
+            raise ValueError("the stored model file does not match its checksum; it will not be loaded")
+        d["file"] = data
+    return d
+
+
+def delete_model(db: Session, model_id) -> dict:
+    m = db.query(ClassificationModel).filter(ClassificationModel.id == _uuid(model_id, "Model")).first()
+    if m is None:
+        raise NotFound("Model not found")
+    db.delete(m)
+    db.commit()
+    return {"deleted": str(model_id)}

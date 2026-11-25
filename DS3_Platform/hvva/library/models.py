@@ -13,6 +13,8 @@ generic UUID / JSON on SQLite) so the same models also run on a local SQLite fil
 HyperVista additions (database/migrations/001_category_tree_acquisition.sql, applied automatically on connect):
 ``spectra.acquisition_type`` and the convention that ``materials.category`` holds a '/'-separated hierarchy path
 (Vegetation/Tree/Tsuga/Canadensis).
+Migration 005 (classification): ``ground_truths`` + ``ground_truth_points`` (point / label-map ground truth placed
+by lat/lon) and ``classification_models`` (trained Random Forest / SVM models with their settings, file in the row).
 Migration 002 (ROIs): table ``rois`` (one row per region of interest drawn on an image, class by class),
 ``spectra.roi_id`` / ``spectra.roi_class`` and the link table ``spectrum_rois`` (which ROIs a spectrum was computed
 from - a pooled class mean comes from many ROIs, possibly in several images).
@@ -23,8 +25,9 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import (JSON, BigInteger, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
-                        Uuid)
+from sqlalchemy import (JSON, BigInteger, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text,
+                        UniqueConstraint, Uuid)
+from sqlalchemy.orm import deferred
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.sql import func
 
@@ -195,3 +198,72 @@ class DataFile(Base):
     storage_path = Column(Text)
     file_metadata = _meta()
     uploaded_at = _created()
+
+
+class GroundTruth(Base):
+    """Ground truth for classification (migration 005): point tables (lat/lon/value per layer, e.g. one abundance
+    sheet per material) or a label map, with the label rule last used to turn values into classes."""
+    __tablename__ = "ground_truths"
+    id = _id()
+    library_id = Column(Uuid(as_uuid=True), ForeignKey("libraries.id", ondelete="SET NULL"))
+    image_id = Column(Uuid(as_uuid=True), ForeignKey("images.id", ondelete="SET NULL"))
+    name = Column(String(255), nullable=False)
+    kind = Column(String(20), nullable=False, default="points")          # points | label_map
+    layers = Column(JSONType, nullable=False, default=list)              # ["Cadmium", "Lead", ...]
+    value_meaning = Column(String(100))                                  # e.g. "abundance (fraction of pixel)"
+    crs = Column(Text)
+    image_rows = Column(Integer)
+    image_cols = Column(Integer)
+    source_files = Column(JSONType)
+    rule = Column(JSONType)                                              # gt_points label rule
+    class_names = Column(JSONType)                                       # {"1": "Cadmium", ...}
+    n_points = Column(Integer)
+    label_map = deferred(Column(LargeBinary))                            # npz bytes (kind = label_map)
+    gt_metadata = _meta()
+    created_at = _created()
+    updated_at = _updated()
+
+
+class GroundTruthPoint(Base):
+    __tablename__ = "ground_truth_points"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    ground_truth_id = _fk("ground_truths.id")
+    layer = Column(String(255), nullable=False)
+    lat = Column(Float)
+    lon = Column(Float)
+    pixel_row = Column(Integer)
+    pixel_col = Column(Integer)
+    value = Column(Float)
+    class_name = Column(String(255))
+
+
+class ClassificationModel(Base):
+    """A trained classical model (migration 005). The fitted estimator + feature transform are stored as joblib
+    bytes in ``model_file`` (sha256 checked before loading); everything needed to reuse it is in the other columns."""
+    __tablename__ = "classification_models"
+    id = _id()
+    library_id = Column(Uuid(as_uuid=True), ForeignKey("libraries.id", ondelete="SET NULL"))
+    image_id = Column(Uuid(as_uuid=True), ForeignKey("images.id", ondelete="SET NULL"))
+    ground_truth_id = Column(Uuid(as_uuid=True), ForeignKey("ground_truths.id", ondelete="SET NULL"))
+    name = Column(String(255), nullable=False)
+    model_type = Column(String(50), nullable=False)                      # Random Forest | SVM (RBF) | ...
+    family = Column(String(20), nullable=False, default="classical")
+    class_names = Column(JSONType, nullable=False)
+    n_bands = Column(Integer, nullable=False)
+    wavelengths = Column(FloatArray)
+    unit = Column(String(20))
+    feature_kind = Column(String(20))
+    window = Column(Integer)
+    components = Column(Integer)
+    label_source = Column(String(20))                                    # rois | gt | both
+    rule = Column(JSONType)
+    roi_uids = Column(JSONType)
+    metrics = Column(JSONType)
+    settings = Column(JSONType)
+    config = Column(JSONType)
+    model_file = deferred(Column(LargeBinary, nullable=False))
+    file_format = Column(String(20), nullable=False, default="joblib")
+    size_bytes = Column(BigInteger)
+    sha256 = Column(String(64))
+    model_metadata = _meta()
+    created_at = _created()

@@ -9,7 +9,8 @@ h5py                     # HDF5, MATLAB v7.3, NetCDF4
 tifffile                 # TIFF / EnMAP GeoTIFF
 imagecodecs              # compressed TIFFs
 Pillow                   # map tiles
-openpyxl                 # Excel spectra
+openpyxl                 # Excel spectra + ground-truth point tables (.xlsx)
+pandas                   # ground-truth point tables (Viewer and Analysis ▸ Classification)
 pyarrow                  # Parquet spectra
 spectral                 # ENVI reading in the Image module
 scikit-learn             # K-Means, PCA, RF / SVM (Image module)

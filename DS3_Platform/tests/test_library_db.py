@@ -209,7 +209,8 @@ def test_migration_adds_acquisition_column(tmp_path):
     eng.dispose()
     db = Database(url)
     assert db.migrate() == ["spectra.acquisition_type", "spectra.roi_id", "spectra.roi_class", "spectra.purity",
-                            "spectra.wavelengths", "rois", "spectrum_rois", "images"]
+                            "spectra.wavelengths", "rois", "spectrum_rois", "images", "ground_truths",
+                            "ground_truth_points", "classification_models"]
     assert "acquisition_type" in {c["name"] for c in inspect(db.engine).get_columns("spectra")}
     assert db.migrate() == []                                       # idempotent
 

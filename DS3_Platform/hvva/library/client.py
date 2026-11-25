@@ -164,6 +164,34 @@ class DirectClient(LibraryClient):
     def delete_roi(self, roi_id, delete_spectra=False):
         return self._run(repo.delete_roi, roi_id, delete_spectra)
 
+    # ---- classification (migration 005)
+    def save_ground_truth(self, info, points):
+        return self._run(repo.save_ground_truth, info, points)
+
+    def update_ground_truth_rule(self, gt_id, rule, class_names=None):
+        return self._run(repo.update_ground_truth_rule, gt_id, rule, class_names)
+
+    def list_ground_truths(self, image_id=None, library_id=None, search=None):
+        return self._run(repo.list_ground_truths, image_id, library_id, search)
+
+    def get_ground_truth(self, gt_id, with_points=True):
+        return self._run(repo.get_ground_truth, gt_id, with_points)
+
+    def delete_ground_truth(self, gt_id):
+        return self._run(repo.delete_ground_truth, gt_id)
+
+    def save_model(self, info, file_bytes):
+        return self._run(repo.save_model, info, file_bytes)
+
+    def list_models(self, image_id=None, ground_truth_id=None, library_id=None):
+        return self._run(repo.list_models, image_id, ground_truth_id, library_id)
+
+    def get_model(self, model_id, with_file=True):
+        return self._run(repo.get_model, model_id, with_file)
+
+    def delete_model(self, model_id):
+        return self._run(repo.delete_model, model_id)
+
     def save_spectra(self, library_id, dataset_name, items, category=None, acquisition=None):
         items = _sig_items(items, category)
 
@@ -438,6 +466,17 @@ def _api_preview(self, path, options=None, n_spectra=12):
 
 
 ApiClient.preview_file = _api_preview
+
+
+def _api_classification(self, *a, **kw):
+    raise RuntimeError("Ground truth and trained models are stored over a direct database connection only. "
+                       "Connect to the database directly (Library ▸ Connect…, PostgreSQL or SQLite), not through the "
+                       "HTTP API.")
+
+
+for _n in ("save_ground_truth", "update_ground_truth_rule", "list_ground_truths", "get_ground_truth",
+           "delete_ground_truth", "save_model", "list_models", "get_model", "delete_model"):
+    setattr(ApiClient, _n, _api_classification)
 
 
 def make_client(mode: str, url: str, init_schema: bool = False) -> LibraryClient:
