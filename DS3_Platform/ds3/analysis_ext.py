@@ -306,12 +306,20 @@ class PointGTDialog(W.QDialog):
         self.stored = stored                # {name, id, points, rule, ...} from the library
         self._cache = {}
         self.result = None
-        lay = W.QVBoxLayout(self)
+        outer = W.QVBoxLayout(self)
+        body = W.QWidget()
+        lay = W.QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 6, 0)
+        scroll = W.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(W.QFrame.NoFrame)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
 
         g1 = W.QGroupBox("1. Point tables (one layer per file, e.g. one sheet per material)")
         l1 = W.QVBoxLayout(g1)
         self.tbl_files = _table(["File", "Sheet", "Layer name", "Rows"])
-        self.tbl_files.setMinimumHeight(120)
+        self.tbl_files.setMinimumHeight(150)
         l1.addWidget(self.tbl_files)
         r1 = W.QHBoxLayout()
         self.b_add = _btn("Add files...", self.on_add)
@@ -383,7 +391,7 @@ class PointGTDialog(W.QDialog):
         f3.addWidget(W.QLabel("Leave out classes under"), 3, 2)
         f3.addWidget(self.sp_min, 3, 3)
         self.tbl_cls = _table(["Use", "Class", "Pixels"])
-        self.tbl_cls.setMinimumHeight(150)
+        self.tbl_cls.setMinimumHeight(190)
         f3.addWidget(self.tbl_cls, 4, 0, 1, 4)
         self.lbl_sum = _hint("")
         f3.addWidget(self.lbl_sum, 5, 0, 1, 4)
@@ -397,7 +405,7 @@ class PointGTDialog(W.QDialog):
         bb.addButton(W.QDialogButtonBox.Cancel)
         bb.accepted.connect(self.on_ok)
         bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+        outer.addWidget(bb)                 # outside the scroll area: always visible
 
         self.cb_pos.currentIndexChanged.connect(self._sync_pos)
         for w in (self.cb_kind, self.cb_layer):
@@ -407,7 +415,11 @@ class PointGTDialog(W.QDialog):
         self.ed_none.editingFinished.connect(self.refresh_labels)
         self.ed_edges.editingFinished.connect(self.refresh_labels)
         self.sp_min.valueChanged.connect(self.refresh_labels)
-        self.resize(760, 860)
+        scr = (parent.screen() if parent is not None and hasattr(parent, "screen") else None) or \
+            W.QApplication.primaryScreen()
+        avail = scr.availableGeometry()
+        self.resize(min(780, int(avail.width() * 0.9)), min(940, int(avail.height() * 0.88)))
+        self.setSizeGripEnabled(True)
         self._sync_pos()
         if stored is not None:
             self._from_stored(stored)
@@ -422,28 +434,35 @@ class PointGTDialog(W.QDialog):
             self._add_paths(paths)
 
     def _add_paths(self, paths):
+        self._layers_from_table()
         have = {f["path"] for f in self.files}
-        new = [p for p in paths if p not in have]
-        all_paths = [f["path"] for f in self.files] + new
-        names = G.layer_names(all_paths)
-        for p in new:
+        for p in paths:
+            if p in have:
+                continue
             try:
                 sheets = G.table_sheets(p)
             except Exception as e:                                               # noqa: BLE001
                 W.QMessageBox.warning(self, "Point tables", f"{Path(p).name}: {e}")
                 continue
             self.files.append({"path": p, "sheets": sheets, "sheet": sheets[0] if sheets else None})
-        for f, n in zip(self.files, names):
-            f.setdefault("layer", n)
-            if f["path"] in new:
-                f["layer"] = n
+        self._auto_names()
         self._fill_files()
         self._fill_columns()
 
+    def _auto_names(self):
+        """Layer names from all file names together (abundance_Cadmium, abundance_Lead -> Cadmium, Lead);
+        a name typed by hand is kept."""
+        names = G.layer_names([f["path"] for f in self.files])
+        for f, n in zip(self.files, names):
+            if not f.get("edited"):
+                f["layer"] = n
+
     def on_remove(self):
+        self._layers_from_table()
         rows = sorted({i.row() for i in self.tbl_files.selectedIndexes()}, reverse=True)
         for r in rows:
             del self.files[r]
+        self._auto_names()
         self._fill_files()
         self._fill_columns()
 
@@ -478,8 +497,9 @@ class PointGTDialog(W.QDialog):
     def _layers_from_table(self):
         for i, f in enumerate(self.files):
             it = self.tbl_files.item(i, 2)
-            if it is not None and it.text().strip():
+            if it is not None and it.text().strip() and it.text().strip() != f.get("layer"):
                 f["layer"] = it.text().strip()
+                f["edited"] = True
 
     # ---- columns
     def _fill_columns(self):
